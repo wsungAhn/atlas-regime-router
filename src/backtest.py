@@ -34,7 +34,13 @@ STARTING_EQUITY = 100_000.0
 DTE_DAYS = 30
 RISK_FREE_RATE = 0.045
 DELTA_SHORT_LEG = 0.20
-SPREAD_WIDTH_PCT = 0.05
+# AlphaBot R1-B 원값(0.05)은 SOXL류 $10~30대 레버리지 ETF 기준이었다 — SPY($630대)에
+# 그대로 쓰면 폭 $31.5(계약당 최대손실 ~$3,000)짜리 비현실적으로 넓은 스프레드가
+# 나와 리스크예산 대부분을 잡아먹는다(사용자가 "예산부족으로 진입 안 되면 사이징이
+# 잘못된 거 아니냐"고 정확히 짚어서 재확인 — 사이징 공식이 아니라 이 폭 파라미터가
+# 원인이었음). 실제 SPY/QQQ 크레딧스프레드 관행 폭($1~10)에 맞춰 1.5%로 재보정
+# (630*0.015≈$9.45 — 시장 관행 범위 안).
+SPREAD_WIDTH_PCT = 0.015
 PROFIT_TARGET_PCT = 0.5
 STOP_LOSS_MULTIPLE = 2.0
 STRIKE_INCREMENT = 0.5
