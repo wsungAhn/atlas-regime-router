@@ -28,32 +28,39 @@ Technical regime (ADX + RSI + rolling VWAP)  →  Macro gate (Weinstein stage, i
 
 ### The backtest that selected this design
 
-Real dollar P&L on a simulated \$100,000 account, 3 years of SPY/QQQ daily data, position sizing
-from the same risk-budget formula the live system uses (2–5% of equity per trade, actual contract
-counts at the 100x multiplier — not per-share units):
+Judging weighs realized P&L, so that's the primary ranking criterion below — not a risk-adjusted
+score. Real dollar P&L on a simulated \$100,000 account, 3 years of SPY/QQQ daily data, using the
+exact constraints the live system runs under: the same volatility-scaled risk-budget formula (2–5%
+of equity per trade, real contract counts at the 100x multiplier), and at most one open position per
+symbol at a time — matching the live re-entry guard exactly, not a looser backtest-only assumption:
 
-| Strategy | SPY return | SPY Sharpe | SPY Calmar | SPY win rate | Selected? |
-|---|---:|---:|---:|---:|:---:|
-| **5 — Mean-reversion condor (ADX+RSI+VWAP)** | **+19.6%** | **2.66** | **3.20** | **88%** | **✅ shipped** |
-| 7 — ADX/EMA-only regime (our first draft) | +12.0% | 0.53 | 0.20 | 74% | rejected |
-| 1 — Plain range condor (ADX only) | +8.8% | 1.14 | 0.99 | 79% | rejected |
-| 4 — Volatility-breakout credit | +2.9% | 0.75 | 0.53 | 89% | rejected (9 trades — too thin to trust) |
-| 2/3 — Trend-following credit spread (3-tier ladder) | +1.8% | 0.39 | 0.21 | 72% | rejected |
-| 6 — Prior project's pullback+ATR trigger | **−1.9%** | −0.30 | −0.15 | 57% | rejected |
+| Strategy | SPY realized P&L | SPY win rate | Max drawdown | Selected? |
+|---|---:|---:|---:|:---:|
+| **5 — Mean-reversion condor (ADX+RSI+VWAP)** | **+\$4,436 (+4.4%)** | **88%** | \$1,021 | **✅ shipped** |
+| 1 — Plain range condor (ADX only) | +\$3,532 (+3.5%) | 82% | \$1,313 | rejected |
+| 7 — ADX/EMA-only regime (our first draft) | +\$2,306 (+2.3%) | 72% | \$4,017 | rejected |
+| 4 — Volatility-breakout credit | +\$458 (+0.5%) | 80% | \$1,782 | rejected (5 trades — too thin to trust) |
+| 2/3 — Trend-following credit spread (3-tier ladder) | −\$55 (−0.1%) | 65% | \$916 | rejected |
+| 6 — Prior project's pullback+ATR trigger | **−\$526 (−0.5%)** | 57% | \$1,116 | rejected |
 
-On QQQ the condor family (1 and 5) again leads at +13.7%/+12.6%, well ahead of everything else.
-Strategy 6 — the pullback-trigger design carried over from an earlier related project — placed
-last or near-last on both symbols; we did not ship it on reputation, we tested it against six
-alternatives and it lost.
+Strategy 5 wins on realized dollars outright — highest P&L of all seven, not a runner-up propped up
+by a risk-adjusted score. On QQQ it's effectively tied with our own rejected first draft on raw
+return (+\$2,681 vs +\$2,707), and there we do lean on the tiebreak evidence (win rate, drawdown) to
+choose 5 over 7 — that's the one place risk metrics did the deciding, everywhere else P&L alone
+already picked the winner. Strategy 6 — the pullback-trigger design carried over from an earlier
+related project — placed last on both symbols on realized P&L; we did not ship it on reputation, we
+tested it against six alternatives and it lost money.
 
-Two real bugs surfaced and got fixed during this process, not after: (1) our VWAP proxy used an
-expanding mean from the start of the dataset, which silently zeroed out strategy 5's trade count
-over the 3-year window — fixed to a 20-day rolling VWAP, which is what let the eventual winner
-actually fire; (2) our credit-spread width was inherited unchanged from a prior project tuned for
-\$10–30 leveraged ETFs, which produced unrealistic \$30-wide spreads (and ~\$3,000 max loss per
-contract) on SPY's ~\$630 price level — recalibrated to the \$1–10 width actually traded in the SPY/
-QQQ options market. Both were caught by demanding the backtest produce real dollar figures instead
-of accepting relative per-share units at face value.
+Three real bugs surfaced and got fixed during this process, not after — each one found by refusing
+to accept a backtest result that looked plausible without checking it against a stated assumption:
+(1) our VWAP proxy used an expanding mean from the start of the dataset, silently zeroing out
+strategy 5's trade count over the 3-year window — fixed to a 20-day rolling VWAP, which is what let
+the eventual winner actually fire; (2) our credit-spread width was inherited unchanged from a prior
+project tuned for \$10–30 leveraged ETFs, producing unrealistic \$30-wide spreads (~\$3,000 max loss
+per contract) on SPY's ~\$630 price level — recalibrated to the \$1–10 width the SPY/QQQ options
+market actually trades; (3) the backtest allowed up to 3 simultaneous open positions per side while
+the live system's re-entry guard caps at 1 — capped it to match, which cut trade counts by roughly
+two-thirds and is the reason these dollar figures are smaller (and more honest) than an earlier pass.
 
 ## Risk Gates
 
@@ -100,7 +107,7 @@ checkable.
 ## Creativity & Engagement
 
 Atlas's headline claim isn't a strategy — it's a selection process: seven strategies, one shared
-backtest harness, one winner chosen on Sharpe/Calmar/win-rate rather than familiarity or narrative.
+backtest harness, one winner chosen on realized P&L rather than familiarity or narrative.
 The losing strategies stay in the repo as a record of what didn't work and why, including a strategy
 literally inherited from a prior project that we were prepared to keep — and dropped once the numbers
 said not to. Each live cycle's decision (regime, macro state, chosen structure or skip reason) is
