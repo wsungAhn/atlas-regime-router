@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "alpaca": {
+      "command": ".venv/bin/alpaca-mcp-server",
+      "args": ["--env-file", ".env.competition"],
+      "env": {}
+    }
+  }
+}

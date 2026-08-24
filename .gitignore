@@ -1,0 +1,5 @@
+.env.competition
+.venv/
+__pycache__/
+*.pyc
+registry/
