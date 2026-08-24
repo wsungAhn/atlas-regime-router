@@ -27,6 +27,8 @@ from alpaca.data.requests import OptionChainRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.enums import ContractType
 
+import indicators as ind
+
 # ── 대회 리스크 게이트(문서 §리스크 게이트와 1:1 대응, 값 변경 시 문서도 같이 고칠 것) ──
 RISK_PCT_MIN = 0.02
 RISK_PCT_MAX = 0.05
@@ -83,29 +85,7 @@ def load_macro_gate(db_path: Path = MACRO_DB_PATH) -> MacroGate:
     return MacroGate(ok=True, reason="clear", stage=stage)
 
 
-# ── 종목별 기술적 레짐 (ADX14 + EMA20/50) ──
-
-def _wilder_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
-    ).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
-
-
-def _adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    up_move = high.diff()
-    down_move = -low.diff()
-    plus_dm = ((up_move > down_move) & (up_move > 0)) * up_move
-    minus_dm = ((down_move > up_move) & (down_move > 0)) * down_move
-    atr = _wilder_atr(df, n)
-    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
-    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
-    return dx.ewm(alpha=1 / n, adjust=False).mean()
-
+# ── 종목별 기술적 레짐 (indicators.py 공용 함수 사용) ──
 
 @dataclass
 class RegimeSignal:
@@ -117,15 +97,23 @@ class RegimeSignal:
 
 
 def classify_regime_from_bars(df: pd.DataFrame, symbol: str) -> RegimeSignal:
-    """순수 함수 — 테스트에서 합성 DataFrame을 바로 넣을 수 있도록 데이터조회와 분리."""
-    df = df.tail(60)
-    atr = float(_wilder_atr(df, 14).iloc[-1])
-    adx = float(_adx(df, 14).iloc[-1])
-    ema20 = float(df["close"].ewm(span=20, adjust=False).mean().iloc[-1])
-    ema50 = float(df["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+    """순수 함수 — 테스트에서 합성 DataFrame을 바로 넣을 수 있도록 데이터조회와 분리.
+
+    "range" 트리거는 strategies.py의 전략5(평균회귀 콘도르 리셋) 조건을 그대로
+    쓴다 — SPY/QQQ 3년 백테스트에서 5번이 승률 77~85%·Calmar 0.4~2.8로 7전략 중
+    1위였다(2026-08-24 실측). ADX 단독 임계값(구버전)보다 RSI·VWAP 근접까지
+    같이 보는 이 조건이 실제로 검증된 것 — MVP를 그 결과에 맞춰 승자 중심으로
+    재구성."""
+    df = df.tail(80)
+    atr = float(ind.wilder_atr(df, 14).iloc[-1])
+    adx = float(ind.adx(df, 14).iloc[-1])
+    ema20 = float(ind.ema(df["close"], 20).iloc[-1])
+    ema50 = float(ind.ema(df["close"], 50).iloc[-1])
+    rsi = float(ind.rsi(df, 14).iloc[-1])
+    vwap = float(ind.vwap_session(df, window=20).iloc[-1])
     close = float(df["close"].iloc[-1])
 
-    if adx < 18:
+    if atr > 0 and adx < 18 and abs(close - vwap) / atr < 1.0 and 40 < rsi < 60:
         regime = "range"
     elif adx > 20 and ema20 > ema50:
         regime = "trend_up"

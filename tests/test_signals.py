@@ -46,6 +46,20 @@ def test_classify_regime_range():
     assert signal.adx < 18
 
 
+def test_classify_regime_low_adx_but_recent_spike_is_not_range():
+    """전략5(백테스트 1위) 조건 검증 — ADX만 낮다고 range가 아니라, RSI가 극단이거나
+    가격이 최근 VWAP에서 크게 벗어나 있으면 range로 판정하면 안 된다(구버전 버그:
+    ADX 단독 조건이라 이런 케이스도 range로 오판했었음)."""
+    n = 80
+    idx = pd.date_range("2026-01-01", periods=n, freq="D")
+    # 오래 횡보하다 마지막 5일 급등 — ADX는 아직 안 올라왔지만 RSI는 과매수,
+    # 가격도 최근 VWAP보다 훨씬 위
+    close = pd.Series([100 + (i % 3) * 0.1 for i in range(n - 5)] + [101, 103, 106, 110, 115], index=idx, dtype=float)
+    df = pd.DataFrame({"high": close + 0.3, "low": close - 0.3, "close": close}, index=idx)
+    signal = classify_regime_from_bars(df, "TEST")
+    assert signal.regime != "range"
+
+
 def test_risk_pct_scales_down_with_high_volatility():
     low_vol = risk_pct_for_atr_pct(atr_pct=0.01, atr_pct_low_q=0.01, atr_pct_high_q=0.05)
     high_vol = risk_pct_for_atr_pct(atr_pct=0.05, atr_pct_low_q=0.01, atr_pct_high_q=0.05)
