@@ -52,8 +52,16 @@ def scale_trades_to_dollars(
     exit_date 순서로 잔고를 정산한다. weight(래더 레벨별 예산 배분, 기본 1.0)는
     trade dict에 'weight' 키가 있으면 그걸 쓴다.
 
-    base_risk_pct는 전략묶음당 리스크(문서 §리스크 게이트 2~5%)의 상한을 쓴다 —
-    3%는 **동일종목 포트폴리오 전체 상한**(여러 포지션 합산 개념)이지 개별
+    사이징 기준 리스크%는 trade dict에 'risk_pct'가 있으면 그걸 쓰고(변동성
+    기반 동적 2~5% — signals.py 라이브 코드와 동일 공식으로 backtest.py가
+    거래마다 미리 계산해 넣는다), 없으면 base_risk_pct(기본 5%, 상수)로
+    폴백한다. **라이브가 죽어있던 risk_pct_for_atr_pct를 실제로 배선한 뒤
+    (2026-08-24), 백테스트도 같은 동적 사이징을 안 쓰면 검증한 성과와 실제
+    라이브 동작이 다른 사이징 기준으로 갈라진다** — 이 파라미터는 그 정합성을
+    맞추기 위해 추가됐다.
+
+    이 값(risk_pct 또는 base_risk_pct)은 전략묶음당 리스크(문서 §리스크 게이트
+    2~5%)를 쓴다 — 3%(동일종목 상한)는 **여러 포지션 합산 개념**이지 개별
     거래 하나의 예산이 아니다. 최초 구현이 이 둘을 혼동해 래더 레벨 대부분이
     0계약으로 잘려나가는 버그가 있었다(실측: 전략2/3 SPY 151거래 전부 총손익 0
     — weight×3%가 SPY 스프레드 최대손실보다 항상 작았음). **0계약(예산 부족으로
@@ -70,7 +78,8 @@ def scale_trades_to_dollars(
     skipped_zero_contracts = 0
     for t in sorted_by_entry:
         weight = float(t.get("weight", default_weight))
-        risk_budget = equity * base_risk_pct * weight
+        trade_risk_pct = float(t.get("risk_pct", base_risk_pct))
+        risk_budget = equity * trade_risk_pct * weight
         max_loss_dollars = t["max_loss"] * CONTRACT_MULTIPLIER
         contracts = int(risk_budget // max_loss_dollars) if max_loss_dollars > 0 else 0
         if contracts <= 0:

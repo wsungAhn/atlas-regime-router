@@ -24,8 +24,9 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import indicators as ind  # noqa: E402
 from strategies import ALL_STRATEGIES, StrategySignal  # noqa: E402
-from portfolio import scale_trades_to_dollars  # noqa: E402
+from portfolio import risk_pct_for_atr_pct, scale_trades_to_dollars  # noqa: E402
 from vendor.credit_spread_simulator import run_portfolio_simulation  # noqa: E402
 from vendor.iv_approximation import estimate_historical_vol  # noqa: E402
 
@@ -134,7 +135,28 @@ def _metrics_from_dollar_trades(
     )
 
 
-def backtest_strategy(name: str, df: pd.DataFrame, mtm_iv: pd.Series, n_years: float) -> StrategyResult | None:
+def _risk_pct_series(df: pd.DataFrame, lookback: int = 252) -> pd.Series:
+    """날짜별 변동성 기반 리스크%(2~5%) — signals.py 라이브 코드가 쓰는 것과
+    동일한 공식(risk_pct_for_atr_pct)을 백테스트에도 적용해 검증된 성과와 실제
+    라이브 동작의 사이징 기준을 맞춘다(2026-08-24, 라이브에 이 배선을 넣은 뒤
+    백테스트도 같은 조건으로 재실행). **미래정보 누출 금지** — 각 날짜의
+    risk_pct는 그 날짜까지의(trailing) lookback일 ATR%만으로 계산한다, 이후
+    데이터는 절대 안 본다."""
+    atr = ind.wilder_atr(df, 14)
+    atr_pct = (atr / df["close"]).dropna()
+    values = {}
+    for i in range(lookback, len(atr_pct)):
+        window = atr_pct.iloc[i - lookback:i + 1]
+        current = float(window.iloc[-1])
+        low_q = float(window.quantile(0.25))
+        high_q = float(window.quantile(0.75))
+        values[atr_pct.index[i]] = risk_pct_for_atr_pct(current, low_q, high_q)
+    return pd.Series(values).sort_index()
+
+
+def backtest_strategy(
+    name: str, df: pd.DataFrame, mtm_iv: pd.Series, n_years: float, risk_pct_series: pd.Series,
+) -> StrategyResult | None:
     signal_fn = ALL_STRATEGIES[name]
     signals: list[StrategySignal] = signal_fn(df)
     if not signals:
@@ -152,7 +174,10 @@ def backtest_strategy(name: str, df: pd.DataFrame, mtm_iv: pd.Series, n_years: f
 
     raw_trades: list[dict] = []
     for (side, level), dates in groups.items():
-        raw_trades += _run_side(df, mtm_iv, dates, side, weight_by_level[level])
+        trades = _run_side(df, mtm_iv, dates, side, weight_by_level[level])
+        for t in trades:
+            t["risk_pct"] = float(risk_pct_series.get(t["entry_date"], risk_pct_series.iloc[-1] if len(risk_pct_series) else 0.05))
+        raw_trades += trades
 
     dollar_trades, equity_series = scale_trades_to_dollars(raw_trades, STARTING_EQUITY)
     result = _metrics_from_dollar_trades(dollar_trades, equity_series, n_years)
@@ -166,12 +191,13 @@ def run_all(symbol: str = "SPY", years: int = 3) -> list[StrategyResult]:
     client = StockHistoricalDataClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"])
     df = fetch_daily_bars(client, symbol, years=years)
     mtm_iv = _rolling_iv_series(df)
+    risk_pct_series = _risk_pct_series(df)
     n_years = (df.index[-1] - df.index[0]).days / 365.0
 
     results = []
     for name in ALL_STRATEGIES:
         try:
-            r = backtest_strategy(name, df, mtm_iv, n_years)
+            r = backtest_strategy(name, df, mtm_iv, n_years, risk_pct_series)
         except Exception as exc:  # noqa: BLE001 — 백테스트 스캔이라 한 전략 실패가 나머지를 막으면 안 됨
             print(f"[{name}] FAILED: {exc}")
             continue
