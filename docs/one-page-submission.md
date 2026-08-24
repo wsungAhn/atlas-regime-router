@@ -28,22 +28,32 @@ Technical regime (ADX + RSI + rolling VWAP)  →  Macro gate (Weinstein stage, i
 
 ### The backtest that selected this design
 
-| Strategy | SPY Sharpe | SPY Calmar | SPY win rate | Selected? |
-|---|---:|---:|---:|:---:|
-| **5 — Mean-reversion condor (ADX+RSI+VWAP)** | **2.55** | **2.77** | **85%** | **✅ shipped** |
-| 7 — ADX/EMA-only regime (our first draft) | 0.45 | 0.18 | 72% | rejected |
-| 1 — Plain range condor (ADX only) | 0.93 | 0.48 | 76% | rejected |
-| 4 — Volatility-breakout credit | 0.34 | 0.43 | 78% | rejected (thin sample) |
-| 2/3 — Trend-following credit spread | −0.32 | −0.15 | 67% | rejected |
-| 6 — Prior project's pullback+ATR trigger | −1.07 | −0.28 | 40% | rejected |
+Real dollar P&L on a simulated \$100,000 account, 3 years of SPY/QQQ daily data, position sizing
+from the same risk-budget formula the live system uses (2–5% of equity per trade, actual contract
+counts at the 100x multiplier — not per-share units):
 
-Results held up directionally on QQQ as well. Strategy 6 — the pullback-trigger design carried over
-from an earlier related project — placed last on both symbols; we did not ship it on reputation, we
-tested it against six alternatives and it lost. One real bug surfaced during this process: our VWAP
-proxy used an expanding mean from the start of the dataset, which silently zeroed out strategy 5's
-trade count over a 3-year window. Fixing it to a 20-day rolling VWAP is what let the eventual winner
-actually fire — a concrete instance of the backtest catching a defect that intuition would have
-missed entirely.
+| Strategy | SPY return | SPY Sharpe | SPY Calmar | SPY win rate | Selected? |
+|---|---:|---:|---:|---:|:---:|
+| **5 — Mean-reversion condor (ADX+RSI+VWAP)** | **+19.6%** | **2.66** | **3.20** | **88%** | **✅ shipped** |
+| 7 — ADX/EMA-only regime (our first draft) | +12.0% | 0.53 | 0.20 | 74% | rejected |
+| 1 — Plain range condor (ADX only) | +8.8% | 1.14 | 0.99 | 79% | rejected |
+| 4 — Volatility-breakout credit | +2.9% | 0.75 | 0.53 | 89% | rejected (9 trades — too thin to trust) |
+| 2/3 — Trend-following credit spread (3-tier ladder) | +1.8% | 0.39 | 0.21 | 72% | rejected |
+| 6 — Prior project's pullback+ATR trigger | **−1.9%** | −0.30 | −0.15 | 57% | rejected |
+
+On QQQ the condor family (1 and 5) again leads at +13.7%/+12.6%, well ahead of everything else.
+Strategy 6 — the pullback-trigger design carried over from an earlier related project — placed
+last or near-last on both symbols; we did not ship it on reputation, we tested it against six
+alternatives and it lost.
+
+Two real bugs surfaced and got fixed during this process, not after: (1) our VWAP proxy used an
+expanding mean from the start of the dataset, which silently zeroed out strategy 5's trade count
+over the 3-year window — fixed to a 20-day rolling VWAP, which is what let the eventual winner
+actually fire; (2) our credit-spread width was inherited unchanged from a prior project tuned for
+\$10–30 leveraged ETFs, which produced unrealistic \$30-wide spreads (and ~\$3,000 max loss per
+contract) on SPY's ~\$630 price level — recalibrated to the \$1–10 width actually traded in the SPY/
+QQQ options market. Both were caught by demanding the backtest produce real dollar figures instead
+of accepting relative per-share units at face value.
 
 ## Risk Gates
 
