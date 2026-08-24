@@ -4,12 +4,17 @@
 으로 그대로 백테스트 가능하다.
 
 1~5는 사용자가 준 ATR 그리드 논문(competition_one_page_atr_options_ai_writeup.md /
-atr_grid_options_trading_competition_paper.md)의 5개 전략 — 원문의 3단 래더(j=1,2,3 ATR)
-대신 **레짐당 신호 1개**로 단순화했다(8일 빌드 예산 + 백테스트 시뮬레이터가 날짜당
-1포지션을 가정하는 구조라 래더를 그대로 넣으면 시뮬레이터 자체를 다시 짜야 함 —
-# ponytail: 래더 다단진입은 신호품질부터 검증한 다음 확장).
+atr_grid_options_trading_competition_paper.md)의 5개 전략.
 6은 AlphaBot R1-B 원 전략(find_entry_signals) 그대로 재사용.
 7은 오늘 만든 Atlas MVP(ADX/EMA 2레짐).
+
+전략2/3(추세 크레딧)은 원문 §5.2/§5.3의 **3단 래더**를 그대로 구현한다 — 스윙
+고점/저점에서 j∈{1,2,3} ATR 떨어진 3개 가격대(G_j)를 각각 독립적으로 감시하다가
+가격이 그 레벨에 닿을 때마다(레벨마다 별도 트리거) 진입 신호를 낸다. 리스크
+배분은 원문 그대로 R1=0.2·R2=0.3·R3=0.5 (얕은 되돌림일수록 작게, 깊을수록
+크게 — 단 원문 규칙대로 G_3는 추세 재확인 없이는 안 나가게 ADX/EMA 조건을
+그 시점에도 다시 확인한다). `level`/`weight` 필드로 portfolio.py의 사이징에
+그대로 전달된다.
 """
 from __future__ import annotations
 
@@ -20,11 +25,17 @@ import pandas as pd
 import indicators as ind
 from vendor.credit_spread_simulator import find_entry_signals
 
+LADDER_LEVELS = (1, 2, 3)  # j (ATR 배수)
+LADDER_WEIGHTS = {1: 0.20, 2: 0.30, 3: 0.50}  # 원문 §5.2 R1/R2/R3
+LADDER_TOLERANCE_ATR = 0.5  # 레벨 근접 판정 허용오차(±0.5 ATR)
+
 
 @dataclass
 class StrategySignal:
     date: pd.Timestamp
     spread_type: str  # "bull_put" | "bear_call" | "iron_condor"(=둘 다) | "debit"(미시뮬 대상)
+    level: int = 1
+    weight: float = 1.0
 
 
 def _common_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -54,25 +65,30 @@ def strategy1_range_condor_signals(df: pd.DataFrame, min_history: int = 60) -> l
     return out
 
 
-# ── 전략 2/3: 추세 방향 크레딧 스프레드 그리드 ──
+# ── 전략 2/3: 추세 방향 크레딧 스프레드 3단 래더 ──
 def strategy23_trend_credit_signals(df: pd.DataFrame, min_history: int = 60) -> list[StrategySignal]:
     d = _common_indicators(df)
     out = []
     for i in range(min_history, len(d)):
         row = d.iloc[i]
-        if pd.isna(row["adx"]) or pd.isna(row["ema20"]) or pd.isna(row["atr"]):
+        if pd.isna(row["adx"]) or pd.isna(row["ema20"]) or pd.isna(row["atr"]) or row["atr"] <= 0:
             continue
         swing_high = d["high"].iloc[max(0, i - 20):i + 1].max()
         swing_low = d["low"].iloc[max(0, i - 20):i + 1].min()
+
         if row["ema20"] > row["ema50"] and row["adx"] > 20:
-            # 상승추세 풋 크레딧: 스윙고점에서 1~3 ATR 조정 시
-            pullback = swing_high - row["close"]
-            if row["atr"] > 0 and 1.0 * row["atr"] <= pullback <= 3.0 * row["atr"]:
-                out.append(StrategySignal(d.index[i], "bull_put"))
+            # 상승추세: 스윙고점에서 j ATR 되돌림한 레벨 G_j 각각 독립 감시
+            for j in LADDER_LEVELS:
+                if j == 3 and not (row["ema20"] > row["ema50"] and row["adx"] > 20):
+                    continue  # G_3는 추세 재확인 필수(원문 §5.2) — 위에서 이미 확인됐으나 명시
+                g_j = swing_high - j * row["atr"]
+                if abs(row["close"] - g_j) <= LADDER_TOLERANCE_ATR * row["atr"]:
+                    out.append(StrategySignal(d.index[i], "bull_put", level=j, weight=LADDER_WEIGHTS[j]))
         elif row["ema20"] < row["ema50"] and row["adx"] > 20:
-            bounce = row["close"] - swing_low
-            if row["atr"] > 0 and 1.0 * row["atr"] <= bounce <= 3.0 * row["atr"]:
-                out.append(StrategySignal(d.index[i], "bear_call"))
+            for j in LADDER_LEVELS:
+                g_j = swing_low + j * row["atr"]
+                if abs(row["close"] - g_j) <= LADDER_TOLERANCE_ATR * row["atr"]:
+                    out.append(StrategySignal(d.index[i], "bear_call", level=j, weight=LADDER_WEIGHTS[j]))
     return out
 
 

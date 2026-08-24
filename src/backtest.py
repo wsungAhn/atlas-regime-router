@@ -25,8 +25,11 @@ from alpaca.data.timeframe import TimeFrame
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from strategies import ALL_STRATEGIES, StrategySignal  # noqa: E402
+from portfolio import scale_trades_to_dollars  # noqa: E402
 from vendor.credit_spread_simulator import run_portfolio_simulation  # noqa: E402
 from vendor.iv_approximation import estimate_historical_vol  # noqa: E402
+
+STARTING_EQUITY = 100_000.0
 
 DTE_DAYS = 30
 RISK_FREE_RATE = 0.045
@@ -66,17 +69,20 @@ def _rolling_iv_series(df: pd.DataFrame, lookback: int = IV_LOOKBACK_DAYS) -> pd
 class StrategyResult:
     name: str
     n_trades: int
-    total_pnl: float
+    total_pnl: float  # 실제 달러 손익(계약수·승수 반영)
     win_rate: float
-    max_drawdown: float
+    max_drawdown: float  # 달러
     sharpe: float
     calmar: float
     profit_factor: float
+    final_equity: float
 
 
 def _run_side(
-    df: pd.DataFrame, mtm_iv: pd.Series, dates: list[pd.Timestamp], spread_type: str,
+    df: pd.DataFrame, mtm_iv: pd.Series, dates: list[pd.Timestamp], spread_type: str, weight: float,
 ) -> list[dict]:
+    """dates에 실제 진입한 raw 거래를 시뮬레이션하고, portfolio.py가 사이징에 쓸
+    weight(래더 레벨 가중치, 비래더 전략은 1.0)를 각 거래 dict에 태깅한다."""
     if not dates:
         return []
     result = run_portfolio_simulation(
@@ -87,30 +93,38 @@ def _run_side(
         stop_loss_multiple=STOP_LOSS_MULTIPLE, strike_increment=STRIKE_INCREMENT,
         credit_haircut_pct=CREDIT_HAIRCUT_PCT, max_concurrent_positions=3,
     )
-    return result["trade_log"]
+    trades = result["trade_log"]
+    for t in trades:
+        t["weight"] = weight
+    return trades
 
 
-def _metrics_from_trades(trades: list[dict], n_years: float) -> StrategyResult | None:
-    if not trades:
+def _metrics_from_dollar_trades(
+    dollar_trades: list, equity_series: pd.Series, n_years: float,
+) -> StrategyResult | None:
+    if not dollar_trades:
         return None
-    pnls = np.array([t["realized_pnl"] for t in trades])
+    pnls = np.array([dt.dollar_pnl for dt in dollar_trades])
     wins = pnls[pnls > 0]
     total_pnl = float(pnls.sum())
     win_rate = float(len(wins) / len(pnls)) if len(pnls) else 0.0
-    equity_curve = np.cumsum(pnls)
+    equity_curve = equity_series.values if len(equity_series) else np.cumsum(pnls) + STARTING_EQUITY
     running_max = np.maximum.accumulate(equity_curve)
     drawdowns = running_max - equity_curve
     max_dd = float(drawdowns.max()) if len(drawdowns) else 0.0
-    daily_like_returns = pnls  # per-trade returns as proxy (거래빈도가 낮아 일별 재구성 대신 거래단위)
-    sharpe = float(daily_like_returns.mean() / daily_like_returns.std() * np.sqrt(len(pnls) / max(n_years, 0.1))) if daily_like_returns.std() > 0 else 0.0
-    cagr_like = total_pnl / max(n_years, 0.1)
-    calmar = float(cagr_like / max_dd) if max_dd > 0 else float("inf") if total_pnl > 0 else 0.0
+    per_trade_returns = pnls / STARTING_EQUITY
+    sharpe = float(per_trade_returns.mean() / per_trade_returns.std() * np.sqrt(len(pnls) / max(n_years, 0.1))) if per_trade_returns.std() > 0 else 0.0
+    cagr_like = (total_pnl / STARTING_EQUITY) / max(n_years, 0.1)
+    mdd_pct = max_dd / STARTING_EQUITY
+    calmar = float(cagr_like / mdd_pct) if mdd_pct > 0 else float("inf") if total_pnl > 0 else 0.0
     gross_profit = float(pnls[pnls > 0].sum())
     gross_loss = float(-pnls[pnls < 0].sum())
     profit_factor = float(gross_profit / gross_loss) if gross_loss > 0 else float("inf") if gross_profit > 0 else 0.0
+    final_equity = float(equity_curve[-1]) if len(equity_curve) else STARTING_EQUITY
     return StrategyResult(
         name="", n_trades=len(pnls), total_pnl=total_pnl, win_rate=win_rate,
         max_drawdown=max_dd, sharpe=sharpe, calmar=calmar, profit_factor=profit_factor,
+        final_equity=final_equity,
     )
 
 
@@ -120,11 +134,22 @@ def backtest_strategy(name: str, df: pd.DataFrame, mtm_iv: pd.Series, n_years: f
     if not signals:
         return None
 
-    put_dates = [s.date for s in signals if s.spread_type in ("bull_put", "iron_condor")]
-    call_dates = [s.date for s in signals if s.spread_type in ("bear_call", "iron_condor")]
+    # (spread_type_side, level) 조합별로 묶어서 각각 run_portfolio_simulation을
+    # 돌린다 — 래더 레벨마다 weight가 다르므로 별도 시뮬레이션 후 weight를 태깅.
+    groups: dict[tuple[str, int], list[pd.Timestamp]] = {}
+    weight_by_level: dict[int, float] = {}
+    for s in signals:
+        sides = ("bull_put", "bear_call") if s.spread_type == "iron_condor" else (s.spread_type,)
+        for side in sides:
+            groups.setdefault((side, s.level), []).append(s.date)
+            weight_by_level[s.level] = s.weight
 
-    trades = _run_side(df, mtm_iv, put_dates, "bull_put") + _run_side(df, mtm_iv, call_dates, "bear_call")
-    result = _metrics_from_trades(trades, n_years)
+    raw_trades: list[dict] = []
+    for (side, level), dates in groups.items():
+        raw_trades += _run_side(df, mtm_iv, dates, side, weight_by_level[level])
+
+    dollar_trades, equity_series = scale_trades_to_dollars(raw_trades, STARTING_EQUITY)
+    result = _metrics_from_dollar_trades(dollar_trades, equity_series, n_years)
     if result is not None:
         result.name = name
     return result
@@ -152,12 +177,13 @@ def run_all(symbol: str = "SPY", years: int = 3) -> list[StrategyResult]:
 
 
 def print_report(results: list[StrategyResult], symbol: str) -> None:
-    print(f"\n=== {symbol} — 7전략 백테스트 결과 ===")
-    print(f"{'전략':<28}{'거래수':>6}{'총손익':>12}{'승률':>8}{'MDD':>10}{'Sharpe':>8}{'Calmar':>8}{'PF':>8}")
+    print(f"\n=== {symbol} — 7전략 백테스트 결과 (${STARTING_EQUITY:,.0f} 시작, 실제 계약수 반영) ===")
+    print(f"{'전략':<28}{'거래수':>6}{'총손익($)':>14}{'수익률':>8}{'승률':>8}{'MDD($)':>12}{'Sharpe':>8}{'Calmar':>8}{'PF':>8}")
     for r in sorted(results, key=lambda x: x.total_pnl, reverse=True):
+        ret_pct = r.total_pnl / STARTING_EQUITY
         print(
-            f"{r.name:<28}{r.n_trades:>6}{r.total_pnl:>12.2f}{r.win_rate:>8.1%}"
-            f"{r.max_drawdown:>10.2f}{r.sharpe:>8.2f}{r.calmar:>8.2f}{r.profit_factor:>8.2f}"
+            f"{r.name:<28}{r.n_trades:>6}{r.total_pnl:>14,.0f}{ret_pct:>8.1%}{r.win_rate:>8.1%}"
+            f"{r.max_drawdown:>12,.0f}{r.sharpe:>8.2f}{r.calmar:>8.2f}{r.profit_factor:>8.2f}"
         )
 
 
