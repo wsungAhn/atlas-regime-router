@@ -1,4 +1,4 @@
-"""mcp_runner.py의 순수 로직(파싱·중복진입 방지) 유닛테스트 — MCP 서버 실행 없이."""
+"""mcp_runner.py의 순수 로직(파싱·중복진입 방지·포지션 그룹핑) 유닛테스트 — MCP 서버 실행 없이."""
 import json
 import sys
 from pathlib import Path
@@ -8,7 +8,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from mcp_runner import _mcp_data, _symbols_with_open_exposure  # noqa: E402
+from mcp_runner import (  # noqa: E402
+    _mcp_data,
+    _positions_by_symbol,
+    _symbols_with_open_orders,
+    _underlying_of,
+)
 
 
 def _tool_result(payload: dict):
@@ -33,21 +38,32 @@ def test_mcp_data_unwraps_alpaca_envelope():
     assert _mcp_data(result) == {"equity": "100000"}
 
 
-@pytest.mark.asyncio
-async def test_no_exposure_when_no_positions_or_orders():
-    session = _FakeSession(positions=[], orders=[])
-    exposed = await _symbols_with_open_exposure(session)
-    assert exposed == set()
+def test_underlying_of_matches_occ_prefix():
+    assert _underlying_of("SPY260321P00600000") == "SPY"
+    assert _underlying_of("QQQ260321C00500000") == "QQQ"
+    assert _underlying_of("AAPL260321C00150000") is None  # 관리 대상 심볼 아님
 
 
 @pytest.mark.asyncio
-async def test_open_position_blocks_reentry_for_that_symbol_only():
+async def test_positions_by_symbol_groups_legs_of_same_underlying():
     session = _FakeSession(
-        positions=[{"symbol": "SPY260321P00600000", "qty": "-2"}],
+        positions=[
+            {"symbol": "SPY260321P00600000", "side": "short"},
+            {"symbol": "SPY260321P00590000", "side": "long"},
+            {"symbol": "QQQ260321C00500000", "side": "short"},
+        ],
         orders=[],
     )
-    exposed = await _symbols_with_open_exposure(session)
-    assert exposed == {"SPY"}
+    grouped = await _positions_by_symbol(session)
+    assert len(grouped["SPY"]) == 2
+    assert len(grouped["QQQ"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_open_orders_when_none_pending():
+    session = _FakeSession(positions=[], orders=[])
+    exposed = await _symbols_with_open_orders(session)
+    assert exposed == set()
 
 
 @pytest.mark.asyncio
@@ -59,5 +75,5 @@ async def test_pending_multileg_order_blocks_reentry():
         positions=[],
         orders=[{"legs": [{"symbol": "QQQ260321C00500000"}, {"symbol": "QQQ260321C00510000"}]}],
     )
-    exposed = await _symbols_with_open_exposure(session)
+    exposed = await _symbols_with_open_orders(session)
     assert exposed == {"QQQ"}

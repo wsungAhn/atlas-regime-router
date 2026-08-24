@@ -9,13 +9,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from signals import (  # noqa: E402
     MacroGate,
+    build_close_intent,
     build_credit_spread_intent,
     build_iron_condor_intent,
     classify_regime_from_bars,
     contracts_for_max_loss,
     decide_for_symbol,
+    evaluate_exit,
     risk_pct_for_atr_pct,
 )
+from datetime import date, timedelta  # noqa: E402
 
 
 def _trending_up_bars(n=80):
@@ -156,3 +159,59 @@ def test_decide_for_symbol_trend_up_builds_put_credit_spread():
     assert decision.order_intent is not None
     assert decision.order_intent["order_class"] == "mleg"
     assert len(decision.order_intent["legs"]) == 2
+
+
+# ── 청산 감시 (2026-08-24 추가 — 이전엔 청산 판단 로직이 아예 없었다) ──
+
+def _far_expiry_symbol(days_out=30):
+    exp = (date.today() + timedelta(days=days_out)).strftime("%y%m%d")
+    return f"SPY{exp}P00600000"
+
+
+def test_evaluate_exit_holds_when_pnl_is_neutral():
+    legs = [
+        {"symbol": _far_expiry_symbol(), "cost_basis": -100.0, "unrealized_pl": 10.0, "side": "short", "qty": "1"},
+        {"symbol": _far_expiry_symbol(), "cost_basis": 0.0, "unrealized_pl": 0.0, "side": "long", "qty": "1"},
+    ]
+    decision = evaluate_exit(legs)
+    assert decision.should_close is False
+    assert decision.reason == "hold"
+
+
+def test_evaluate_exit_closes_at_profit_target():
+    """수취크레딧 100 중 60(60%) 이익 실현 — PROFIT_TARGET_PCT=0.5 초과."""
+    legs = [{"symbol": _far_expiry_symbol(), "cost_basis": -100.0, "unrealized_pl": 60.0, "side": "short", "qty": "1"}]
+    decision = evaluate_exit(legs)
+    assert decision.should_close is True
+    assert decision.reason == "profit_target"
+
+
+def test_evaluate_exit_closes_at_stop_loss():
+    """손실이 크레딧의 100%(=STOP_LOSS_MULTIPLE 2.0의 손실분) 도달."""
+    legs = [{"symbol": _far_expiry_symbol(), "cost_basis": -100.0, "unrealized_pl": -100.0, "side": "short", "qty": "1"}]
+    decision = evaluate_exit(legs)
+    assert decision.should_close is True
+    assert decision.reason == "stop_loss"
+
+
+def test_evaluate_exit_forces_close_near_expiry_regardless_of_pnl():
+    """DTE가 FORCE_CLOSE_DTE(14) 이하면 손익이 좋아도 강제청산."""
+    legs = [{"symbol": _far_expiry_symbol(days_out=5), "cost_basis": -100.0, "unrealized_pl": 5.0, "side": "short", "qty": "1"}]
+    decision = evaluate_exit(legs)
+    assert decision.should_close is True
+    assert decision.reason == "dte_forced"
+
+
+def test_build_close_intent_reverses_short_and_long_sides():
+    legs = [
+        {"symbol": "SPY_SHORT", "side": "short", "qty": "3"},
+        {"symbol": "SPY_LONG", "side": "long", "qty": "3"},
+    ]
+    intent = build_close_intent(legs, client_order_id="close-1")
+    assert intent["type"] == "market"
+    assert intent["order_class"] == "mleg"
+    by_symbol = {leg["symbol"]: leg for leg in intent["legs"]}
+    assert by_symbol["SPY_SHORT"]["side"] == "buy"
+    assert by_symbol["SPY_SHORT"]["position_intent"] == "buy_to_close"
+    assert by_symbol["SPY_LONG"]["side"] == "sell"
+    assert by_symbol["SPY_LONG"]["position_intent"] == "sell_to_close"

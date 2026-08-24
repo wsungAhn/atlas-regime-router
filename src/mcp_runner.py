@@ -2,15 +2,19 @@
 Atlas Options Hackathon — 완전자동 실행 루프 (MCP 클라이언트, LLM 없음).
 
 launchd로 장중에만 주기적으로 트리거된다(9:30~16:00 ET, launchd StartCalendarInterval
-— 정확한 시각은 install_launchd.sh 참고). 매 사이클:
+— 정확한 시각은 config/launchd/com.atlas.options-runner.plist 참고). 매 사이클:
   1. Alpaca MCP `get_clock`으로 실제 장 개폐 확인(공휴일·조기폐장 자동 반영) — 닫혀
      있으면 아무것도 안 하고 조용히 종료(NOOP 로그만).
   2. Alpaca MCP 서버를 서브프로세스로 띄우고 stdio MCP 클라이언트로 접속
      (LLM이 도구를 호출하는 게 아니라, 이 결정론적 스크립트가 직접 MCP
      프로토콜로 place_option_order 등을 호출한다 — 대회요건 "Trading API +
      MCP 서버" 둘 다 충족하면서 완전 자동화도 깨지지 않는다)
-  3. signals.py::decide_for_symbol()로 신호계산(순수 함수, 결정론적)
-  4. 결정이 나오면 MCP get_account_info로 잔고 재확인 → place_option_order 호출
+  3. **청산 감시부터** — 열린 포지션마다 signals.py::evaluate_exit()로 익절/손절/
+     DTE임박 판단, 해당되면 build_close_intent()로 반대매매 주문 제출(Alpaca
+     멀티레그 주문은 브라켓을 지원 안 해서 이 감시를 사이클마다 직접 해야 한다
+     — 2026-08-24 뒤늦게 발견한 진짜 공백, 처음엔 진입만 있고 청산이 없었다)
+  4. **신규진입** — signals.py::decide_for_symbol()로 신호계산(순수 함수,
+     결정론적), 이미 포지션/미체결주문 있는 심볼은 건너뜀
   5. 결과를 registry/decisions.jsonl(감사로그)와 logs/mcp_runner.log(운영로그)에 남긴다
 
 # ponytail: 재시도·백오프는 없음(launchd가 다음 사이클에 자연 재시도) — 이 시스템은
@@ -34,7 +38,9 @@ from mcp.client.stdio import stdio_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from signals import (  # noqa: E402
     MacroGate,
+    build_close_intent,
     decide_for_symbol,
+    evaluate_exit,
     load_macro_gate,
 )
 from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: E402
@@ -78,25 +84,36 @@ def _log_decision(record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-async def _symbols_with_open_exposure(session: ClientSession) -> set[str]:
-    """열린 포지션 + 대기 중(미체결) 주문의 기초자산 심볼 집합. OCC 옵션심볼은
-    항상 기초자산 티커로 시작하므로(예: "SPY260321P00600000") prefix 매칭으로
-    충분하다 — SPY/QQQ처럼 서로 다른 심볼끼리 겹칠 일이 없다."""
-    exposed: set[str] = set()
+def _underlying_of(symbol: str) -> str | None:
+    """OCC 옵션심볼 prefix로 기초자산 판별(예: "SPY260321P00600000" → "SPY")."""
+    for base in SYMBOLS:
+        if symbol.startswith(base):
+            return base
+    return None
+
+
+async def _positions_by_symbol(session: ClientSession) -> dict[str, list[dict]]:
     positions = _mcp_data(await session.call_tool("get_all_positions", {})).get("result", [])
+    grouped: dict[str, list[dict]] = {}
     for p in positions:
-        sym = p.get("symbol", "")
-        for base in SYMBOLS:
-            if sym.startswith(base):
-                exposed.add(base)
+        base = _underlying_of(p.get("symbol", ""))
+        if base:
+            grouped.setdefault(base, []).append(p)
+    return grouped
+
+
+async def _symbols_with_open_orders(session: ClientSession) -> set[str]:
+    """미체결 주문의 기초자산 심볼 집합 — 방금 진입 주문을 넣었는데 아직 안
+    채워진 상태에서 다음 15분 사이클이 또 진입하는 걸 막는다(포지션으로는 아직
+    안 잡히지만 실질적으로 이미 노출된 상태이므로)."""
+    exposed: set[str] = set()
     orders = _mcp_data(await session.call_tool("get_orders", {"status": "open"})).get("result", [])
     for o in orders:
         legs = o.get("legs") or [o]
         for leg in legs:
-            sym = leg.get("symbol", "")
-            for base in SYMBOLS:
-                if sym.startswith(base):
-                    exposed.add(base)
+            base = _underlying_of(leg.get("symbol", ""))
+            if base:
+                exposed.add(base)
     return exposed
 
 
@@ -133,7 +150,34 @@ async def run_cycle_once() -> None:
             macro: MacroGate = load_macro_gate()
             logger.info("[MACRO] ok=%s reason=%s stage=%s", macro.ok, macro.reason, macro.stage)
 
-            symbols_with_exposure = await _symbols_with_open_exposure(session)
+            # ── 1) 청산 감시 — 열린 포지션부터 먼저 확인 (신규진입보다 항상 우선) ──
+            positions_by_symbol = await _positions_by_symbol(session)
+            for symbol, legs in positions_by_symbol.items():
+                try:
+                    exit_decision = evaluate_exit(legs)
+                except Exception:
+                    logger.exception("[ERROR] evaluate_exit failed for %s — leaving position open", symbol)
+                    continue
+                if not exit_decision.should_close:
+                    logger.info("[HOLD] %s pnl_pct=%.1f%%", symbol, exit_decision.profit_pct * 100)
+                    continue
+                close_intent = build_close_intent(legs, client_order_id=f"atlas-close-{symbol}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}")
+                try:
+                    close_result = _mcp_data(await session.call_tool("place_option_order", close_intent))
+                except Exception:
+                    logger.exception("[ERROR] close order failed for %s (reason=%s) — will retry next cycle", symbol, exit_decision.reason)
+                    _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "close_order_error", "exit_reason": exit_decision.reason})
+                    continue
+                logger.info("[CLOSE] %s reason=%s pnl_pct=%.1f%%", symbol, exit_decision.reason, exit_decision.profit_pct * 100)
+                _log_decision({
+                    "symbol": symbol, "submitted": True, "action": "close",
+                    "exit_reason": exit_decision.reason, "profit_pct": exit_decision.profit_pct,
+                    "order_intent": close_intent, "order_result": close_result,
+                })
+
+            # ── 2) 신규진입 — 이미 포지션/미체결주문 있는 심볼은 건너뛴다 ──
+            symbols_with_pending_orders = await _symbols_with_open_orders(session)
+            symbols_with_exposure = set(positions_by_symbol.keys()) | symbols_with_pending_orders
             if symbols_with_exposure:
                 logger.info("[EXPOSURE] already open/pending: %s", sorted(symbols_with_exposure))
 

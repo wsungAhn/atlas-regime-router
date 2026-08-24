@@ -42,6 +42,12 @@ TARGET_DTE_RANGE = (30, 45)
 SHORT_DELTA_TARGET = 0.15
 PROTECTIVE_DELTA_TARGET = 0.06  # 보호레그는 숏레그보다 델타가 훨씬 낮은(더 바깥) 쪽
 
+# ── 청산 규칙(백테스트 backtest.py와 동일 상수 — 실행에도 반드시 배선할 것.
+#    2026-08-24 발견: 이전엔 진입만 있고 청산 감시가 아예 없었다) ──
+PROFIT_TARGET_PCT = 0.5   # 수취 크레딧의 50% 이익 실현 시 청산
+STOP_LOSS_MULTIPLE = 2.0  # 청산비용이 수취크레딧의 2배 도달 시 손절
+FORCE_CLOSE_DTE = MIN_DTE  # 이 DTE 이하로 내려가면 손익 무관 강제청산
+
 MACRO_DB_PATH = Path.home() / ".local/share/regime-signals/verdicts.db"
 MACRO_BLOCK_STAGES = {"stage4_declining"}
 
@@ -94,6 +100,25 @@ class RegimeSignal:
     atr: float
     adx: float
     close: float
+    risk_pct: float = RISK_PCT_MIN  # 변동성 기반 2~5%, atr_pct_percentile_bounds로 계산
+
+
+ATR_PCT_LOOKBACK_DAYS = 252
+
+
+def atr_pct_percentile_bounds(df: pd.DataFrame, lookback: int = ATR_PCT_LOOKBACK_DAYS) -> tuple[float, float, float]:
+    """(현재 ATR%, 25th pct, 75th pct) — risk_pct_for_atr_pct에 그대로 먹인다.
+    데이터가 lookback보다 짧으면 있는 만큼으로 근사(콜드스타트, 상장 얼마 안 된
+    종목 대비 — SPY/QQQ엔 해당 없지만 함수 자체는 일반화해 둔다)."""
+    atr = ind.wilder_atr(df, 14)
+    atr_pct = (atr / df["close"]).dropna()
+    window = atr_pct.tail(lookback)
+    if window.empty:
+        return 0.0, 0.0, 0.0
+    current = float(window.iloc[-1])
+    low_q = float(window.quantile(0.25))
+    high_q = float(window.quantile(0.75))
+    return current, low_q, high_q
 
 
 def classify_regime_from_bars(df: pd.DataFrame, symbol: str) -> RegimeSignal:
@@ -103,15 +128,23 @@ def classify_regime_from_bars(df: pd.DataFrame, symbol: str) -> RegimeSignal:
     쓴다 — SPY/QQQ 3년 백테스트에서 5번이 승률 77~85%·Calmar 0.4~2.8로 7전략 중
     1위였다(2026-08-24 실측). ADX 단독 임계값(구버전)보다 RSI·VWAP 근접까지
     같이 보는 이 조건이 실제로 검증된 것 — MVP를 그 결과에 맞춰 승자 중심으로
-    재구성."""
-    df = df.tail(80)
-    atr = float(ind.wilder_atr(df, 14).iloc[-1])
-    adx = float(ind.adx(df, 14).iloc[-1])
-    ema20 = float(ind.ema(df["close"], 20).iloc[-1])
-    ema50 = float(ind.ema(df["close"], 50).iloc[-1])
-    rsi = float(ind.rsi(df, 14).iloc[-1])
-    vwap = float(ind.vwap_session(df, window=20).iloc[-1])
-    close = float(df["close"].iloc[-1])
+    재구성.
+
+    risk_pct는 전체 df(가능하면 ATR_PCT_LOOKBACK_DAYS=252일치)의 ATR% 분위수로
+    계산한다 — 원래 risk_pct_for_atr_pct가 정의만 되고 어디서도 안 불리는 죽은
+    코드였다(항상 고정 min(2%,3%)=2%만 씀, 백테스트가 검증한 5%와 불일치).
+    사용자가 "첫 진입이 최대사이징 아니냐"고 물어서 확인하다가 발견해서 배선."""
+    regime_window = df.tail(80)
+    atr = float(ind.wilder_atr(regime_window, 14).iloc[-1])
+    adx = float(ind.adx(regime_window, 14).iloc[-1])
+    ema20 = float(ind.ema(regime_window["close"], 20).iloc[-1])
+    ema50 = float(ind.ema(regime_window["close"], 50).iloc[-1])
+    rsi = float(ind.rsi(regime_window, 14).iloc[-1])
+    vwap = float(ind.vwap_session(regime_window, window=20).iloc[-1])
+    close = float(regime_window["close"].iloc[-1])
+
+    current_atr_pct, low_q, high_q = atr_pct_percentile_bounds(df)
+    risk_pct = risk_pct_for_atr_pct(current_atr_pct, low_q, high_q)
 
     if atr > 0 and adx < 18 and abs(close - vwap) / atr < 1.0 and 40 < rsi < 60:
         regime = "range"
@@ -121,13 +154,13 @@ def classify_regime_from_bars(df: pd.DataFrame, symbol: str) -> RegimeSignal:
         regime = "trend_down"
     else:
         regime = "cash"
-    return RegimeSignal(symbol=symbol, regime=regime, atr=atr, adx=adx, close=close)
+    return RegimeSignal(symbol=symbol, regime=regime, atr=atr, adx=adx, close=close, risk_pct=risk_pct)
 
 
 def fetch_and_classify_regime(client: StockHistoricalDataClient, symbol: str) -> RegimeSignal:
     req = StockBarsRequest(
         symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
-        start=datetime.now(timezone.utc) - timedelta(days=120),
+        start=datetime.now(timezone.utc) - timedelta(days=ATR_PCT_LOOKBACK_DAYS + 30),
     )
     bars = client.get_stock_bars(req).df
     df = bars.xs(symbol, level="symbol") if isinstance(bars.index, pd.MultiIndex) else bars
@@ -248,7 +281,13 @@ def decide_for_symbol(
     if signal.regime == "cash":
         return CycleDecision(symbol, signal.regime, macro, None, "regime_cash")
 
-    risk_budget = min(equity * RISK_PCT_MIN, equity * SAME_UNDERLYING_RISK_CAP_PCT)
+    # signal.risk_pct(2~5%, ATR 분위수 기반 동적)를 그대로 쓴다 — 이전엔
+    # SAME_UNDERLYING_RISK_CAP_PCT(3%, "동일종목 여러 포지션 합산 상한" 개념)를
+    # 여기 곱해서 사실상 항상 2%로 눌러버리는 결함이 있었다(백테스트 portfolio.py
+    # 에서도 같은 유형의 혼동을 한 번 발견해 고친 적 있음 — 이번엔 라이브 쪽).
+    # 종목당 동시보유 1개(_symbols_with_open_exposure 가드)라 same-underlying
+    # 상한은 이 시점에 이미 자동 충족된다.
+    risk_budget = equity * signal.risk_pct
     cid_base = f"atlas-{symbol}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
 
     if signal.regime == "range":
@@ -286,3 +325,92 @@ def decide_for_symbol(
         short_leg, long_leg, qty, net_credit=1.0, client_order_id=f"{cid_base}-spread",
     )
     return CycleDecision(symbol, signal.regime, macro, intent, None)
+
+
+# ── 청산 감시 (2026-08-24 추가 — 이전엔 진입만 있고 청산이 전혀 없었다) ──
+# Alpaca 옵션 멀티레그 주문은 브라켓(진입 시 익절/손절 동시지정)을 지원하지 않는다
+# (place_option_order 스키마에 take_profit/stop_loss 필드 자체가 없음, 실측 확인).
+# 그래서 사이클마다 열린 포지션을 직접 조회해 손익을 계산하고 청산 여부를 판단해야
+# 한다 — 이 파일은 그 판단(순수 함수)만 하고, 실제 포지션 조회·주문 제출은
+# mcp_runner.py가 한다(신호계산과 실행을 분리하는 이 모듈의 기존 원칙 그대로).
+
+def _occ_expiration(symbol: str) -> date | None:
+    """OCC 옵션심볼(예: SPY260321P00600000)에서 만기일 추출. 파싱 실패 시 None
+    (강제청산 판단을 못 하게 되므로 mcp_runner.py가 이 경우 로그만 남기고 스킵)."""
+    for i, ch in enumerate(symbol):
+        if ch.isdigit():
+            digits = symbol[i:i + 6]
+            if len(digits) == 6 and digits.isdigit():
+                try:
+                    return datetime.strptime(digits, "%y%m%d").date()
+                except ValueError:
+                    return None
+            return None
+    return None
+
+
+@dataclass
+class ExitDecision:
+    should_close: bool
+    reason: str  # "profit_target" | "stop_loss" | "dte_forced" | "hold"
+    profit_pct: float
+
+
+def evaluate_exit(leg_positions: list[dict], today: date | None = None) -> ExitDecision:
+    """한 스프레드를 구성하는 레그들(Alpaca position dict, 필드: symbol, cost_basis,
+    unrealized_pl)을 받아 청산해야 하는지 판단한다. 순수 함수 — 실제 포지션
+    리스트만 있으면 브로커 연결 없이 테스트 가능.
+
+    부호규약: cost_basis 합의 음수 절대값을 "수취 크레딧"으로 본다(순크레딧
+    포지션이면 진입 시 현금이 들어왔으므로 Alpaca가 음의 cost_basis로 기록하는
+    것이 표준 규약 — 라이브에서 최초 체결 후 실측으로 재검증 필요, 여기선
+    이 규약을 전제로 한다는 걸 명시해 둔다)."""
+    if not leg_positions:
+        return ExitDecision(False, "hold", 0.0)
+
+    today = today or datetime.now(timezone.utc).date()
+    total_cost_basis = sum(float(p.get("cost_basis", 0.0)) for p in leg_positions)
+    total_unrealized_pl = sum(float(p.get("unrealized_pl", 0.0)) for p in leg_positions)
+    credit_received = abs(total_cost_basis)
+
+    expirations = [_occ_expiration(p.get("symbol", "")) for p in leg_positions]
+    valid_expirations = [e for e in expirations if e is not None]
+    if valid_expirations:
+        min_dte = min((e - today).days for e in valid_expirations)
+        if min_dte <= FORCE_CLOSE_DTE:
+            return ExitDecision(True, "dte_forced", total_unrealized_pl / credit_received if credit_received else 0.0)
+
+    if credit_received <= 0:
+        return ExitDecision(False, "hold", 0.0)  # 정보 부족 — 손익 판단 불가, 강제청산(DTE)만 유효
+
+    profit_pct = total_unrealized_pl / credit_received
+    if profit_pct >= PROFIT_TARGET_PCT:
+        return ExitDecision(True, "profit_target", profit_pct)
+    if profit_pct <= -(STOP_LOSS_MULTIPLE - 1.0):
+        return ExitDecision(True, "stop_loss", profit_pct)
+    return ExitDecision(False, "hold", profit_pct)
+
+
+def build_close_intent(leg_positions: list[dict], client_order_id: str) -> dict:
+    """열린 포지션의 반대 방향(숏→buy_to_close, 롱→sell_to_close)으로 청산 주문을
+    만든다. limit_price는 시장가에 가깝게(0.0 근처) — 청산은 방향성 베팅이 아니라
+    리스크 종료가 목적이므로 가격에 민감하게 굴 이유가 없다. 실제 체결 보장을
+    위해 market 타입을 쓴다(멀티레그도 Alpaca가 market order_class=mleg 지원)."""
+    legs = []
+    for p in leg_positions:
+        side_held = str(p.get("side", "")).lower()
+        if side_held == "short":
+            side, intent = "buy", "buy_to_close"
+        else:
+            side, intent = "sell", "sell_to_close"
+        legs.append({
+            "symbol": p["symbol"], "ratio_qty": "1", "side": side, "position_intent": intent,
+        })
+    return {
+        "qty": str(int(abs(float(leg_positions[0].get("qty", 1))))),
+        "type": "market",
+        "time_in_force": "day",
+        "order_class": "mleg",
+        "client_order_id": client_order_id,
+        "legs": legs,
+    }
