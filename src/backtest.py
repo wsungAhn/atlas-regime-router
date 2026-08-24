@@ -89,7 +89,16 @@ def _run_side(
     df: pd.DataFrame, mtm_iv: pd.Series, dates: list[pd.Timestamp], spread_type: str, weight: float,
 ) -> list[dict]:
     """dates에 실제 진입한 raw 거래를 시뮬레이션하고, portfolio.py가 사이징에 쓸
-    weight(래더 레벨 가중치, 비래더 전략은 1.0)를 각 거래 dict에 태깅한다."""
+    weight(래더 레벨 가중치, 비래더 전략은 1.0)를 각 거래 dict에 태깅한다.
+
+    max_concurrent_positions=1 — 라이브(mcp_runner.py의 _symbols_with_open_
+    exposure 가드)가 종목당 동시보유 1개로 제한하는 것과 맞춘다. 원래 3으로
+    돌리고 있었는데, 이러면 레짐이 며칠 지속될 때 백테스트가 동시에 최대 3개
+    포지션을 겹쳐 쌓아 실제 라이브보다 더 많은 거래·더 큰 익스포저를 낸다
+    (사용자가 "실제보다 더 많은 거래가 일어날 수 있는 거 아니냐"고 정확히
+    지적해서 발견). 래더(전략2/3)는 레벨별로 별도 그룹 시뮬레이션이라 레벨1·2·3이
+    각자 1개씩 동시보유는 가능(래더의 설계 의도 자체가 다단 동시진입이라 여기는
+    예외) — 콘도르·단일스프레드 전략(1,4,5,6,7)만 "정확히 라이브와 동일"해진다."""
     if not dates:
         return []
     result = run_portfolio_simulation(
@@ -98,7 +107,7 @@ def _run_side(
         delta_short_leg=DELTA_SHORT_LEG, spread_width_pct=SPREAD_WIDTH_PCT,
         spread_type=spread_type, profit_target_pct=PROFIT_TARGET_PCT,
         stop_loss_multiple=STOP_LOSS_MULTIPLE, strike_increment=STRIKE_INCREMENT,
-        credit_haircut_pct=CREDIT_HAIRCUT_PCT, max_concurrent_positions=3,
+        credit_haircut_pct=CREDIT_HAIRCUT_PCT, max_concurrent_positions=1,
     )
     trades = result["trade_log"]
     for t in trades:
