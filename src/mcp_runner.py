@@ -38,9 +38,12 @@ from mcp.client.stdio import stdio_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from signals import (  # noqa: E402
     MacroGate,
+    RiskGateDecision,
+    RiskGateState,
     build_close_intent,
     decide_for_symbol,
     evaluate_exit,
+    evaluate_risk_gates,
     load_macro_gate,
 )
 from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: E402
@@ -49,7 +52,40 @@ from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DECISION_LOG = REPO_ROOT / "registry" / "decisions.jsonl"
 RUNNER_LOG = REPO_ROOT / "logs" / "mcp_runner.log"
-SYMBOLS = ("SPY", "QQQ")
+RISK_GATE_STATE_PATH = REPO_ROOT / "registry" / "risk_gate_state.json"
+ENV_FILE = REPO_ROOT / ".env.competition"
+SYMBOLS = ("SPY", "QQQ", "GLD", "TLT", "SLV", "IWM")  # 2026-08-25: 지수 2 +
+# 금(GLD)+장기채(TLT)+은(SLV)+소형주(IWM) 4개 추가 — SPY/QQQ만 있으면 "동일종목
+# 여러 개 보유"와 리스크 성격이 비슷해서(사용자 지적) 진짜 다른 자산군으로 분산.
+# 6종목 모두 일봉 백테스트(P&L 실측) + 라이브 옵션체인 유동성 드라이런 둘 다
+# 통과. **XLE/XLF/EEM은 백테스트에서 이 챔피언 전략으로 손실이 나서 제외**
+# (각각 -$17k/-$21k/-$20k, 3yr) — "검증됐다"고 우기지 않고 실제로 진 걸 안 씀.
+# VNQ/HYG는 백테스트는 좋았지만(+$52k/+$36k) 실제 옵션체인이 5~9일 위클리
+# 만기를 못 채워서(chain_insufficient) 제외 — 백테스트가 못 보는 걸 라이브
+# 드라이런이 잡아낸 경우. DIA는 손익이 사실상 0(+$1.6k/3yr)이라 추가 가치 없어
+# 제외. 목표였던 8종목(최대 80% 예산)엔 못 미치지만, 검증 안 된 걸 억지로
+# 채우는 것보다 정직한 6종목(최대 60%)이 낫다고 판단.
+
+
+def _load_env_file(path: Path) -> None:
+    """launchd는 셸 프로필을 안 거쳐서 .env.competition을 자동으로 안 읽는다.
+    alpaca-mcp-server 서브프로세스는 --env-file로 자체 로드하지만, 이 프로세스
+    자신도 StockHistoricalDataClient/OptionHistoricalDataClient를 직접 생성하려고
+    os.environ["ALPACA_API_KEY"]를 그대로 읽는다 — 2026-08-25 07:15 첫 실거래
+    사이클이 이 누락으로 KeyError 크래시(장 열림 확인·잔고조회까지는 성공하고
+    시장데이터 클라이언트 생성에서 죽음). generate_report.py엔 같은 문제를 전날
+    밤에 미리 고쳐놓고 정작 이 파일엔 빠뜨렸었다."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_env_file(ENV_FILE)
 
 logger = logging.getLogger("mcp_runner")
 
@@ -77,11 +113,55 @@ def _mcp_data(tool_result) -> dict:
     return payload["data"]
 
 
+def _order_error(payload: dict) -> str | None:
+    """place_option_order가 브로커에 거부당해도(계좌 옵션등급 부족, 마진부족 등)
+    MCP 도구 호출 자체는 예외를 안 던진다 — 응답 데이터 안에 {"error": {...}}로
+    담겨 정상 반환된다. **2026-08-25 07:15 첫 실거래에서 실측**: SPY 주문이
+    "account not eligible to trade uncovered option contracts"(403)로 거부됐는데
+    로그·decisions.jsonl엔 submitted=true/[SUBMIT]로 찍혀 있었다 — 이 함수 없이는
+    거부된 주문이 "성공"으로 조용히 기록된다. QQQ 동일 구조 주문은 정상 체결돼서
+    계좌 전체 문제가 아니라 이 주문 하나의 문제였음을 확인."""
+    if isinstance(payload, dict) and "error" in payload:
+        err = payload["error"]
+        if isinstance(err, dict):
+            return f"{err.get('message', 'unknown')} (detail: {err.get('detail')})"
+        return str(err)
+    return None
+
+
 def _log_decision(record: dict) -> None:
     DECISION_LOG.parent.mkdir(parents=True, exist_ok=True)
     record["ts"] = datetime.now(timezone.utc).isoformat()
     with open(DECISION_LOG, "a") as f:
         f.write(json.dumps(record) + "\n")
+
+
+def _load_risk_gate_state(equity: float) -> tuple[RiskGateState | None, bool]:
+    """프로세스가 사이클마다 새로 뜨므로 상태는 파일로만 지속된다. 파일이
+    없으면(최초 실행) 지금 잔고를 HWM으로 삼아 새로 시작 — 정지 없음.
+
+    **2026-08-25 Codex 감사 지적, fail-closed로 수정**: 파일이 손상됐을 때
+    예전엔 HWM을 현재 잔고로 "리셋"했다 — 이러면 실제로 -20% 아래로 빠져있는
+    상태에서 손상이 나면 서킷브레이커가 조용히 풀려버린다(fail-open, 정확히
+    이 게이트가 막아야 할 상황을 손상 하나로 우회). 이제 손상 시 (None, True)를
+    반환 — 호출자는 신규진입 전체를 이번 사이클 무조건 차단하고, 파일도
+    덮어쓰지 않는다(사후분석 위해 원본 보존)."""
+    if not RISK_GATE_STATE_PATH.exists():
+        return RiskGateState(high_water_mark=equity), False
+    try:
+        return RiskGateState.from_dict(json.loads(RISK_GATE_STATE_PATH.read_text())), False
+    except (json.JSONDecodeError, KeyError, ValueError):
+        logger.exception("[ERROR] risk_gate_state.json corrupt — fail-closed (신규진입 전체 차단, 파일은 안 건드림)")
+        return None, True
+
+
+def _save_risk_gate_state(state: RiskGateState) -> None:
+    """임시파일에 쓰고 os.replace로 원자적 치환 — 사이클 중간에 프로세스가
+    죽어도(launchd kill, crash) 절반만 쓰인 손상 파일이 안 남는다."""
+    RISK_GATE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = RISK_GATE_STATE_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(state.to_dict()))
+    os.replace(tmp_path, RISK_GATE_STATE_PATH)
 
 
 def _underlying_of(symbol: str) -> str | None:
@@ -102,17 +182,70 @@ async def _positions_by_symbol(session: ClientSession) -> dict[str, list[dict]]:
     return grouped
 
 
+STALE_ORDER_MAX_MINUTES = 30  # 라이브 15분 루프 기준 2사이클 — 그 이상 안 걸리면
+# 제출 시점 가격이 시장과 멀어졌다고 보고 취소해서 자리를 되돌린다.
+# **2026-08-25 실측 발견**: GLD 주문이 63분, IWM 주문이 48분째 미체결로 방치되고
+# 있었다 — 한 번 제출하면 재조정·취소·재시도가 전혀 없어서 하루 종일 그 종목
+# 자리만 막고 아무 일도 안 일어나는 상태였다.
+
+
+def _order_age_minutes(order: dict, now: datetime) -> float | None:
+    submitted_at = order.get("submitted_at") or order.get("created_at")
+    if not submitted_at:
+        return None
+    try:
+        submitted_dt = datetime.fromisoformat(str(submitted_at).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (now - submitted_dt).total_seconds() / 60
+
+
+async def _cancel_stale_orders(session: ClientSession, orders: list[dict], now: datetime | None = None) -> set[str]:
+    """STALE_ORDER_MAX_MINUTES보다 오래 안 걸린 미체결 주문을 취소하고, 취소된
+    주문이 걸려있던 기초자산 심볼 집합을 반환한다 — 호출자가 이 심볼들을
+    "노출됨" 집합에서 빼서 이번 사이클에 새 가격으로 재시도할 수 있게 한다."""
+    now = now or datetime.now(timezone.utc)
+    freed: set[str] = set()
+    for o in orders:
+        age = _order_age_minutes(o, now)
+        if age is None or age < STALE_ORDER_MAX_MINUTES:
+            continue
+        order_id = o.get("id")
+        legs = o.get("legs") or [o]
+        symbols = {base for leg in legs if (base := _underlying_of(leg.get("symbol", "")))}
+        if not order_id or not symbols:
+            continue
+        try:
+            await session.call_tool("cancel_order_by_id", {"order_id": order_id})
+        except Exception:
+            logger.exception("[ERROR] failed to cancel stale order %s (age=%.0fmin)", order_id, age)
+            continue
+        logger.info("[CANCEL_STALE] order_id=%s age=%.0fmin symbols=%s — freed for repricing", order_id, age, sorted(symbols))
+        freed |= symbols
+    return freed
+
+
 async def _symbols_with_open_orders(session: ClientSession) -> set[str]:
     """미체결 주문의 기초자산 심볼 집합 — 방금 진입 주문을 넣었는데 아직 안
     채워진 상태에서 다음 15분 사이클이 또 진입하는 걸 막는다(포지션으로는 아직
-    안 잡히지만 실질적으로 이미 노출된 상태이므로)."""
+    안 잡히지만 실질적으로 이미 노출된 상태이므로). 오래된(STALE_ORDER_MAX_MINUTES
+    초과) 주문은 여기서 취소하고 노출 집합에서 빼서 같은 사이클에 재시도되게 한다.
+
+    **2026-08-25 Codex 감사 지적**: `nested`를 명시 안 하면 Alpaca API의
+    실제 기본값에 이 가드가 암묵적으로 의존하게 된다 — nested=false면 멀티레그
+    주문이 부모 없이 개별 레그로 평면화돼 나올 수 있고(그 자체는 leg.symbol로
+    잡히니 안전), nested=true가 진짜 필요한 형태는 아래 코드가 원래 가정하고
+    있던 "부모 order에 legs 배열" 모양이다(테스트 픽스처가 이 모양을 가정해
+    작성돼 있었는데 정작 실제 호출은 nested를 안 넘기고 있었다) — 명시해서
+    가정과 실제 호출을 일치시킨다."""
     exposed: set[str] = set()
-    orders = _mcp_data(await session.call_tool("get_orders", {"status": "open"})).get("result", [])
+    orders = _mcp_data(await session.call_tool("get_orders", {"status": "open", "nested": True})).get("result", [])
+    freed = await _cancel_stale_orders(session, orders)
     for o in orders:
         legs = o.get("legs") or [o]
         for leg in legs:
             base = _underlying_of(leg.get("symbol", ""))
-            if base:
+            if base and base not in freed:
                 exposed.add(base)
     return exposed
 
@@ -150,9 +283,30 @@ async def run_cycle_once() -> None:
             macro: MacroGate = load_macro_gate()
             logger.info("[MACRO] ok=%s reason=%s stage=%s", macro.ok, macro.reason, macro.stage)
 
-            # ── 1) 청산 감시 — 열린 포지션부터 먼저 확인 (신규진입보다 항상 우선) ──
+            risk_gate_state, state_corrupt = _load_risk_gate_state(equity)
+            if state_corrupt:
+                # 손상 파일은 그대로 둔다(덮어쓰면 사후분석 불가) — 사람이 고칠 때까지 매 사이클 차단.
+                risk_gate = RiskGateDecision(True, "state_corrupt_fail_closed", RiskGateState(high_water_mark=equity))
+            else:
+                risk_gate = evaluate_risk_gates(equity, risk_gate_state)
+                _save_risk_gate_state(risk_gate.state)
+            if risk_gate.blocked:
+                logger.info(
+                    "[RISK_GATE] reason=%s hwm=%.2f halt_until=%s — 신규진입 억제(청산감시는 계속)",
+                    risk_gate.reason, risk_gate.state.high_water_mark, risk_gate.state.halt_until,
+                )
+
+            # ── 1) 청산 감시 — 열린 포지션부터 먼저 확인 (신규진입보다 항상 우선,
+            #    리스크게이트 정지 중에도 청산은 절대 안 막는다). 미체결 주문
+            #    목록을 먼저 가져와서 이미 청산주문이 나가있는 심볼은 중복 제출
+            #    안 하게 막는다(2026-08-25 Codex 감사 지적 — market 주문이라
+            #    실제 걸릴 가능성은 낮지만 공짜로 막을 수 있는 방어선). ──
+            symbols_with_pending_orders = await _symbols_with_open_orders(session)
             positions_by_symbol = await _positions_by_symbol(session)
             for symbol, legs in positions_by_symbol.items():
+                if symbol in symbols_with_pending_orders:
+                    logger.info("[SKIP] %s already has a pending order — no duplicate close/entry this cycle", symbol)
+                    continue
                 try:
                     exit_decision = evaluate_exit(legs)
                 except Exception:
@@ -161,12 +315,25 @@ async def run_cycle_once() -> None:
                 if not exit_decision.should_close:
                     logger.info("[HOLD] %s pnl_pct=%.1f%%", symbol, exit_decision.profit_pct * 100)
                     continue
-                close_intent = build_close_intent(legs, client_order_id=f"atlas-close-{symbol}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}")
+                try:
+                    close_intent = build_close_intent(legs, client_order_id=f"atlas-close-{symbol}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}")
+                except ValueError:
+                    logger.exception("[ERROR] build_close_intent rejected malformed position for %s — leaving open for manual review", symbol)
+                    _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "malformed_position", "exit_reason": exit_decision.reason})
+                    continue
                 try:
                     close_result = _mcp_data(await session.call_tool("place_option_order", close_intent))
                 except Exception:
                     logger.exception("[ERROR] close order failed for %s (reason=%s) — will retry next cycle", symbol, exit_decision.reason)
                     _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "close_order_error", "exit_reason": exit_decision.reason})
+                    continue
+                broker_error = _order_error(close_result)
+                if broker_error:
+                    logger.error("[ERROR] close order REJECTED by broker for %s (reason=%s): %s — position still open, will retry next cycle", symbol, exit_decision.reason, broker_error)
+                    _log_decision({
+                        "symbol": symbol, "submitted": False, "skip_reason": "close_order_rejected",
+                        "exit_reason": exit_decision.reason, "order_intent": close_intent, "order_result": close_result,
+                    })
                     continue
                 logger.info("[CLOSE] %s reason=%s pnl_pct=%.1f%%", symbol, exit_decision.reason, exit_decision.profit_pct * 100)
                 _log_decision({
@@ -175,8 +342,16 @@ async def run_cycle_once() -> None:
                     "order_intent": close_intent, "order_result": close_result,
                 })
 
-            # ── 2) 신규진입 — 이미 포지션/미체결주문 있는 심볼은 건너뛴다 ──
-            symbols_with_pending_orders = await _symbols_with_open_orders(session)
+            # ── 2) 신규진입 — 리스크게이트 정지 중이면 전체 스킵, 아니면 이미
+            #    포지션/미체결주문 있는 심볼만 건너뛴다 ──
+            if risk_gate.blocked:
+                for symbol in SYMBOLS:
+                    _log_decision({"symbol": symbol, "submitted": False, "skip_reason": f"risk_gate:{risk_gate.reason}"})
+                return
+
+            # symbols_with_pending_orders는 청산루프 전에 이미 조회함 — 재사용
+            # (이 사이클에서 막 낸 청산주문은 아직 이 집합에 없지만, 포지션 자체가
+            # positions_by_symbol에 남아있어서 아래 union이 여전히 올바르게 막는다).
             symbols_with_exposure = set(positions_by_symbol.keys()) | symbols_with_pending_orders
             if symbols_with_exposure:
                 logger.info("[EXPOSURE] already open/pending: %s", sorted(symbols_with_exposure))
@@ -216,6 +391,17 @@ async def run_cycle_once() -> None:
                         "symbol": symbol, "regime": decision.regime,
                         "order_intent": decision.order_intent, "submitted": False,
                         "skip_reason": "order_submit_error",
+                    })
+                    continue
+
+                broker_error = _order_error(order_payload)
+                if broker_error:
+                    logger.error("[ERROR] entry order REJECTED by broker for %s: %s", symbol, broker_error)
+                    _log_decision({
+                        "symbol": symbol, "regime": decision.regime,
+                        "macro_reason": decision.macro_gate.reason,
+                        "order_intent": decision.order_intent, "order_result": order_payload,
+                        "submitted": False, "skip_reason": "order_rejected",
                     })
                     continue
 

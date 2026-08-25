@@ -31,14 +31,25 @@ import indicators as ind
 
 # ── 대회 리스크 게이트(문서 §리스크 게이트와 1:1 대응, 값 변경 시 문서도 같이 고칠 것) ──
 RISK_PCT_MIN = 0.02
-RISK_PCT_MAX = 0.05
+RISK_PCT_MAX = 0.10  # 2026-08-25 오전: 5%→10% 재상향, 사용자 지시("포지션 10%로
+# 유지해") — 대신 일일/주간 킬스위치를 20%/50%로 넓혀서(아래) 포지션 1건의
+# 최악의 경우가 계좌 킬스위치를 혼자 뚫는 문제를 해결. portfolio.py의 동일
+# 공식과 값을 맞출 것(주석 참고).
 SAME_UNDERLYING_RISK_CAP_PCT = 0.03
 PORTFOLIO_RISK_CAP_PCT = 0.06
 CASH_RESERVE_PCT = 0.10
-DAILY_LOSS_KILL_PCT = 0.03
-WEEKLY_LOSS_KILL_PCT = 0.06
-MIN_DTE = 14
-TARGET_DTE_RANGE = (30, 45)
+DAILY_LOSS_KILL_PCT = 0.20  # 2026-08-25 오전: 0.03→0.20, 사용자 지시
+WEEKLY_LOSS_KILL_PCT = 0.50  # 2026-08-25 오전: 0.06→0.50, 사용자 지시
+# 2026-08-24 추가 — 사용자 지시: 계좌 사상최고치(HWM) 대비 -20% 낙폭 시 전체
+# 시스템 신규진입 45분 정지(라이브 15분 루프 기준 2회 패스, 3번째 루프에서
+# 재개). portfolio.py(백테스트)와 값을 맞춘 사본 — 정지는 잔고를 리셋하지
+# 않는다(HWM은 절대 안 낮아지고, 정지 풀려도 이미 난 손실은 그대로 이어간다).
+PORTFOLIO_DD_KILL_PCT = 0.20
+PORTFOLIO_DD_HALT_MINUTES = 45
+TARGET_DTE_RANGE = (5, 9)  # 2026-08-24: 30~45일(월간)→5~9일(주간)로 축소 — 오늘
+# 백테스트가 검증한 챔피언(전략7)이 DTE_DAYS=7(주간옵션)로 회전율을 올려서
+# 나온 결과라, 라이브도 그대로 맞춰야 백테스트=라이브가 유지된다(안 맞추면
+# 오늘 검증한 숫자와 무관한 다른 전략이 라이브에서 돎).
 SHORT_DELTA_TARGET = 0.15
 PROTECTIVE_DELTA_TARGET = 0.06  # 보호레그는 숏레그보다 델타가 훨씬 낮은(더 바깥) 쪽
 
@@ -46,7 +57,11 @@ PROTECTIVE_DELTA_TARGET = 0.06  # 보호레그는 숏레그보다 델타가 훨�
 #    2026-08-24 발견: 이전엔 진입만 있고 청산 감시가 아예 없었다) ──
 PROFIT_TARGET_PCT = 0.5   # 수취 크레딧의 50% 이익 실현 시 청산
 STOP_LOSS_MULTIPLE = 2.0  # 청산비용이 수취크레딧의 2배 도달 시 손절
-FORCE_CLOSE_DTE = MIN_DTE  # 이 DTE 이하로 내려가면 손익 무관 강제청산
+FORCE_CLOSE_DTE = 2  # 2026-08-24: MIN_DTE(14, 월간 시절 값)에서 분리 — 이 DTE
+# 이하로 내려가면 손익 무관 강제청산. 주간옵션(목표 진입 DTE 5~9)에서 14는
+# 진입 직후 항상 강제청산되는 값이라 쓸 수 없었다 — 만기 임박 감마리스크만
+# 피하면 되므로 2일로 재설정(백테스트는 이 강제청산 자체를 시뮬레이션 안 해서
+# 참고할 검증값이 없다 — 감마리스크 회피라는 목적에 맞춘 판단값).
 
 MACRO_DB_PATH = Path.home() / ".local/share/regime-signals/verdicts.db"
 MACRO_BLOCK_STAGES = {"stage4_declining"}
@@ -124,11 +139,14 @@ def atr_pct_percentile_bounds(df: pd.DataFrame, lookback: int = ATR_PCT_LOOKBACK
 def classify_regime_from_bars(df: pd.DataFrame, symbol: str) -> RegimeSignal:
     """순수 함수 — 테스트에서 합성 DataFrame을 바로 넣을 수 있도록 데이터조회와 분리.
 
-    "range" 트리거는 strategies.py의 전략5(평균회귀 콘도르 리셋) 조건을 그대로
-    쓴다 — SPY/QQQ 3년 백테스트에서 5번이 승률 77~85%·Calmar 0.4~2.8로 7전략 중
-    1위였다(2026-08-24 실측). ADX 단독 임계값(구버전)보다 RSI·VWAP 근접까지
-    같이 보는 이 조건이 실제로 검증된 것 — MVP를 그 결과에 맞춰 승자 중심으로
-    재구성.
+    "range"/"trend" 트리거는 strategies.py의 전략7(Atlas MVP, ADX/EMA 2레짐)
+    조건을 그대로 쓴다 — 2026-08-24 챔피언 교체: 리스크캡 상향(5%→10%)+4종목
+    확대 재백테스트에서 7번이 raw $ P&L로 SPY/QQQ/IWM 3/4종목에서 5번(구 챔피언,
+    RSI·VWAP 근접까지 보는 좁은 조건)을 앞질렀다(IWM +28.9% vs +12.1%/3yr).
+    판정기준이 P&L이라 승률·Calmar가 아니라 이 결과를 따른다 — 트레이드오프는
+    MDD 증가(같은 사용자 지시로 확인·수용됨). RSI/VWAP 필터를 걷어내 range
+    트리거 조건이 넓어졌다(ADX<18 단독) — 신호 빈도 자체를 늘리는 게 이번
+    교체의 목적이므로 의도된 변화.
 
     risk_pct는 전체 df(가능하면 ATR_PCT_LOOKBACK_DAYS=252일치)의 ATR% 분위수로
     계산한다 — 원래 risk_pct_for_atr_pct가 정의만 되고 어디서도 안 불리는 죽은
@@ -139,14 +157,12 @@ def classify_regime_from_bars(df: pd.DataFrame, symbol: str) -> RegimeSignal:
     adx = float(ind.adx(regime_window, 14).iloc[-1])
     ema20 = float(ind.ema(regime_window["close"], 20).iloc[-1])
     ema50 = float(ind.ema(regime_window["close"], 50).iloc[-1])
-    rsi = float(ind.rsi(regime_window, 14).iloc[-1])
-    vwap = float(ind.vwap_session(regime_window, window=20).iloc[-1])
     close = float(regime_window["close"].iloc[-1])
 
     current_atr_pct, low_q, high_q = atr_pct_percentile_bounds(df)
     risk_pct = risk_pct_for_atr_pct(current_atr_pct, low_q, high_q)
 
-    if atr > 0 and adx < 18 and abs(close - vwap) / atr < 1.0 and 40 < rsi < 60:
+    if adx < 18:
         regime = "range"
     elif adx > 20 and ema20 > ema50:
         regime = "trend_up"
@@ -169,7 +185,88 @@ def fetch_and_classify_regime(client: StockHistoricalDataClient, symbol: str) ->
 
 # ── 옵션 체인에서 목표 델타 근접 계약 선택 ──
 
-def pick_by_delta(chain: dict, contract_type: ContractType, target_abs_delta: float) -> str | None:
+def _occ_strike(symbol: str) -> float | None:
+    """OCC 옵션심볼 고정폭 스펙(마지막 8자리=행사가*1000)에서 행사가 추출 —
+    티커 길이와 무관하게 뒤에서부터 파싱(_occ_expiration은 앞에서부터 숫자를
+    찾는 방식이라 서로 다른 접근, 여긴 고정폭이 더 안전해서 이걸 씀)."""
+    if len(symbol) < 15:
+        return None
+    strike_str = symbol[-8:]
+    if not strike_str.isdigit():
+        return None
+    return int(strike_str) / 1000.0
+
+
+def _vertical_width(short_symbol: str | None, long_symbol: str | None, contract_type: ContractType) -> float | None:
+    """숏/보호 레그의 실제 스프레드 폭(주가 단위, ×100 전) — 계약당 실제
+    최대손실을 사이징에 쓰기 위함. **2026-08-25 Codex 감사 발견(실측 확인)**:
+    사이징이 `signal.atr * 2.5`라는 러프한 근사만 쓰고 있었는데, 그날 아침
+    실제로 "insufficient options buying power"(요청 마진이 예산 추정과
+    완전히 다름) 거부가 났다 — 진짜 선택된 strike로 사이징해야 한다.
+    방향도 함께 검증한다(풋은 보호행사가<숏행사가, 콜은 보호행사가>숏행사가,
+    같은 계약이면 안 됨) — 아니면 보호가 아니라 의미없는 조합인데도 주문이
+    나갈 뻔했다는 게 이 감사의 또 다른 지적."""
+    if not short_symbol or not long_symbol or short_symbol == long_symbol:
+        return None
+    short_k = _occ_strike(short_symbol)
+    long_k = _occ_strike(long_symbol)
+    if short_k is None or long_k is None:
+        return None
+    if contract_type == ContractType.PUT and not (long_k < short_k):
+        return None
+    if contract_type == ContractType.CALL and not (long_k > short_k):
+        return None
+    return abs(short_k - long_k)
+
+
+def _mid_price(snap) -> float | None:
+    """호가 중간값 — 크레딧 계산용. **2026-08-25 실거래로 발견**: 이전엔
+    net_credit이 전부 하드코딩 `1.0`이었다 — SPY/QQQ는 우연히(프리미엄이
+    $1보다 커서 "1달러만 받아도 좋다"는 아주 유리한/체결되기 쉬운 가격이라)
+    체결됐지만, GLD/TLT는 실제 프리미엄이 $1보다 작아서 $1 크레딧 요구가
+    시장에 없는 가격이라 주문이 NEW 상태로 계속 미체결이었다. 실제 호가로
+    계산해야 아무 종목에서나 정상 작동한다."""
+    q = getattr(snap, "latest_quote", None)
+    if q is None:
+        return None
+    bid, ask = getattr(q, "bid_price", None) or 0.0, getattr(q, "ask_price", None) or 0.0
+    if bid <= 0 and ask <= 0:
+        return None
+    if bid <= 0:
+        return float(ask)
+    if ask <= 0:
+        return float(bid)
+    return (float(bid) + float(ask)) / 2.0
+
+
+CREDIT_HAIRCUT_PCT = 0.05  # 호가 중간값보다 살짝 낮게 요구해 체결 가능성을 높임(backtest.py와 동일 개념)
+
+
+def _vertical_credit(chain: dict, short_symbol: str | None, long_symbol: str | None) -> float | None:
+    """숏/롱 레그의 실제 중간가로 순크레딧 계산 — None이면 호가데이터 부족."""
+    if not short_symbol or not long_symbol:
+        return None
+    short_snap, long_snap = chain.get(short_symbol), chain.get(long_symbol)
+    if short_snap is None or long_snap is None:
+        return None
+    short_mid, long_mid = _mid_price(short_snap), _mid_price(long_snap)
+    if short_mid is None or long_mid is None:
+        return None
+    return short_mid - long_mid
+
+
+def pick_by_delta(
+    chain: dict, contract_type: ContractType, target_abs_delta: float,
+    expiration: date | None = None,
+) -> str | None:
+    """expiration을 주면 그 만기의 계약으로만 후보를 제한한다. **2026-08-25 실거래
+    사고로 발견**: TARGET_DTE_RANGE를 주간옵션(5~9일)으로 좁힌 뒤로 그 창 안에
+    만기가 여러 개(월/수/금 위클리) 걸쳐 있는데, 숏레그·롱레그를 독립적으로
+    "델타 최근접"만 보고 고르다 보니 SPY 콜스프레드가 숏 만기 9/3·롱(보호)
+    만기 9/2로 갈렸다 — 보호레그가 숏레그보다 하루 먼저 만기돼서 그 하루 동안
+    사실상 네이키드였고, Alpaca가 "uncovered option contracts"로 거부. 이제
+    숏레그를 먼저 고른 뒤 그 만기로 보호레그 후보를 제한해서 같은 만기끼리만
+    스프레드를 구성한다."""
     candidates = []
     for sym, snap in chain.items():
         if snap.greeks is None:
@@ -178,6 +275,8 @@ def pick_by_delta(chain: dict, contract_type: ContractType, target_abs_delta: fl
         if contract_type == ContractType.CALL and not is_call:
             continue
         if contract_type == ContractType.PUT and is_call:
+            continue
+        if expiration is not None and _occ_expiration(sym) != expiration:
             continue
         candidates.append((sym, abs(abs(snap.greeks.delta) - target_abs_delta)))
     if not candidates:
@@ -205,7 +304,7 @@ def risk_pct_for_atr_pct(atr_pct: float, atr_pct_low_q: float, atr_pct_high_q: f
     if atr_pct_high_q <= atr_pct_low_q:
         return RISK_PCT_MIN
     scaled = (atr_pct - atr_pct_low_q) / (atr_pct_high_q - atr_pct_low_q)
-    r = RISK_PCT_MAX - 0.03 * max(0.0, min(1.0, scaled))
+    r = RISK_PCT_MAX - (RISK_PCT_MAX - RISK_PCT_MIN) * max(0.0, min(1.0, scaled))
     return max(RISK_PCT_MIN, min(RISK_PCT_MAX, r))
 
 
@@ -295,16 +394,27 @@ def decide_for_symbol(
         calls = fetch_chain(option_client, symbol, ContractType.CALL)
         short_put = pick_by_delta(puts, ContractType.PUT, SHORT_DELTA_TARGET)
         short_call = pick_by_delta(calls, ContractType.CALL, SHORT_DELTA_TARGET)
-        long_put = pick_by_delta(puts, ContractType.PUT, PROTECTIVE_DELTA_TARGET)
-        long_call = pick_by_delta(calls, ContractType.CALL, PROTECTIVE_DELTA_TARGET)
+        # 보호레그는 반드시 그 숏레그와 같은 만기로만 고른다 — 아니면 보호레그가
+        # 숏레그보다 먼저 만기돼 그 사이 네이키드가 되는 사고가 재발한다(2026-08-25 실측).
+        long_put = pick_by_delta(puts, ContractType.PUT, PROTECTIVE_DELTA_TARGET, expiration=_occ_expiration(short_put) if short_put else None)
+        long_call = pick_by_delta(calls, ContractType.CALL, PROTECTIVE_DELTA_TARGET, expiration=_occ_expiration(short_call) if short_call else None)
         if not all([short_put, long_put, short_call, long_call]):
             return CycleDecision(symbol, signal.regime, macro, None, "chain_insufficient")
-        max_loss_est = signal.atr * 2.5 * 100
+        put_width = _vertical_width(short_put, long_put, ContractType.PUT)
+        call_width = _vertical_width(short_call, long_call, ContractType.CALL)
+        if put_width is None or call_width is None:
+            return CycleDecision(symbol, signal.regime, macro, None, "malformed_spread")
+        max_loss_est = max(put_width, call_width) * 100  # 실제 폭 기준(콘도르는 두 사이드 중 더 넓은 쪽이 최대손실)
         qty = contracts_for_max_loss(risk_budget, max_loss_est)
         if qty < 1:
             return CycleDecision(symbol, signal.regime, macro, None, "qty_below_1")
+        put_credit = _vertical_credit(puts, short_put, long_put)
+        call_credit = _vertical_credit(calls, short_call, long_call)
+        if put_credit is None or call_credit is None:
+            return CycleDecision(symbol, signal.regime, macro, None, "no_quote_data")
+        net_credit = max(0.01, (put_credit + call_credit) * (1.0 - CREDIT_HAIRCUT_PCT))
         intent = build_iron_condor_intent(
-            short_put, long_put, short_call, long_call, qty, net_credit=1.0,
+            short_put, long_put, short_call, long_call, qty, net_credit=net_credit,
             client_order_id=f"{cid_base}-condor",
         )
         return CycleDecision(symbol, signal.regime, macro, intent, None)
@@ -314,15 +424,22 @@ def decide_for_symbol(
     ctype = ContractType.PUT if put_side else ContractType.CALL
     chain = fetch_chain(option_client, symbol, ctype)
     short_leg = pick_by_delta(chain, ctype, SHORT_DELTA_TARGET)
-    long_leg = pick_by_delta(chain, ctype, PROTECTIVE_DELTA_TARGET)
+    long_leg = pick_by_delta(chain, ctype, PROTECTIVE_DELTA_TARGET, expiration=_occ_expiration(short_leg) if short_leg else None)
     if not short_leg or not long_leg:
         return CycleDecision(symbol, signal.regime, macro, None, "chain_insufficient")
-    max_loss_est = signal.atr * 1.25 * 100
+    width = _vertical_width(short_leg, long_leg, ctype)
+    if width is None:
+        return CycleDecision(symbol, signal.regime, macro, None, "malformed_spread")
+    max_loss_est = width * 100  # 실제 폭 기준(전엔 signal.atr*1.25 근사 — 그날 아침 마진부족 거부의 원인)
     qty = contracts_for_max_loss(risk_budget, max_loss_est)
     if qty < 1:
         return CycleDecision(symbol, signal.regime, macro, None, "qty_below_1")
+    credit = _vertical_credit(chain, short_leg, long_leg)
+    if credit is None:
+        return CycleDecision(symbol, signal.regime, macro, None, "no_quote_data")
+    net_credit = max(0.01, credit * (1.0 - CREDIT_HAIRCUT_PCT))
     intent = build_credit_spread_intent(
-        short_leg, long_leg, qty, net_credit=1.0, client_order_id=f"{cid_base}-spread",
+        short_leg, long_leg, qty, net_credit=net_credit, client_order_id=f"{cid_base}-spread",
     )
     return CycleDecision(symbol, signal.regime, macro, intent, None)
 
@@ -362,9 +479,10 @@ def evaluate_exit(leg_positions: list[dict], today: date | None = None) -> ExitD
     리스트만 있으면 브로커 연결 없이 테스트 가능.
 
     부호규약: cost_basis 합의 음수 절대값을 "수취 크레딧"으로 본다(순크레딧
-    포지션이면 진입 시 현금이 들어왔으므로 Alpaca가 음의 cost_basis로 기록하는
-    것이 표준 규약 — 라이브에서 최초 체결 후 실측으로 재검증 필요, 여기선
-    이 규약을 전제로 한다는 걸 명시해 둔다)."""
+    포지션이면 진입 시 현금이 들어왔으므로 Alpaca가 음의 cost_basis로 기록).
+    **2026-08-25 실체결로 검증 완료** — SPY/QQQ 콘도르 8레그 전부 확인:
+    숏레그(SHORT) cost_basis 전부 음수(QQQ -348/-468, SPY -624/-516),
+    롱레그(LONG) 전부 양수(QQQ 192/135, SPY 252/150) — 가정 그대로 맞았다."""
     if not leg_positions:
         return ExitDecision(False, "hold", 0.0)
 
@@ -395,7 +513,16 @@ def build_close_intent(leg_positions: list[dict], client_order_id: str) -> dict:
     """열린 포지션의 반대 방향(숏→buy_to_close, 롱→sell_to_close)으로 청산 주문을
     만든다. limit_price는 시장가에 가깝게(0.0 근처) — 청산은 방향성 베팅이 아니라
     리스크 종료가 목적이므로 가격에 민감하게 굴 이유가 없다. 실제 체결 보장을
-    위해 market 타입을 쓴다(멀티레그도 Alpaca가 market order_class=mleg 지원)."""
+    위해 market 타입을 쓴다(멀티레그도 Alpaca가 market order_class=mleg 지원).
+
+    **2026-08-25 Codex 감사 지적**: qty를 leg_positions[0]에서만 가져와
+    나머지 레그가 다른 수량이어도(부분체결·수동개입·잔여레그) 조용히 무시하고
+    있었다. 전량청산은 모든 레그가 같은 수량이어야 의미가 있으므로, 수량이
+    안 맞으면 예외를 던져 청산 자체를 막는다(fail-closed — 잘못된 수량으로
+    청산 주문을 내는 것보다 사람이 볼 때까지 포지션을 열어두는 게 낫다)."""
+    qtys = {abs(float(p.get("qty", 1))) for p in leg_positions}
+    if len(qtys) != 1:
+        raise ValueError(f"leg quantities mismatch, refusing to build close intent: {qtys}")
     legs = []
     for p in leg_positions:
         side_held = str(p.get("side", "")).lower()
@@ -407,10 +534,106 @@ def build_close_intent(leg_positions: list[dict], client_order_id: str) -> dict:
             "symbol": p["symbol"], "ratio_qty": "1", "side": side, "position_intent": intent,
         })
     return {
-        "qty": str(int(abs(float(leg_positions[0].get("qty", 1))))),
+        "qty": str(int(qtys.pop())),
         "type": "market",
         "time_in_force": "day",
         "order_class": "mleg",
         "client_order_id": client_order_id,
         "legs": legs,
     }
+
+
+# ── 계좌 레벨 리스크게이트 (일일/주간/HWM 서킷브레이커) — 2026-08-24 배선 ──
+# DAILY_LOSS_KILL_PCT/WEEKLY_LOSS_KILL_PCT/PORTFOLIO_DD_KILL_PCT는 처음부터
+# 문서·상수로만 존재하고 백테스트·라이브 어디서도 실제로 안 걸려 있었다(4종목
+# 합산 백테스트가 MDD 63~71%까지 찍는 걸 보고서야 발견) — mcp_runner.py가
+# 매 사이클 이 함수를 호출해서 신규진입 전체를 막을지 판단한다. 청산감시는
+# 이 게이트와 무관하게 항상 정상 진행(리스크 종료는 절대 안 막는다).
+
+@dataclass
+class RiskGateState:
+    high_water_mark: float
+    halt_until: datetime | None = None
+    day_key: date | None = None
+    day_start_equity: float = 0.0
+    week_key: date | None = None
+    week_start_equity: float = 0.0
+
+    def to_dict(self) -> dict:
+        return {
+            "high_water_mark": self.high_water_mark,
+            "halt_until": self.halt_until.isoformat() if self.halt_until else None,
+            "day_key": self.day_key.isoformat() if self.day_key else None,
+            "day_start_equity": self.day_start_equity,
+            "week_key": self.week_key.isoformat() if self.week_key else None,
+            "week_start_equity": self.week_start_equity,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "RiskGateState":
+        return RiskGateState(
+            high_water_mark=float(d.get("high_water_mark", 0.0)),
+            halt_until=datetime.fromisoformat(d["halt_until"]) if d.get("halt_until") else None,
+            day_key=date.fromisoformat(d["day_key"]) if d.get("day_key") else None,
+            day_start_equity=float(d.get("day_start_equity", 0.0)),
+            week_key=date.fromisoformat(d["week_key"]) if d.get("week_key") else None,
+            week_start_equity=float(d.get("week_start_equity", 0.0)),
+        )
+
+
+@dataclass
+class RiskGateDecision:
+    blocked: bool
+    reason: str  # "ok" | "daily_loss_kill" | "weekly_loss_kill" | "portfolio_dd_halt_active" | "portfolio_dd_kill_triggered"
+    state: RiskGateState
+
+
+def evaluate_risk_gates(equity: float, state: RiskGateState, now: datetime | None = None) -> RiskGateDecision:
+    """순수 함수 — 상태(state)를 입력으로 받아 새 상태와 이번 사이클의 신규진입
+    차단 여부를 반환한다. mcp_runner.py가 사이클마다 이전 상태를 파일에서
+    읽어 넘기고, 반환된 새 상태를 다시 저장한다(프로세스가 사이클마다 새로
+    뜨므로 상태는 파일로만 지속됨).
+
+    **정지=잔고 리셋이 아니다**: high_water_mark는 절대 낮아지지 않고, 정지가
+    풀려도 이미 난 손실은 그대로 이어간다 — 사용자가 명시적으로 강조한
+    요구사항. day_start_equity/week_start_equity는 그 날/주의 "손실 한도
+    계산 기준점"일 뿐 실제 잔고가 아니다(하루/한 주 지나면 갱신되지만,
+    equity 자체는 계속 누적된 손익을 그대로 반영한다)."""
+    now = now or datetime.now(timezone.utc)
+    today = now.date()
+    week_start = today - timedelta(days=today.weekday())
+
+    day_key = state.day_key
+    day_start_equity = state.day_start_equity
+    if day_key != today:
+        day_key, day_start_equity = today, equity
+
+    week_key = state.week_key
+    week_start_equity = state.week_start_equity
+    if week_key != week_start:
+        week_key, week_start_equity = week_start, equity
+
+    high_water_mark = max(state.high_water_mark, equity) if state.high_water_mark > 0 else equity
+    halt_until = state.halt_until
+
+    if halt_until is not None and now < halt_until:
+        new_state = RiskGateState(high_water_mark, halt_until, day_key, day_start_equity, week_key, week_start_equity)
+        return RiskGateDecision(True, "portfolio_dd_halt_active", new_state)
+
+    daily_dd = 1.0 - equity / day_start_equity if day_start_equity > 0 else 0.0
+    weekly_dd = 1.0 - equity / week_start_equity if week_start_equity > 0 else 0.0
+    portfolio_dd = 1.0 - equity / high_water_mark if high_water_mark > 0 else 0.0
+
+    if daily_dd >= DAILY_LOSS_KILL_PCT:
+        reason = "daily_loss_kill"
+    elif weekly_dd >= WEEKLY_LOSS_KILL_PCT:
+        reason = "weekly_loss_kill"
+    elif portfolio_dd >= PORTFOLIO_DD_KILL_PCT:
+        halt_until = now + timedelta(minutes=PORTFOLIO_DD_HALT_MINUTES)
+        reason = "portfolio_dd_kill_triggered"
+    else:
+        new_state = RiskGateState(high_water_mark, None, day_key, day_start_equity, week_key, week_start_equity)
+        return RiskGateDecision(False, "ok", new_state)
+
+    new_state = RiskGateState(high_water_mark, halt_until, day_key, day_start_equity, week_key, week_start_equity)
+    return RiskGateDecision(True, reason, new_state)

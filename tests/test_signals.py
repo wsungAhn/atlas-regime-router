@@ -9,6 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from signals import (  # noqa: E402
     MacroGate,
+    RiskGateState,
+    _vertical_width,
     build_close_intent,
     build_credit_spread_intent,
     build_iron_condor_intent,
@@ -16,9 +18,12 @@ from signals import (  # noqa: E402
     contracts_for_max_loss,
     decide_for_symbol,
     evaluate_exit,
+    evaluate_risk_gates,
+    pick_by_delta,
     risk_pct_for_atr_pct,
 )
-from datetime import date, timedelta  # noqa: E402
+from alpaca.trading.enums import ContractType  # noqa: E402
+from datetime import date, datetime, timedelta, timezone  # noqa: E402
 
 
 def _trending_up_bars(n=80):
@@ -49,31 +54,17 @@ def test_classify_regime_range():
     assert signal.adx < 18
 
 
-def test_classify_regime_low_adx_but_recent_spike_is_not_range():
-    """전략5(백테스트 1위) 조건 검증 — ADX만 낮다고 range가 아니라, RSI가 극단이거나
-    가격이 최근 VWAP에서 크게 벗어나 있으면 range로 판정하면 안 된다(구버전 버그:
-    ADX 단독 조건이라 이런 케이스도 range로 오판했었음)."""
-    n = 80
-    idx = pd.date_range("2026-01-01", periods=n, freq="D")
-    # 오래 횡보하다 마지막 5일 급등 — ADX는 아직 안 올라왔지만 RSI는 과매수,
-    # 가격도 최근 VWAP보다 훨씬 위
-    close = pd.Series([100 + (i % 3) * 0.1 for i in range(n - 5)] + [101, 103, 106, 110, 115], index=idx, dtype=float)
-    df = pd.DataFrame({"high": close + 0.3, "low": close - 0.3, "close": close}, index=idx)
-    signal = classify_regime_from_bars(df, "TEST")
-    assert signal.regime != "range"
-
-
 def test_risk_pct_scales_down_with_high_volatility():
     low_vol = risk_pct_for_atr_pct(atr_pct=0.01, atr_pct_low_q=0.01, atr_pct_high_q=0.05)
     high_vol = risk_pct_for_atr_pct(atr_pct=0.05, atr_pct_low_q=0.01, atr_pct_high_q=0.05)
     assert low_vol > high_vol
-    assert 0.02 <= high_vol <= 0.05
-    assert 0.02 <= low_vol <= 0.05
+    assert 0.02 <= high_vol <= 0.10
+    assert 0.02 <= low_vol <= 0.10
 
 
 def test_risk_pct_clips_to_bounds():
     assert risk_pct_for_atr_pct(0.10, 0.01, 0.05) == pytest.approx(0.02)
-    assert risk_pct_for_atr_pct(-1.0, 0.01, 0.05) == pytest.approx(0.05)
+    assert risk_pct_for_atr_pct(-1.0, 0.01, 0.05) == pytest.approx(0.10)
 
 
 def test_contracts_for_max_loss_floor_division():
@@ -108,9 +99,16 @@ class _FakeGreeks:
         self.delta = delta
 
 
+class _FakeQuote:
+    def __init__(self, bid_price, ask_price):
+        self.bid_price = bid_price
+        self.ask_price = ask_price
+
+
 class _FakeSnapshot:
-    def __init__(self, delta):
+    def __init__(self, delta, bid=1.0, ask=1.2):
         self.greeks = _FakeGreeks(delta)
+        self.latest_quote = _FakeQuote(bid, ask)
 
 
 class _FakeOptionDataClient:
@@ -135,6 +133,35 @@ class _FakeStockDataClient:
         return _Wrapper()
 
 
+def test_vertical_width_computes_real_strike_distance():
+    """2026-08-25 Codex 감사 발견(실측 확인): 사이징이 signal.atr*2.5 근사만
+    쓰고 있었는데 그날 아침 실제로 "insufficient options buying power" 거부가
+    났다 — 실제 선택된 strike로 사이징해야 한다."""
+    assert _vertical_width("SPY260902P00750000", "SPY260902P00737000", ContractType.PUT) == pytest.approx(13.0)
+    assert _vertical_width("SPY260902C00778000", "SPY260902C00784000", ContractType.CALL) == pytest.approx(6.0)
+
+
+def test_vertical_width_rejects_wrong_direction_or_same_contract():
+    """보호행사가가 방향을 잘못 잡으면(풋인데 롱행사가가 더 높다든가) 진짜
+    보호가 아니다 — None을 반환해서 주문 생성 자체를 막아야 한다."""
+    assert _vertical_width("SPY260902P00737000", "SPY260902P00750000", ContractType.PUT) is None  # 방향 반대
+    assert _vertical_width("SPY260902C00784000", "SPY260902C00778000", ContractType.CALL) is None  # 방향 반대
+    assert _vertical_width("SPY260902P00750000", "SPY260902P00750000", ContractType.PUT) is None  # 같은 계약
+
+
+def test_pick_by_delta_expiration_filter_excludes_other_expirations():
+    """2026-08-25 실거래 사고 회귀 방지 — SPY 콜스프레드가 숏레그 만기(9/3)와
+    보호레그 만기(9/2)가 갈려서 Alpaca가 "uncovered option contracts"로 거부한
+    바로 그 케이스. expiration을 넘기면 다른 만기 후보는 델타가 더 가까워도
+    제외돼야 한다."""
+    chain = {
+        "SPY260902C00784000": _FakeSnapshot(delta=0.05),   # 9/2 만기, 목표델타(0.06)와 차이 0.01
+        "SPY260903C00780000": _FakeSnapshot(delta=0.061),  # 9/3 만기, 차이 0.001(더 가까움)이지만 만기가 다름
+    }
+    picked = pick_by_delta(chain, ContractType.CALL, target_abs_delta=0.06, expiration=date(2026, 9, 2))
+    assert picked == "SPY260902C00784000"
+
+
 def test_decide_for_symbol_macro_gate_blocks_regardless_of_regime():
     macro = MacroGate(ok=False, reason="stage4_declining", stage="stage4_declining")
     decision = decide_for_symbol(
@@ -149,8 +176,8 @@ def test_decide_for_symbol_trend_up_builds_put_credit_spread():
     stock_client = _FakeStockDataClient(_trending_up_bars(), "SPY")
     chains = {
         ("SPY", __import__("alpaca.trading.enums", fromlist=["ContractType"]).ContractType.PUT): {
-            "SPY_P_SHORT": _FakeSnapshot(delta=-0.15),
-            "SPY_P_LONG": _FakeSnapshot(delta=-0.06),
+            "SPY260902P00750000": _FakeSnapshot(delta=-0.15, bid=2.0, ask=2.2),  # 숏(높은 행사가)
+            "SPY260902P00737000": _FakeSnapshot(delta=-0.06, bid=0.5, ask=0.7),  # 보호(낮은 행사가, 같은 만기)
         },
     }
     option_client = _FakeOptionDataClient(chains)
@@ -159,6 +186,30 @@ def test_decide_for_symbol_trend_up_builds_put_credit_spread():
     assert decision.order_intent is not None
     assert decision.order_intent["order_class"] == "mleg"
     assert len(decision.order_intent["legs"]) == 2
+    # 2026-08-25 실거래 발견 회귀 방지 — net_credit이 하드코딩 1.0이었을 때 GLD/TLT처럼
+    # 실제 프리미엄이 $1 미만인 종목은 영원히 미체결이었다. 숏(mid 2.1)-롱(mid 0.6)=1.5,
+    # 5% 헤어컷 반영해 1.0이 아닌 실제 계산값이 나와야 한다.
+    assert float(decision.order_intent["limit_price"]) == pytest.approx(-1.5 * 0.95, abs=0.01)
+
+
+def test_decide_for_symbol_never_mixes_expirations_across_short_and_protective_leg():
+    """2026-08-25 실거래 사고 회귀 방지 — 체인에 두 개 만기(9/2, 9/3)가 섞여
+    있을 때 숏레그와 보호레그가 서로 다른 만기로 갈리면 안 된다(보호레그가
+    숏레그보다 먼저 만기되면 그 사이 네이키드 — Alpaca가 실제로 거부했음)."""
+    macro = MacroGate(ok=True, reason="clear", stage="stage2_advancing")
+    stock_client = _FakeStockDataClient(_trending_up_bars(), "SPY")
+    chains = {
+        ("SPY", ContractType.PUT): {
+            "SPY260902P00749000": _FakeSnapshot(delta=-0.15),  # 숏레그, 9/2 만기 — 목표델타(0.15) 정확
+            "SPY260903P00737000": _FakeSnapshot(delta=-0.061),  # 보호레그 후보, 9/3 — 델타가 더 가깝지만 만기가 다름
+            "SPY260902P00737000": _FakeSnapshot(delta=-0.05),   # 보호레그 후보, 9/2 — 숏레그와 같은 만기
+        },
+    }
+    option_client = _FakeOptionDataClient(chains)
+    decision = decide_for_symbol(stock_client, option_client, "SPY", equity=100_000, macro=macro)
+    legs = decision.order_intent["legs"]
+    expirations = {leg["symbol"][3:9] for leg in legs}
+    assert len(expirations) == 1, f"legs span multiple expirations: {legs}"
 
 
 # ── 청산 감시 (2026-08-24 추가 — 이전엔 청산 판단 로직이 아예 없었다) ──
@@ -195,8 +246,9 @@ def test_evaluate_exit_closes_at_stop_loss():
 
 
 def test_evaluate_exit_forces_close_near_expiry_regardless_of_pnl():
-    """DTE가 FORCE_CLOSE_DTE(14) 이하면 손익이 좋아도 강제청산."""
-    legs = [{"symbol": _far_expiry_symbol(days_out=5), "cost_basis": -100.0, "unrealized_pl": 5.0, "side": "short", "qty": "1"}]
+    """DTE가 FORCE_CLOSE_DTE(2, 주간옵션 기준 감마리스크 회피용) 이하면 손익이
+    좋아도 강제청산."""
+    legs = [{"symbol": _far_expiry_symbol(days_out=1), "cost_basis": -100.0, "unrealized_pl": 5.0, "side": "short", "qty": "1"}]
     decision = evaluate_exit(legs)
     assert decision.should_close is True
     assert decision.reason == "dte_forced"
@@ -215,3 +267,61 @@ def test_build_close_intent_reverses_short_and_long_sides():
     assert by_symbol["SPY_SHORT"]["position_intent"] == "buy_to_close"
     assert by_symbol["SPY_LONG"]["side"] == "sell"
     assert by_symbol["SPY_LONG"]["position_intent"] == "sell_to_close"
+
+
+def test_build_close_intent_rejects_mismatched_leg_quantities():
+    """2026-08-25 Codex 감사 지적: qty를 legs[0]에서만 가져와서 나머지 레그가
+    다른 수량이어도(부분체결·수동개입) 조용히 무시하고 있었다. fail-closed로
+    바꿔 예외를 던지게 함 — 잘못된 수량 청산보다 사람이 볼 때까지 열어두는 게 낫다."""
+    legs = [
+        {"symbol": "SPY_SHORT", "side": "short", "qty": "3"},
+        {"symbol": "SPY_LONG", "side": "long", "qty": "2"},  # 수량 불일치
+    ]
+    with pytest.raises(ValueError):
+        build_close_intent(legs, client_order_id="close-1")
+
+
+# ── 계좌 레벨 리스크게이트 (2026-08-24 라이브 배선 — 내일 개장 전 마지막 안전장치) ──
+
+def test_risk_gate_ok_when_no_drawdown():
+    state = RiskGateState(high_water_mark=100_000.0)
+    decision = evaluate_risk_gates(100_000.0, state, now=datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc))
+    assert decision.blocked is False
+    assert decision.reason == "ok"
+
+
+def test_risk_gate_daily_loss_kill_blocks_same_day():
+    """2026-08-25 오전: 킬스위치 임계값을 3%/6%→20%/50%로 재조정(사용자 지시,
+    포지션 1건 최대리스크 10%→5% 하향과 맞물려)."""
+    state = RiskGateState(high_water_mark=100_000.0, day_key=date(2026, 1, 5), day_start_equity=100_000.0)
+    decision = evaluate_risk_gates(75_000.0, state, now=datetime(2026, 1, 5, 11, 0, tzinfo=timezone.utc))  # -25%
+    assert decision.blocked is True
+    assert decision.reason == "daily_loss_kill"
+
+
+def test_risk_gate_portfolio_drawdown_halts_and_does_not_erase_hwm():
+    """HWM 대비 -20% 도달 시 정지, 그리고 HWM 자체는 낮아지지 않아야 한다
+    (정지=잔고 리셋 아님 — 사용자가 명시적으로 요구한 불변식)."""
+    state = RiskGateState(high_water_mark=100_000.0)
+    breach_time = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+    decision = evaluate_risk_gates(79_000.0, state, now=breach_time)  # -21%
+    assert decision.blocked is True
+    assert decision.reason == "portfolio_dd_kill_triggered"
+    assert decision.state.high_water_mark == 100_000.0  # 낮아지지 않음
+    assert decision.state.halt_until == breach_time + timedelta(minutes=45)
+
+
+def test_risk_gate_stays_halted_within_45_minutes_then_releases():
+    state = RiskGateState(high_water_mark=100_000.0)
+    breach_time = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+    after_breach = evaluate_risk_gates(79_000.0, state, now=breach_time)
+
+    still_halted = evaluate_risk_gates(79_000.0, after_breach.state, now=breach_time + timedelta(minutes=30))
+    assert still_halted.blocked is True
+    assert still_halted.reason == "portfolio_dd_halt_active"
+
+    # 45분+다음 주(일일/주간 기준점도 새로 리셋)까지 지나고 잔고가 회복됐다면 재개돼야 함
+    next_monday = breach_time + timedelta(days=7)
+    recovered = evaluate_risk_gates(97_000.0, still_halted.state, now=next_monday)
+    assert recovered.blocked is False
+    assert recovered.reason == "ok"

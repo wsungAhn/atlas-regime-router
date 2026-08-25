@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.atlas.report-generator</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python</string>
+        <string>/Users/Mung/dev/atlas-options-hackathon/src/generate_report.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Mung/dev/atlas-options-hackathon</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>13</integer>
+        <key>Minute</key><integer>10</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Mung/dev/atlas-options-hackathon/logs/report-generator.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Mung/dev/atlas-options-hackathon/logs/report-generator.err.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>
