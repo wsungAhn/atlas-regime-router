@@ -204,9 +204,21 @@ async def _crypto_positions_by_symbol(session: ClientSession) -> dict[str, dict]
     """_positions_by_symbol은 OCC 옵션심볼→기초자산 매칭(_underlying_of)만
     하므로 "BTC/USD" 같은 크립토 심볼은 그 함수에 넣으면 조용히 드롭된다
     (실측 확인 — 옵션 전용으로 설계된 기존 함수를 그대로 재사용하면 안 됨).
-    크립토는 심볼이 곧 계약이라(멀티레그 없음) 별도의 단순 매칭이면 충분."""
+    크립토는 심볼이 곧 계약이라(멀티레그 없음) 별도의 단순 매칭이면 충분.
+
+    **2026-08-26 실거래로 발견한 버그**: place_crypto_order는 "BTC/USD"(슬래시)를
+    요구하지만 get_all_positions는 같은 포지션을 "BTCUSD"(슬래시 없음)로 반환한다
+    — 그대로 매칭하면 방금 산 포지션을 다음 사이클이 못 찾아서 중복매수 가드와
+    청산감시(evaluate_crypto_exit)가 둘 다 무력화된다. 슬래시를 지운 키로
+    매칭하고, CryptoPositionState 조회용으로는 CRYPTO_SYMBOLS(슬래시 있는 정규
+    표기)로 다시 매핑해서 반환한다."""
     positions = _mcp_data(await session.call_tool("get_all_positions", {})).get("result", [])
-    return {p["symbol"]: p for p in positions if p.get("symbol") in CRYPTO_SYMBOLS}
+    by_stripped = {p["symbol"].replace("/", ""): p for p in positions if p.get("symbol")}
+    return {
+        symbol: by_stripped[symbol.replace("/", "")]
+        for symbol in CRYPTO_SYMBOLS
+        if symbol.replace("/", "") in by_stripped
+    }
 
 
 async def _positions_by_symbol(session: ClientSession) -> dict[str, list[dict]]:
@@ -453,12 +465,42 @@ async def run_cycle_once() -> None:
                     "order_result": order_payload, "submitted": True,
                 })
 
-            # ── 3) 크립토 슬리브 (2026-08-26 추가, Task Contract: BTC/USD·ETH/USD
-            #    현물 롱/플랫, 옵션과 같은 계좌·같은 clock/리스크게이트 공유) —
-            #    옵션과 같은 구조(청산 먼저, 그다음 신규진입)를 그대로 따른다.
-            #    이 루프는 주식시장 개장시간에만 도는데(get_clock이 위에서 이미
-            #    막았으면 여기까지 안 옴) 크립토는 24/7이라 주말 움직임을 못 잡는다
-            #    — v1 의도된 단순화, 결과 보고 필요하면 별도 스케줄로 분리.
+async def run_crypto_cycle_once() -> None:
+    """옵션 사이클(run_cycle_once)과 완전히 분리된 독립 루프 — 크립토는 24/7
+    마켓이라 주식장 개폐(get_clock)와 무관하게 자체 스케줄(별도 launchd job,
+    config/launchd/com.atlas.crypto-runner.plist)로 돈다.
+
+    **2026-08-26 배선 변경**: 원래 이 로직은 run_cycle_once 안에 있어서
+    get_clock의 주식장 개폐 체크를 그대로 물려받았다(크립토도 주식장 열려있을
+    때만 돎) — 사용자가 "크립토는 24시간 마켓인데 왜 갇혀있냐"고 지적해서
+    별도 함수·별도 스케줄로 분리했다. risk_gate_state.json은 옵션 사이클과
+    그대로 공유(Task Contract: 같은 계좌·같은 리스크게이트)."""
+    client_cm = await _new_mcp_session()
+    async with client_cm as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            equity = float(_mcp_data(await session.call_tool("get_account_info", {}))["equity"])
+            logger.info("[CRYPTO_CYCLE] equity=%.2f", equity)
+
+            crypto_client = CryptoHistoricalDataClient(
+                os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
+            )
+            macro: MacroGate = load_macro_gate()
+            logger.info("[MACRO] ok=%s reason=%s stage=%s", macro.ok, macro.reason, macro.stage)
+
+            risk_gate_state, state_corrupt = _load_risk_gate_state(equity)
+            if state_corrupt:
+                risk_gate = RiskGateDecision(True, "state_corrupt_fail_closed", RiskGateState(high_water_mark=equity))
+            else:
+                risk_gate = evaluate_risk_gates(equity, risk_gate_state)
+                _save_risk_gate_state(risk_gate.state)
+            if risk_gate.blocked:
+                logger.info(
+                    "[RISK_GATE] reason=%s hwm=%.2f halt_until=%s — 크립토 신규진입 억제(청산감시는 계속)",
+                    risk_gate.reason, risk_gate.state.high_water_mark, risk_gate.state.halt_until,
+                )
+
             crypto_positions = _load_crypto_positions()
             crypto_open_positions = await _crypto_positions_by_symbol(session)
 
@@ -544,10 +586,18 @@ async def run_cycle_once() -> None:
 
 async def main() -> None:
     _setup_logging()
+    # 2026-08-26: 옵션(주식장 시간 게이트)과 크립토(24/7, 독립 스케줄)를
+    # 같은 스크립트에서 인자로 갈라 launchd job 2개(com.atlas.options-runner,
+    # com.atlas.crypto-runner)가 각자의 트리거로 이 파일을 호출한다.
+    mode = sys.argv[1] if len(sys.argv) > 1 else "options"
+    cycle_fn = {"options": run_cycle_once, "crypto": run_crypto_cycle_once}.get(mode)
+    if cycle_fn is None:
+        logger.error("[FATAL] unknown mode %r (expected 'options' or 'crypto')", mode)
+        sys.exit(2)
     try:
-        await run_cycle_once()
+        await cycle_fn()
     except Exception:
-        logger.exception("[FATAL] cycle crashed before completing")
+        logger.exception("[FATAL] %s cycle crashed before completing", mode)
         # 종료코드 0으로 두지 않는다 — launchd 로그·ThrottleInterval이 이 실패를 보고
         # 다음 스케줄까지 정상 재시도하게 둔다(예외를 삼키면 조용한 무한장애가 됨).
         sys.exit(1)
