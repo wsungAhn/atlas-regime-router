@@ -157,6 +157,7 @@ def simulate_directional_trades(
             "entry_date": entry_date, "exit_date": exit_date, "symbol": symbol,
             "sleeve": sleeve, "direction": direction, "max_loss": max_loss,
             "realized_pnl": realized_pnl, "multiplier": 1.0, "qty_increment": qty_increment,
+            "entry_price": entry_px,  # portfolio.py가 이걸로 무마진 계좌의 notional 상한을 건다
         })
         open_until = exit_date
     return trades

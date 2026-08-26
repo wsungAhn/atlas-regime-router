@@ -712,7 +712,17 @@ def decide_crypto_for_symbol(
     if stop_pct <= 0:
         return CryptoCycleDecision(symbol, signal.regime, macro, None, "invalid_stop_distance")
 
-    notional = risk_budget / stop_pct  # 손절 도달 시 예상손실이 risk_budget이 되도록 포지션 크기 역산
+    # risk_budget/stop_pct는 "손절 도달 시 risk_budget만큼만 잃도록" 포지션
+    # 크기를 역산한 값 — 손절폭이 가격 대비 좁으면(변동성 낮은 구간) 이 값이
+    # 계좌 전체보다 커질 수 있다(실측 2026-08-26: BTC 드라이런에서 계좌의 162%).
+    # 크립토 현물은 레버리지가 없어 실제 매수 가능 금액이 잔고를 못 넘는다.
+    # 상한을 equity 전체가 아니라 "현금유보(CASH_RESERVE_PCT) 제외하고 크립토
+    # 심볼 수만큼 균등분배"로 잡는다 — 안 그러면 BTC/ETH가 같은 사이클에 동시
+    # 신호를 내는 흔한 경우(둘 다 trend_up, 예: 2026-08-26 드라이런처럼) 각자
+    # equity 100%씩 요구해서 둘째 주문이 매수여력 부족으로 거부되거나, 옵션
+    # 포지션이 쓸 자리가 아예 안 남는다.
+    max_notional_per_symbol = equity * (1.0 - CASH_RESERVE_PCT) / len(CRYPTO_SYMBOLS)
+    notional = min(risk_budget / stop_pct, max_notional_per_symbol)
     if notional < 10.0:  # Alpaca 크립토 시장가 최소주문 근사치 — 그 이하는 의미없는 먼지주문
         return CryptoCycleDecision(symbol, signal.regime, macro, None, "notional_below_minimum")
 

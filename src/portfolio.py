@@ -161,6 +161,18 @@ def scale_trades_to_dollars(
             math.floor(risk_budget / max_loss_dollars / qty_increment) * qty_increment
             if max_loss_dollars > 0 else 0.0
         )
+        # entry_price가 있는 거래(직접 롱/숏 — 옵션 스프레드는 이 키가 없다)는
+        # 손절폭이 가격 대비 좁으면 risk_budget/max_loss 역산이 계좌 잔고를
+        # 넘는 notional을 요구할 수 있다(무마진 계좌는 못 산다). **실측 발견
+        # (2026-08-26)**: 라이브 크립토 드라이런에서 같은 계산으로 notional이
+        # 계좌의 162%가 나옴 — 옵션은 스프레드 폭이 손실을 자연히 캡해서 이
+        # 문제가 없었지만, 직접 포지션은 명시적 상한이 필요하다. risk_budget이
+        # 아니라 equity로 캡한다 — signals.py 라이브 크립토 사이징과 동일 철학
+        # (risk_budget 캡은 손절폭 기반 사이징 자체를 무의미하게 만든다).
+        entry_price = t.get("entry_price")
+        if entry_price and entry_price > 0:
+            max_notional_contracts = math.floor(equity / entry_price / multiplier / qty_increment) * qty_increment
+            contracts = min(contracts, max_notional_contracts)
         if contracts <= 0:
             skipped_zero_contracts += 1
             continue
