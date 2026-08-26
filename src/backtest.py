@@ -51,17 +51,37 @@ STRIKE_INCREMENT = 0.5
 CREDIT_HAIRCUT_PCT = 0.05
 IV_LOOKBACK_DAYS = 252
 
+# 백테스트가 매번 Alpaca API를 새로 호출해 라이브 봇(15분 루프)과 레이트리밋을
+# 다퉜다(2026-08-26 실측 429) — 과거 봉 데이터는 그날 안에는 바뀌지 않으므로
+# 로컬에 캐싱한다. 하루 지나면 최신 봉을 받기 위해 자동 재요청.
+CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "cache"
+CACHE_MAX_AGE = timedelta(hours=20)
+
+
+def _cached(cache_path: Path, fetch_fn) -> pd.DataFrame:
+    if cache_path.exists():
+        age = datetime.now() - datetime.fromtimestamp(cache_path.stat().st_mtime)
+        if age < CACHE_MAX_AGE:
+            return pd.read_parquet(cache_path)
+    df = fetch_fn()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path)
+    return df
+
 
 def fetch_daily_bars(client: StockHistoricalDataClient, symbol: str, years: int = 3) -> pd.DataFrame:
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
-        start=datetime.now(timezone.utc) - timedelta(days=365 * years + 30),
-    )
-    bars = client.get_stock_bars(req).df
-    df = bars.xs(symbol, level="symbol") if isinstance(bars.index, pd.MultiIndex) else bars
-    df.index = pd.DatetimeIndex(df.index.date)  # tz 제거 — 시뮬레이터가 날짜 인덱스 기대
-    df = df[~df.index.duplicated(keep="last")]
-    return df[["open", "high", "low", "close", "volume"]].sort_index()
+    def _fetch() -> pd.DataFrame:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
+            start=datetime.now(timezone.utc) - timedelta(days=365 * years + 30),
+        )
+        bars = client.get_stock_bars(req).df
+        df = bars.xs(symbol, level="symbol") if isinstance(bars.index, pd.MultiIndex) else bars
+        df.index = pd.DatetimeIndex(df.index.date)  # tz 제거 — 시뮬레이터가 날짜 인덱스 기대
+        df = df[~df.index.duplicated(keep="last")]
+        return df[["open", "high", "low", "close", "volume"]].sort_index()
+
+    return _cached(CACHE_DIR / f"{symbol}_{years}y_daily.parquet", _fetch)
 
 
 def fetch_intraday_bars(client: StockHistoricalDataClient, symbol: str, years: int = 3) -> pd.DataFrame:
@@ -72,16 +92,19 @@ def fetch_intraday_bars(client: StockHistoricalDataClient, symbol: str, years: i
     자체는 일봉 레짐(스윙전략, ADX14/EMA20·50)이라 15분봉으로 바꾸면 다른
     전략이 되지만(오늘 검증한 챔피언 무효화), 청산감시·서킷브레이커는 15분
     단위로 실제 반응해야 한다는 지적은 맞다 — 그 부분만 이 함수로 보강."""
-    req = StockBarsRequest(
-        symbol_or_symbols=symbol, timeframe=TimeFrame(15, TimeFrameUnit.Minute),
-        start=datetime.now(timezone.utc) - timedelta(days=365 * years + 30),
-    )
-    bars = client.get_stock_bars(req).df
-    df = bars.xs(symbol, level="symbol") if isinstance(bars.index, pd.MultiIndex) else bars
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-    df = df[~df.index.duplicated(keep="last")]
-    return df[["close"]].sort_index()
+    def _fetch() -> pd.DataFrame:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol, timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+            start=datetime.now(timezone.utc) - timedelta(days=365 * years + 30),
+        )
+        bars = client.get_stock_bars(req).df
+        df = bars.xs(symbol, level="symbol") if isinstance(bars.index, pd.MultiIndex) else bars
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        df = df[~df.index.duplicated(keep="last")]
+        return df[["close"]].sort_index()
+
+    return _cached(CACHE_DIR / f"{symbol}_{years}y_15min.parquet", _fetch)
 
 
 def reprice_exits_intraday(

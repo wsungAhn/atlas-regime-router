@@ -166,6 +166,81 @@ def strategy7_atlas_mvp_signals(df: pd.DataFrame, min_history: int = 60) -> list
     return out
 
 
+# ── 전략 8: 일목균형표 구름 돌파 + RSI50 (사용자 제공 PDF "일목균형표+RSI
+#    6개 전략" 문서의 전략1을 방향성 크레딧 스프레드로 매핑 — 롱 셋업(원문
+#    그대로)은 bull_put, 숏 셋업(원문엔 없음, 이 엔진이 양방향 크레딧을
+#    지원해서 대칭 미러링으로 추가)은 bear_call) ──
+def strategy8_ichimoku_cloud_signals(df: pd.DataFrame, min_history: int = 60) -> list[StrategySignal]:
+    d = _common_indicators(df)
+    cloud = ind.ichimoku(df)
+    d = d.join(cloud)
+    out = []
+    for i in range(min_history, len(d)):
+        row = d.iloc[i]
+        if pd.isna(row["cloud_top"]) or pd.isna(row["rsi"]):
+            continue
+        prev_close = d["close"].iloc[i - 26] if i >= 26 else float("nan")
+        if pd.isna(prev_close):
+            continue
+        if (
+            row["close"] > row["cloud_top"] and row["tenkan"] > row["kijun"]
+            and row["rsi"] > 50 and row["close"] > prev_close
+        ):
+            out.append(StrategySignal(d.index[i], "bull_put"))
+        elif (
+            row["close"] < row["cloud_bottom"] and row["tenkan"] < row["kijun"]
+            and row["rsi"] < 50 and row["close"] < prev_close
+        ):
+            out.append(StrategySignal(d.index[i], "bear_call"))
+    return out
+
+
+# ── 전략 9: 장기 골든/데드크로스(SMA50/200) + RSI 모멘텀 (사용자 제공 PDF
+#    "이동평균선+RSI 6종" 문서의 전략1 — 원문은 롱 온리, 여기서도 숏 사이드는
+#    대칭 미러링) ──
+def strategy9_golden_cross_signals(df: pd.DataFrame, min_history: int = 200) -> list[StrategySignal]:
+    d = _common_indicators(df)
+    d["sma50"] = ind.sma(df["close"], 50)
+    d["sma200"] = ind.sma(df["close"], 200)
+    out = []
+    for i in range(min_history, len(d)):
+        row = d.iloc[i]
+        if pd.isna(row["sma50"]) or pd.isna(row["sma200"]) or pd.isna(row["rsi"]):
+            continue
+        if row["sma50"] > row["sma200"] and row["rsi"] > 55:
+            out.append(StrategySignal(d.index[i], "bull_put"))
+        elif row["sma50"] < row["sma200"] and row["rsi"] < 45:
+            out.append(StrategySignal(d.index[i], "bear_call"))
+    return out
+
+
+# ── 전략 10: EMA9/20 + MACD + RSI 재가속 모멘텀 (사용자 제공 PDF
+#    "이동평균선+RSI 6종" 문서의 전략5 — 원문은 롱 온리, 숏 사이드는 대칭
+#    미러링) ──
+def strategy10_ema_macd_momentum_signals(df: pd.DataFrame, min_history: int = 200) -> list[StrategySignal]:
+    d = _common_indicators(df)
+    d["sma200"] = ind.sma(df["close"], 200)
+    d["macd_hist"] = ind.macd_hist(df["close"])
+    out = []
+    for i in range(min_history, len(d)):
+        row, prev = d.iloc[i], d.iloc[i - 1]
+        if pd.isna(row["sma200"]) or pd.isna(row["macd_hist"]) or pd.isna(row["rsi"]):
+            continue
+        if (
+            row["close"] > row["sma200"] and row["ema20"] > row["ema50"]
+            and row["macd_hist"] > 0 and row["macd_hist"] > prev["macd_hist"]
+            and 50 <= row["rsi"] <= 65 and row["rsi"] > prev["rsi"]
+        ):
+            out.append(StrategySignal(d.index[i], "bull_put"))
+        elif (
+            row["close"] < row["sma200"] and row["ema20"] < row["ema50"]
+            and row["macd_hist"] < 0 and row["macd_hist"] < prev["macd_hist"]
+            and 35 <= row["rsi"] <= 50 and row["rsi"] < prev["rsi"]
+        ):
+            out.append(StrategySignal(d.index[i], "bear_call"))
+    return out
+
+
 ALL_STRATEGIES = {
     "1_range_condor": strategy1_range_condor_signals,
     "2_3_trend_credit": strategy23_trend_credit_signals,
@@ -173,4 +248,7 @@ ALL_STRATEGIES = {
     "5_mean_reversion_condor": strategy5_mean_reversion_condor_signals,
     "6_alphabot_pullback": strategy6_alphabot_pullback_signals,
     "7_atlas_mvp": strategy7_atlas_mvp_signals,
+    "8_ichimoku_cloud": strategy8_ichimoku_cloud_signals,
+    "9_golden_cross": strategy9_golden_cross_signals,
+    "10_ema_macd_momentum": strategy10_ema_macd_momentum_signals,
 }

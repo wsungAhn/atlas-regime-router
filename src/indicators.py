@@ -77,3 +77,29 @@ def percentile_rank(series: pd.Series, value: float) -> float:
     if clean.empty:
         return 50.0
     return float((clean < value).mean() * 100)
+
+
+def sma(series: pd.Series, n: int) -> pd.Series:
+    return series.rolling(n).mean()
+
+
+def macd_hist(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+    macd_line = ema(series, fast) - ema(series, slow)
+    signal_line = ema(macd_line, signal)
+    return macd_line - signal_line
+
+
+def ichimoku(df: pd.DataFrame, tenkan_n: int = 9, kijun_n: int = 26, span_b_n: int = 52) -> pd.DataFrame:
+    """전환선/기준선/선행스팬 — 백테스트는 미래정보 누출을 피하려 span_a/span_b를
+    26기간 앞으로 표시하지 않고 현재 시점 산출값 그대로 cloud_top/bottom에 쓴다
+    (사용자 제공 PDF "일목균형표+RSI 6개 전략" 문서의 명시적 규칙)."""
+    high, low = df["high"], df["low"]
+    tenkan = (high.rolling(tenkan_n).max() + low.rolling(tenkan_n).min()) / 2
+    kijun = (high.rolling(kijun_n).max() + low.rolling(kijun_n).min()) / 2
+    span_a = (tenkan + kijun) / 2
+    span_b = (high.rolling(span_b_n).max() + low.rolling(span_b_n).min()) / 2
+    return pd.DataFrame({
+        "tenkan": tenkan, "kijun": kijun,
+        "cloud_top": pd.concat([span_a, span_b], axis=1).max(axis=1),
+        "cloud_bottom": pd.concat([span_a, span_b], axis=1).min(axis=1),
+    })
