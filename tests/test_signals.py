@@ -367,6 +367,18 @@ def test_decide_crypto_trend_up_builds_market_buy():
     assert decision.target_pct == pytest.approx(decision.stop_pct * 2.0)  # CRYPTO_R_MULTIPLE=2.0
 
 
+def test_decide_crypto_notional_capped_by_available_cash():
+    """2026-08-26 실거래 발견 회귀 방지 — equity(옵션 포지션 시가평가 포함)로만
+    캡하면 실제 크립토 매수 가능 현금(non_marginable_buying_power)보다 훨씬 큰
+    notional을 요청해서 브로커가 거부한다(실측: 요청 $44,553, 가용 $9,991)."""
+    from signals import decide_crypto_for_symbol
+    macro = MacroGate(ok=True, reason="clear", stage="stage2_advancing")
+    client = _FakeCryptoDataClient(_trending_up_bars(), "BTC/USD")
+    decision = decide_crypto_for_symbol(client, "BTC/USD", equity=100_000, macro=macro, available_cash=1000.0)
+    assert decision.order_intent is not None
+    assert float(decision.order_intent["notional"]) <= 500.0  # available_cash/len(CRYPTO_SYMBOLS)=500
+
+
 def test_decide_crypto_skips_non_trend_up_regime():
     from signals import decide_crypto_for_symbol
     macro = MacroGate(ok=True, reason="clear", stage="stage2_advancing")

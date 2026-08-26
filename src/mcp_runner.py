@@ -480,8 +480,14 @@ async def run_crypto_cycle_once() -> None:
         async with ClientSession(read, write) as session:
             await session.initialize()
 
-            equity = float(_mcp_data(await session.call_tool("get_account_info", {}))["equity"])
-            logger.info("[CRYPTO_CYCLE] equity=%.2f", equity)
+            account_info = _mcp_data(await session.call_tool("get_account_info", {}))
+            equity = float(account_info["equity"])
+            # non_marginable_buying_power = 크립토 현물(비마진) 매수에 실제 쓸 수
+            # 있는 현금 — 2026-08-26 실거래로 확인: equity는 옵션 포지션 시가평가를
+            # 포함해서 훨씬 크게 보이지만(옵션이 마진을 이미 물고 있음), 크립토
+            # 사이징은 이 값을 기준으로 캡해야 브로커 거부 없이 바로 체결된다.
+            available_cash = float(account_info.get("non_marginable_buying_power", equity))
+            logger.info("[CRYPTO_CYCLE] equity=%.2f available_cash=%.2f", equity, available_cash)
 
             crypto_client = CryptoHistoricalDataClient(
                 os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
@@ -553,7 +559,7 @@ async def run_crypto_cycle_once() -> None:
                         _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "already_exposed"})
                         continue
                     try:
-                        decision = decide_crypto_for_symbol(crypto_client, symbol, equity, macro)
+                        decision = decide_crypto_for_symbol(crypto_client, symbol, equity, macro, available_cash)
                     except Exception:
                         logger.exception("[ERROR] decide_crypto_for_symbol failed for %s — skipping", symbol)
                         _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "decision_error"})

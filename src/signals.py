@@ -691,6 +691,7 @@ def build_crypto_order_intent(symbol: str, notional: float, client_order_id: str
 
 def decide_crypto_for_symbol(
     client: CryptoHistoricalDataClient, symbol: str, equity: float, macro: MacroGate,
+    available_cash: float | None = None,
 ) -> CryptoCycleDecision:
     """현물 롱/플랫 전용 — bear_call(하락) 신호는 숏이 불가능해 진입하지 않는다
     (Alpaca 크립토는 비마진 현물, §6.4 백테스트 설계와 동일 결정). range/cash
@@ -721,7 +722,16 @@ def decide_crypto_for_symbol(
     # 신호를 내는 흔한 경우(둘 다 trend_up, 예: 2026-08-26 드라이런처럼) 각자
     # equity 100%씩 요구해서 둘째 주문이 매수여력 부족으로 거부되거나, 옵션
     # 포지션이 쓸 자리가 아예 안 남는다.
+    #
+    # **2026-08-26 실거래로 발견**: equity(=$98,953, 옵션 포지션 시가평가 포함)
+    # 기준으로 캡을 잡아도 실제 크립토 매수 가능 현금은 훨씬 적었다(옵션 6개
+    # 스프레드가 마진으로 이미 물고 있어서) — ETH 주문이 "requested $44,553,
+    # available $9,991"로 브로커에 거부됨. available_cash(호출부가 계좌의
+    # non_marginable_buying_power를 넘겨준다 — 크립토 현물 매수에 실제 쓸 수
+    # 있는 현금)가 있으면 그것도 상한에 같이 반영한다.
     max_notional_per_symbol = equity * (1.0 - CASH_RESERVE_PCT) / len(CRYPTO_SYMBOLS)
+    if available_cash is not None:
+        max_notional_per_symbol = min(max_notional_per_symbol, available_cash / len(CRYPTO_SYMBOLS))
     notional = min(risk_budget / stop_pct, max_notional_per_symbol)
     if notional < 10.0:  # Alpaca 크립토 시장가 최소주문 근사치 — 그 이하는 의미없는 먼지주문
         return CryptoCycleDecision(symbol, signal.regime, macro, None, "notional_below_minimum")
