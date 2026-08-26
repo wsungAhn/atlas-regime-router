@@ -37,15 +37,21 @@ from mcp.client.stdio import stdio_client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from signals import (  # noqa: E402
+    CRYPTO_SYMBOLS,
+    CryptoPositionState,
     MacroGate,
     RiskGateDecision,
     RiskGateState,
     build_close_intent,
+    build_crypto_close_intent,
+    decide_crypto_for_symbol,
     decide_for_symbol,
+    evaluate_crypto_exit,
     evaluate_exit,
     evaluate_risk_gates,
     load_macro_gate,
 )
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient  # noqa: E402
 from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: E402
 from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: E402
 
@@ -53,6 +59,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DECISION_LOG = REPO_ROOT / "registry" / "decisions.jsonl"
 RUNNER_LOG = REPO_ROOT / "logs" / "mcp_runner.log"
 RISK_GATE_STATE_PATH = REPO_ROOT / "registry" / "risk_gate_state.json"
+CRYPTO_POSITIONS_PATH = REPO_ROOT / "registry" / "crypto_positions.json"
 ENV_FILE = REPO_ROOT / ".env.competition"
 SYMBOLS = ("SPY", "QQQ", "GLD", "TLT", "SLV", "IWM")  # 2026-08-25: 지수 2 +
 # 금(GLD)+장기채(TLT)+은(SLV)+소형주(IWM) 4개 추가 — SPY/QQQ만 있으면 "동일종목
@@ -164,12 +171,42 @@ def _save_risk_gate_state(state: RiskGateState) -> None:
     os.replace(tmp_path, RISK_GATE_STATE_PATH)
 
 
+def _load_crypto_positions() -> dict[str, CryptoPositionState]:
+    """risk_gate_state.json과 같은 패턴 — 프로세스가 사이클마다 새로 뜨므로
+    진입 시 계산한 stop_pct/target_pct/entry_date를 파일로 지속해야 다음
+    사이클의 청산판정(evaluate_crypto_exit)이 그 값을 다시 쓸 수 있다."""
+    if not CRYPTO_POSITIONS_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(CRYPTO_POSITIONS_PATH.read_text())
+        return {symbol: CryptoPositionState.from_dict(d) for symbol, d in raw.items()}
+    except (json.JSONDecodeError, KeyError, ValueError):
+        logger.exception("[ERROR] crypto_positions.json corrupt — treating as empty (신규진입 시 새로 기록됨)")
+        return {}
+
+
+def _save_crypto_positions(positions: dict[str, CryptoPositionState]) -> None:
+    CRYPTO_POSITIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CRYPTO_POSITIONS_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps({symbol: s.to_dict() for symbol, s in positions.items()}))
+    os.replace(tmp_path, CRYPTO_POSITIONS_PATH)
+
+
 def _underlying_of(symbol: str) -> str | None:
     """OCC 옵션심볼 prefix로 기초자산 판별(예: "SPY260321P00600000" → "SPY")."""
     for base in SYMBOLS:
         if symbol.startswith(base):
             return base
     return None
+
+
+async def _crypto_positions_by_symbol(session: ClientSession) -> dict[str, dict]:
+    """_positions_by_symbol은 OCC 옵션심볼→기초자산 매칭(_underlying_of)만
+    하므로 "BTC/USD" 같은 크립토 심볼은 그 함수에 넣으면 조용히 드롭된다
+    (실측 확인 — 옵션 전용으로 설계된 기존 함수를 그대로 재사용하면 안 됨).
+    크립토는 심볼이 곧 계약이라(멀티레그 없음) 별도의 단순 매칭이면 충분."""
+    positions = _mcp_data(await session.call_tool("get_all_positions", {})).get("result", [])
+    return {p["symbol"]: p for p in positions if p.get("symbol") in CRYPTO_SYMBOLS}
 
 
 async def _positions_by_symbol(session: ClientSession) -> dict[str, list[dict]]:
@@ -278,6 +315,9 @@ async def run_cycle_once() -> None:
                 os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
             )
             option_client = OptionHistoricalDataClient(
+                os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
+            )
+            crypto_client = CryptoHistoricalDataClient(
                 os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
             )
             macro: MacroGate = load_macro_gate()
@@ -412,6 +452,94 @@ async def run_cycle_once() -> None:
                     "order_intent": decision.order_intent,
                     "order_result": order_payload, "submitted": True,
                 })
+
+            # ── 3) 크립토 슬리브 (2026-08-26 추가, Task Contract: BTC/USD·ETH/USD
+            #    현물 롱/플랫, 옵션과 같은 계좌·같은 clock/리스크게이트 공유) —
+            #    옵션과 같은 구조(청산 먼저, 그다음 신규진입)를 그대로 따른다.
+            #    이 루프는 주식시장 개장시간에만 도는데(get_clock이 위에서 이미
+            #    막았으면 여기까지 안 옴) 크립토는 24/7이라 주말 움직임을 못 잡는다
+            #    — v1 의도된 단순화, 결과 보고 필요하면 별도 스케줄로 분리.
+            crypto_positions = _load_crypto_positions()
+            crypto_open_positions = await _crypto_positions_by_symbol(session)
+
+            for symbol in CRYPTO_SYMBOLS:
+                position = crypto_open_positions.get(symbol)
+                if not position:
+                    continue
+                state = crypto_positions.get(symbol)
+                if state is None:
+                    # 상태 파일이 없는데 실제 포지션이 있음(수동개입/상태유실) — fail-closed,
+                    # 사람이 볼 때까지 청산 판단을 못 하니 그대로 둔다(진입은 already_exposed로 막힘).
+                    logger.error("[ERROR] crypto position %s has no stored entry state — leaving open for manual review", symbol)
+                    continue
+                exit_decision = evaluate_crypto_exit(position, state)
+                if not exit_decision.should_close:
+                    logger.info("[HOLD] %s(crypto) pnl_pct=%.1f%%", symbol, exit_decision.profit_pct * 100)
+                    continue
+                qty = str(position.get("qty", "0"))
+                close_intent = build_crypto_close_intent(
+                    symbol, qty, client_order_id=f"atlas-crypto-close-{symbol.replace('/', '')}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}",
+                )
+                try:
+                    close_result = _mcp_data(await session.call_tool("place_crypto_order", close_intent))
+                except Exception:
+                    logger.exception("[ERROR] crypto close order failed for %s (reason=%s) — will retry next cycle", symbol, exit_decision.reason)
+                    _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "close_order_error", "exit_reason": exit_decision.reason})
+                    continue
+                broker_error = _order_error(close_result)
+                if broker_error:
+                    logger.error("[ERROR] crypto close REJECTED for %s (reason=%s): %s — position still open", symbol, exit_decision.reason, broker_error)
+                    _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "close_order_rejected", "exit_reason": exit_decision.reason, "order_intent": close_intent, "order_result": close_result})
+                    continue
+                logger.info("[CLOSE] %s(crypto) reason=%s pnl_pct=%.1f%%", symbol, exit_decision.reason, exit_decision.profit_pct * 100)
+                _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": True, "action": "close", "exit_reason": exit_decision.reason, "profit_pct": exit_decision.profit_pct, "order_intent": close_intent, "order_result": close_result})
+                crypto_positions.pop(symbol, None)
+
+            _save_crypto_positions(crypto_positions)
+
+            if risk_gate.blocked:
+                for symbol in CRYPTO_SYMBOLS:
+                    _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": f"risk_gate:{risk_gate.reason}"})
+            else:
+                # ponytail: 미체결(아직 안 채워진) 크립토 주문 가드는 없음(옵션의
+                # _symbols_with_open_orders는 OCC 심볼 전용이라 그대로 재사용 불가) —
+                # 크립토 시장가 주문은 사실상 즉시체결이라 15분 사이클 간격에서
+                # 중복진입 확률이 낮다고 판단. 실측으로 문제 되면 그때 추가.
+                for symbol in CRYPTO_SYMBOLS:
+                    if symbol in crypto_open_positions:
+                        logger.info("[SKIP] %s(crypto) already has open position — no re-entry", symbol)
+                        _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "already_exposed"})
+                        continue
+                    try:
+                        decision = decide_crypto_for_symbol(crypto_client, symbol, equity, macro)
+                    except Exception:
+                        logger.exception("[ERROR] decide_crypto_for_symbol failed for %s — skipping", symbol)
+                        _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "decision_error"})
+                        continue
+                    if decision.order_intent is None:
+                        logger.info("[SKIP] %s(crypto) regime=%s reason=%s", symbol, decision.regime, decision.skip_reason)
+                        _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "skip_reason": decision.skip_reason, "submitted": False})
+                        continue
+                    try:
+                        order_payload = _mcp_data(await session.call_tool("place_crypto_order", decision.order_intent))
+                    except Exception:
+                        logger.exception("[ERROR] place_crypto_order failed for %s", symbol)
+                        _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "submitted": False, "skip_reason": "order_submit_error"})
+                        continue
+                    broker_error = _order_error(order_payload)
+                    if broker_error:
+                        logger.error("[ERROR] crypto entry REJECTED for %s: %s", symbol, broker_error)
+                        _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "order_result": order_payload, "submitted": False, "skip_reason": "order_rejected"})
+                        continue
+                    logger.info("[SUBMIT] %s(crypto) regime=%s intent=%s", symbol, decision.regime, decision.order_intent)
+                    _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "order_result": order_payload, "submitted": True})
+                    # 체결 확인은 다음 사이클 포지션 조회로 이뤄지지만, stop/target은
+                    # 지금 계산한 값을 바로 저장해야 다음 사이클이 청산판정을 할 수 있다.
+                    crypto_positions[symbol] = CryptoPositionState(
+                        entry_date=datetime.now(timezone.utc).date(),
+                        stop_pct=decision.stop_pct, target_pct=decision.target_pct,
+                    )
+                    _save_crypto_positions(crypto_positions)
 
 
 async def main() -> None:

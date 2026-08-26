@@ -21,6 +21,7 @@ vendor/credit_spread_simulator.py의 trade_log는 옵션 1주(승수 미적용, 
 from __future__ import annotations
 
 import heapq
+import math
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -57,7 +58,7 @@ def risk_pct_for_atr_pct(atr_pct: float, atr_pct_low_q: float, atr_pct_high_q: f
 class DollarTrade:
     entry_date: pd.Timestamp
     exit_date: pd.Timestamp
-    contracts: int
+    contracts: float
     dollar_pnl: float
     raw_trade: dict = field(repr=False, default_factory=dict)
 
@@ -150,12 +151,20 @@ def scale_trades_to_dollars(
         weight = float(t.get("weight", default_weight))
         trade_risk_pct = float(t.get("risk_pct", base_risk_pct))
         risk_budget = equity * trade_risk_pct * weight
-        max_loss_dollars = t["max_loss"] * CONTRACT_MULTIPLIER
-        contracts = int(risk_budget // max_loss_dollars) if max_loss_dollars > 0 else 0
+        # multiplier/qty_increment는 옵션 외 자산군(주식/크립토)을 같은 사이저로
+        # 태우기 위한 확장 — 옵션 거래 dict엔 이 키가 없어 기존 동작과 바이트
+        # 단위로 동일하다(multiplier=100, inc=1.0 → floor(b/m/1)*1 == int(b//m)).
+        multiplier = float(t.get("multiplier", CONTRACT_MULTIPLIER))
+        qty_increment = float(t.get("qty_increment", 1.0))
+        max_loss_dollars = t["max_loss"] * multiplier
+        contracts = (
+            math.floor(risk_budget / max_loss_dollars / qty_increment) * qty_increment
+            if max_loss_dollars > 0 else 0.0
+        )
         if contracts <= 0:
             skipped_zero_contracts += 1
             continue
-        dollar_pnl = t["realized_pnl"] * CONTRACT_MULTIPLIER * contracts
+        dollar_pnl = t["realized_pnl"] * multiplier * contracts
         dollar_trades.append(DollarTrade(
             entry_date=t["entry_date"], exit_date=t["exit_date"],
             contracts=contracts, dollar_pnl=dollar_pnl, raw_trade=t,

@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Literal
 
 import pandas as pd
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import OptionChainRequest, StockBarsRequest
+from alpaca.data.requests import CryptoBarsRequest, OptionChainRequest, StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.enums import ContractType
 
@@ -637,3 +638,127 @@ def evaluate_risk_gates(equity: float, state: RiskGateState, now: datetime | Non
 
     new_state = RiskGateState(high_water_mark, halt_until, day_key, day_start_equity, week_key, week_start_equity)
     return RiskGateDecision(True, reason, new_state)
+
+
+# ── 크립토 슬리브 (2026-08-26 추가, Task Contract: BTC/USD·ETH/USD 현물
+#    롱/플랫 전용, 옵션과 같은 $100k 계좌·같은 리스크게이트 공유) ──
+# docs/design-multi-asset-combined-backtest.md로 백테스트 검증한 것과 동일한
+# 상수(STOP_ATR_MULT/R_MULTIPLE/MAX_HOLD_DAYS)를 그대로 쓴다 — 라이브가 백테스트와
+# 다른 파라미터로 돌면 검증한 숫자가 무의미해진다(TARGET_DTE_RANGE 주석의 옵션
+# 쪽 원칙과 동일).
+CRYPTO_SYMBOLS = ("BTC/USD", "ETH/USD")
+CRYPTO_STOP_ATR_MULT = 2.0
+CRYPTO_R_MULTIPLE = 2.0
+CRYPTO_MAX_HOLD_DAYS = 10
+CRYPTO_LOOKBACK_DAYS = ATR_PCT_LOOKBACK_DAYS + 30
+
+
+def fetch_and_classify_crypto_regime(client: CryptoHistoricalDataClient, symbol: str) -> RegimeSignal:
+    """옵션의 fetch_and_classify_regime과 동일 패턴, 데이터소스만 크립토.
+    레짐 판정 자체(classify_regime_from_bars)는 자산군 무관한 순수함수라
+    재사용한다 — 신규 레짐로직 0줄(백테스트 multi_asset.py와 같은 결정)."""
+    req = CryptoBarsRequest(
+        symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
+        start=datetime.now(timezone.utc) - timedelta(days=CRYPTO_LOOKBACK_DAYS),
+    )
+    bars = client.get_crypto_bars(req).df
+    df = bars.xs(symbol, level="symbol") if isinstance(bars.index, pd.MultiIndex) else bars
+    df.index = pd.DatetimeIndex(df.index.date)
+    df = df[~df.index.duplicated(keep="last")]
+    return classify_regime_from_bars(df, symbol)
+
+
+@dataclass
+class CryptoCycleDecision:
+    symbol: str
+    regime: str
+    macro_gate: MacroGate
+    order_intent: dict | None
+    skip_reason: str | None
+    stop_pct: float | None = None  # 진입 시 계산한 손절 폭(%) — 청산판정에 저장해서 씀
+    target_pct: float | None = None
+
+
+def build_crypto_order_intent(symbol: str, notional: float, client_order_id: str) -> dict:
+    """place_crypto_order MCP 도구용 — notional(달러) 시장가 매수. qty 대신
+    notional을 쓰는 이유: 코인 소수점 정밀도를 브로커가 알아서 처리하게 해서
+    (백테스트의 qty_increment=1e-4 근사를 라이브에서 재구현할 필요가 없음)."""
+    return {
+        "symbol": symbol, "side": "buy", "notional": f"{notional:.2f}",
+        "type": "market", "time_in_force": "gtc", "client_order_id": client_order_id,
+    }
+
+
+def decide_crypto_for_symbol(
+    client: CryptoHistoricalDataClient, symbol: str, equity: float, macro: MacroGate,
+) -> CryptoCycleDecision:
+    """현물 롱/플랫 전용 — bear_call(하락) 신호는 숏이 불가능해 진입하지 않는다
+    (Alpaca 크립토는 비마진 현물, §6.4 백테스트 설계와 동일 결정). range/cash
+    레짐도 방향성 포지션이 아니므로 진입하지 않는다 — trend_up만 매수."""
+    if not macro.ok:
+        return CryptoCycleDecision(symbol, "n/a", macro, None, f"macro_gate_blocked:{macro.reason}")
+
+    signal = fetch_and_classify_crypto_regime(client, symbol)
+    if signal.regime != "trend_up":
+        return CryptoCycleDecision(symbol, signal.regime, macro, None, "not_long_regime")
+
+    risk_budget = equity * signal.risk_pct
+    if signal.atr <= 0 or signal.close <= 0:
+        return CryptoCycleDecision(symbol, signal.regime, macro, None, "invalid_atr_or_price")
+
+    stop_distance = CRYPTO_STOP_ATR_MULT * signal.atr
+    stop_pct = stop_distance / signal.close
+    target_pct = CRYPTO_R_MULTIPLE * stop_pct
+    if stop_pct <= 0:
+        return CryptoCycleDecision(symbol, signal.regime, macro, None, "invalid_stop_distance")
+
+    notional = risk_budget / stop_pct  # 손절 도달 시 예상손실이 risk_budget이 되도록 포지션 크기 역산
+    if notional < 10.0:  # Alpaca 크립토 시장가 최소주문 근사치 — 그 이하는 의미없는 먼지주문
+        return CryptoCycleDecision(symbol, signal.regime, macro, None, "notional_below_minimum")
+
+    cid = f"atlas-crypto-{symbol.replace('/', '')}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
+    intent = build_crypto_order_intent(symbol, notional, cid)
+    return CryptoCycleDecision(symbol, signal.regime, macro, intent, None, stop_pct, target_pct)
+
+
+@dataclass
+class CryptoPositionState:
+    entry_date: date
+    stop_pct: float
+    target_pct: float
+
+    def to_dict(self) -> dict:
+        return {"entry_date": self.entry_date.isoformat(), "stop_pct": self.stop_pct, "target_pct": self.target_pct}
+
+    @staticmethod
+    def from_dict(d: dict) -> "CryptoPositionState":
+        return CryptoPositionState(
+            entry_date=date.fromisoformat(d["entry_date"]),
+            stop_pct=float(d["stop_pct"]), target_pct=float(d["target_pct"]),
+        )
+
+
+def evaluate_crypto_exit(position: dict, state: CryptoPositionState, today: date | None = None) -> ExitDecision:
+    """position은 Alpaca get_open_position 응답(unrealized_plpc 포함). 진입 시
+    저장해둔 stop_pct/target_pct(ATR 기반, §§Task Contract — 백테스트와 동일
+    2xATR 손절/2R 익절)와 보유일수(MAX_HOLD_DAYS)로 판단하는 순수 함수 —
+    옵션의 evaluate_exit과 같은 스타일(포지션 dict + 저장된 상태만으로 테스트 가능)."""
+    today = today or datetime.now(timezone.utc).date()
+    held_days = (today - state.entry_date).days
+    if held_days >= CRYPTO_MAX_HOLD_DAYS:
+        return ExitDecision(True, "max_hold_days", float(position.get("unrealized_plpc", 0.0)))
+
+    plpc = float(position.get("unrealized_plpc", 0.0))
+    if plpc >= state.target_pct:
+        return ExitDecision(True, "profit_target", plpc)
+    if plpc <= -state.stop_pct:
+        return ExitDecision(True, "stop_loss", plpc)
+    return ExitDecision(False, "hold", plpc)
+
+
+def build_crypto_close_intent(symbol: str, qty: str, client_order_id: str) -> dict:
+    """전량 시장가 매도(롱/플랫 전용이라 청산은 항상 sell)."""
+    return {
+        "symbol": symbol, "side": "sell", "qty": qty,
+        "type": "market", "time_in_force": "gtc", "client_order_id": client_order_id,
+    }

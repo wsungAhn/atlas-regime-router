@@ -8,15 +8,19 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from signals import (  # noqa: E402
+    CryptoPositionState,
     MacroGate,
     RiskGateState,
     _vertical_width,
     build_close_intent,
     build_credit_spread_intent,
+    build_crypto_close_intent,
+    build_crypto_order_intent,
     build_iron_condor_intent,
     classify_regime_from_bars,
     contracts_for_max_loss,
     decide_for_symbol,
+    evaluate_crypto_exit,
     evaluate_exit,
     evaluate_risk_gates,
     pick_by_delta,
@@ -325,3 +329,96 @@ def test_risk_gate_stays_halted_within_45_minutes_then_releases():
     recovered = evaluate_risk_gates(97_000.0, still_halted.state, now=next_monday)
     assert recovered.blocked is False
     assert recovered.reason == "ok"
+
+
+# ── 크립토 슬리브 ──
+
+class _FakeCryptoDataClient:
+    def __init__(self, bars_df: pd.DataFrame, symbol: str):
+        self._bars_df = bars_df
+        self._symbol = symbol
+
+    def get_crypto_bars(self, req):
+        class _Wrapper:
+            df = self._bars_df
+
+        return _Wrapper()
+
+
+def test_decide_crypto_macro_gate_blocks_regardless_of_regime():
+    from signals import decide_crypto_for_symbol
+    macro = MacroGate(ok=False, reason="stage4_declining", stage="stage4_declining")
+    decision = decide_crypto_for_symbol(client=None, symbol="BTC/USD", equity=100_000, macro=macro)
+    assert decision.order_intent is None
+    assert decision.skip_reason == "macro_gate_blocked:stage4_declining"
+
+
+def test_decide_crypto_trend_up_builds_market_buy():
+    from signals import decide_crypto_for_symbol
+    macro = MacroGate(ok=True, reason="clear", stage="stage2_advancing")
+    client = _FakeCryptoDataClient(_trending_up_bars(), "BTC/USD")
+    decision = decide_crypto_for_symbol(client, "BTC/USD", equity=100_000, macro=macro)
+    assert decision.regime == "trend_up"
+    assert decision.order_intent is not None
+    assert decision.order_intent["side"] == "buy"
+    assert decision.order_intent["symbol"] == "BTC/USD"
+    assert float(decision.order_intent["notional"]) > 0
+    assert decision.stop_pct is not None and decision.stop_pct > 0
+    assert decision.target_pct == pytest.approx(decision.stop_pct * 2.0)  # CRYPTO_R_MULTIPLE=2.0
+
+
+def test_decide_crypto_skips_non_trend_up_regime():
+    from signals import decide_crypto_for_symbol
+    macro = MacroGate(ok=True, reason="clear", stage="stage2_advancing")
+    client = _FakeCryptoDataClient(_flat_bars(), "BTC/USD")
+    decision = decide_crypto_for_symbol(client, "BTC/USD", equity=100_000, macro=macro)
+    assert decision.order_intent is None
+    assert decision.skip_reason == "not_long_regime"  # range 레짐 — 롱/플랫 전용이라 진입 안 함
+
+
+def test_evaluate_crypto_exit_holds_within_bounds():
+    state = CryptoPositionState(entry_date=date(2026, 1, 1), stop_pct=0.05, target_pct=0.10)
+    decision = evaluate_crypto_exit({"unrealized_plpc": 0.02}, state, today=date(2026, 1, 3))
+    assert decision.should_close is False
+
+
+def test_evaluate_crypto_exit_closes_at_profit_target():
+    state = CryptoPositionState(entry_date=date(2026, 1, 1), stop_pct=0.05, target_pct=0.10)
+    decision = evaluate_crypto_exit({"unrealized_plpc": 0.11}, state, today=date(2026, 1, 3))
+    assert decision.should_close is True
+    assert decision.reason == "profit_target"
+
+
+def test_evaluate_crypto_exit_closes_at_stop_loss():
+    state = CryptoPositionState(entry_date=date(2026, 1, 1), stop_pct=0.05, target_pct=0.10)
+    decision = evaluate_crypto_exit({"unrealized_plpc": -0.06}, state, today=date(2026, 1, 3))
+    assert decision.should_close is True
+    assert decision.reason == "stop_loss"
+
+
+def test_evaluate_crypto_exit_forces_close_after_max_hold_days_regardless_of_pnl():
+    state = CryptoPositionState(entry_date=date(2026, 1, 1), stop_pct=0.05, target_pct=0.10)
+    decision = evaluate_crypto_exit({"unrealized_plpc": 0.01}, state, today=date(2026, 1, 11))  # 10일 경과
+    assert decision.should_close is True
+    assert decision.reason == "max_hold_days"
+
+
+def test_crypto_position_state_roundtrip():
+    state = CryptoPositionState(entry_date=date(2026, 3, 5), stop_pct=0.048, target_pct=0.096)
+    restored = CryptoPositionState.from_dict(state.to_dict())
+    assert restored == state
+
+
+def test_build_crypto_order_intent_uses_notional_market_buy():
+    intent = build_crypto_order_intent("ETH/USD", 4321.5, "cid-1")
+    assert intent == {
+        "symbol": "ETH/USD", "side": "buy", "notional": "4321.50",
+        "type": "market", "time_in_force": "gtc", "client_order_id": "cid-1",
+    }
+
+
+def test_build_crypto_close_intent_sells_full_qty():
+    intent = build_crypto_close_intent("BTC/USD", "0.0512", "cid-close")
+    assert intent["side"] == "sell"
+    assert intent["qty"] == "0.0512"
+    assert intent["symbol"] == "BTC/USD"
