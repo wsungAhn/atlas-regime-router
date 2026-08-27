@@ -108,7 +108,7 @@ The daily execution follows the strictly ordered 5-step lifecycle to eliminate l
 
 ## 6. Verification & Test Suite Summary
 
-The unit test suite in `test_leap_engine.py` was executed with Python 3.12 (`16/16 tests passing`):
+The unit test suite in `test_leap_engine.py` runs on the repository venv (`.venv/bin/python3`, currently Python 3.13). Run `python3 -m pytest` for the live count rather than trusting a number pinned here:
 
 | Test Case | Description | Result |
 |---|---|---|

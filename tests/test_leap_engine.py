@@ -397,6 +397,65 @@ class TestInvariantsAndTiming(unittest.TestCase):
         self.assertEqual(len(skip_events), 1)
         self.assertEqual(pd.Timestamp(skip_events[0]["exit_date"]), dates[1])
 
+    def test_nan_and_zero_iv_are_treated_as_missing(self):
+        """A NaN or 0.0 IV print is not a usable IV: equity must stay finite, not silently nan."""
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [100.0] * 3, "low": [100.0] * 3, "close": [100.0] * 3, "volume": [1000] * 3},
+            index=dates,
+        )
+        # Day 1 prints NaN, day 2 prints 0.0 — both must fall back to the day-0 IV.
+        iv_series = pd.Series([0.20, float("nan"), 0.0], index=dates)
+        regimes = pd.Series("neutral", index=dates)
+
+        engine = LeapEngine(starting_cash=30_000.0)
+        entry_price = black_scholes_price(100.0, 90.0, 1.0, engine.r, 0.20, "call")
+        engine.book.cash -= entry_price * 100.0
+        engine.book.legs["SPY"] = [
+            OptionLeg("call", 90.0, dates[0] + pd.Timedelta(days=365), 1, entry_price, dates[0], "leap", "SPY")
+        ]
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+
+        for d in dates:
+            self.assertIn(d, book.equity_curve)
+            self.assertTrue(math.isfinite(book.equity_curve[d]), f"equity not finite on {d}")
+        skipped = {
+            pd.Timestamp(r["exit_date"])
+            for r in book.realized
+            if r["kind"] == "iv_coverage_skip"
+        }
+        self.assertEqual(skipped, {dates[1], dates[2]})
+
+    def test_spread_settlement_pnl_must_match_cash_moved(self):
+        """A vendor realized_pnl that disagrees with credit - close_debit must not reach metrics."""
+        d = pd.Timestamp("2023-01-02")
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.active_spreads = [
+            ActiveSpread(
+                symbol="SPY",
+                spread_type="bull_put",
+                short_strike=99.0,
+                long_strike=98.0,
+                entry_date=d - pd.Timedelta(days=7),
+                exit_date=d,
+                contracts=1,
+                credit_received=0.30,
+                max_loss=0.70,
+                close_debit=0.12,
+                realized_pnl=1.62,  # vendor claims +$162, cash only moved +$18
+                exit_reason="profit_target",
+            )
+        ]
+
+        with self.assertRaises(AssertionError):
+            engine._step_expiry(d, {"SPY": 100.0}, {"SPY": 0.20})
+
     def test_iv_gap_still_settles_expiry_on_that_close(self):
         """Missing IV on expiry day must not defer intrinsic settlement to a future close."""
         dates = pd.bdate_range("2023-01-02", periods=2)

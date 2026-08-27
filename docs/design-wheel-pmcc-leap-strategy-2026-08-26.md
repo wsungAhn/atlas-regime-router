@@ -402,6 +402,8 @@ V3 spread entry처럼 "그날 옵션가"가 필요한 판단/체결은 **fresh I
 그 콜 청산에는 fresh IV가 필요하므로 주문 실행을 미룬다. IV 결측은 심볼 단위로 격리한다:
 SPY IV 결측이 SLV/TLT의 만기 정산·MTM·fresh IV가 있는 주문 실행을 밀어서는 안 된다.
 결측 사실은 `iv_coverage_skip` 이벤트로 남기되 그날 전체 루프를 중단하지 않는다.
+IV 값이 존재해도 `NaN`·`inf`·0 이하이면 결측과 동일하게 취급한다 — vendor BS는
+`sigma <= 0`을 거부하고, `NaN`은 assert에 걸리지 않은 채 equity를 조용히 오염시킨다.
 시리즈 앞쪽 결측처럼 과거 IV도 없는데 이미 열린 옵션 포지션이 있으면, 해당 심볼의
 비만기 옵션 MTM은 내재가치로만 평가하고 `iv_intrinsic_mtm_fallback` 이벤트를 남긴다.
 이는 entry/trigger/옵션 청산 체결에는 쓰지 않고, sleeve 전체 항등식과 다른 심볼의
@@ -582,6 +584,9 @@ raw 자체 불변식으로 거부한다. theoretical repricing은 이후 MTM/청
    gate를 통과해야 하며, raw credit이 width를 넘거나 `max_loss != width - credit`이면
    mutate 전에 assert로 거부한다. 신호일 IV로 만든 정상 raw를 진입일 IV theoretical
    debit로 재채점하지 않는다.
+   V3 정산 P&L은 실제로 움직인 현금(`credit_received - close_debit`)으로 계상하고,
+   vendor `realized_pnl`이 이와 어긋나면 assert로 거부한다 — 메트릭이 equity_curve와
+   갈라지는 것을 막는다(§1 현금 보존식).
 2. **배정 사이클**: 가격을 행사가 아래로 보내는 합성 시나리오에서 CSP 배정 →
    shares 증가·cash 감소 → CC 매도 → 가격 회복 → 콜어웨이 → 현금 복귀. 각 단계의
    realized 이벤트 kind가 순서대로 기록됨.

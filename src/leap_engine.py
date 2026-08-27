@@ -21,6 +21,11 @@ import pandas as pd
 from vendor.options_pricing import black_scholes_delta, black_scholes_price, strike_for_delta
 
 
+def _is_valid_iv(value: float) -> bool:
+    """IV is usable only if finite and positive: vendor BS rejects sigma <= 0, NaN silently poisons equity."""
+    return math.isfinite(value) and value > 0.0
+
+
 def round_to_increment(value: float, increment: float = 0.5) -> float:
     """Round strike to standard increment (default $0.50)."""
     return round(value / increment) * increment
@@ -482,12 +487,13 @@ class LeapEngine:
                     missing_iv.append(sym)
                     missing_iv_no_prior.append(sym)
                     continue
-                if d in series.index:
-                    iv_value = float(series.loc[d])
+                iv_value = float(series.loc[d]) if d in series.index else float("nan")
+                if _is_valid_iv(iv_value):
                     current_ivs[sym] = iv_value
                     fresh_ivs[sym] = iv_value
                     continue
                 prior = series.loc[series.index < d]
+                prior = prior[np.isfinite(prior) & (prior > 0.0)]
                 missing_iv.append(sym)
                 if prior.empty:
                     missing_iv_no_prior.append(sym)
@@ -1143,7 +1149,16 @@ class LeapEngine:
                 collateral = sp.max_loss * 100.0 * sp.contracts
                 self.book.reserved_collateral -= collateral
                 self.book.cash -= sp.close_debit * 100.0 * sp.contracts
-                dollar_pnl = sp.realized_pnl * 100.0 * sp.contracts
+                # Cash moved credit-in / debit-out, so reported P&L must be that same
+                # difference; a vendor realized_pnl that disagrees would make metrics
+                # diverge from the equity curve (§1 cash conservation).
+                dollar_pnl = (sp.credit_received - sp.close_debit) * 100.0 * sp.contracts
+                vendor_pnl = sp.realized_pnl * 100.0 * sp.contracts
+                if abs(vendor_pnl - dollar_pnl) > 1e-4:
+                    raise AssertionError(
+                        f"Spread realized_pnl mismatch at {d}: symbol={sp.symbol}, "
+                        f"vendor={vendor_pnl:.4f}, credit_minus_debit={dollar_pnl:.4f}"
+                    )
                 if dollar_pnl > 0:
                     self.book.premium_bank = min(self.book.cash, self.book.premium_bank + dollar_pnl)
                 self.book.realized.append({
