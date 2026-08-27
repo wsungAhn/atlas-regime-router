@@ -47,6 +47,9 @@ from leap_engine import (
     run_v3_spread_financing,
     strike_for_delta,
 )
+from backtest import _generate_raw_trades
+import backtest
+from strategies import StrategySignal
 
 
 def create_synthetic_bars(
@@ -453,6 +456,76 @@ class TestInvariantsAndTiming(unittest.TestCase):
         self.assertEqual(book.shares["SPY"], 100)
         self.assertAlmostEqual(report.metrics.final_equity, 29_100.0)
 
+    def test_leap_close_waits_for_fresh_iv_on_execution_day(self):
+        """Strategic LEAP close needs fresh execution-day IV and must not disappear on a gap."""
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [100.0] * 3, "low": [100.0] * 3, "close": [100.0] * 3, "volume": [1000] * 3},
+            index=dates,
+        )
+        iv_series = pd.Series([0.20, 0.20], index=[dates[0], dates[2]])
+        regimes = pd.Series(["bear", "bear", "bear"], index=dates)
+
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.cash = 27_500.0
+        engine.book.legs["SPY"] = [
+            OptionLeg("call", 80.0, dates[2] + pd.Timedelta(days=365), 1, 25.0, dates[0], "leap", "SPY")
+        ]
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: decide_v1_pmcc(eng, d, px, iv, reg),
+        )
+
+        close_events = [r for r in book.realized if r["kind"] == "leap_close"]
+        self.assertEqual(len(close_events), 1)
+        self.assertEqual(pd.Timestamp(close_events[0]["exit_date"]), dates[2])
+        self.assertEqual(len(engine.pending_queue), 0)
+
+    def test_no_prior_iv_fallback_does_not_block_other_symbol_trigger(self):
+        """A no-prior IV symbol uses intrinsic MTM and must not block another symbol's trigger."""
+        dates = pd.bdate_range("2023-01-02", periods=2)
+        bars = {
+            "SPY": pd.DataFrame(
+                {"open": [100.0, 100.0], "high": [100.0, 100.0], "low": [100.0, 100.0], "close": [100.0, 100.0], "volume": [1000, 1000]},
+                index=dates,
+            ),
+            "QQQ": pd.DataFrame(
+                {"open": [100.0, 100.0], "high": [100.0, 100.0], "low": [100.0, 100.0], "close": [100.0, 100.0], "volume": [1000, 1000]},
+                index=dates,
+            ),
+        }
+        ivs = {"SPY": pd.Series([0.20, 0.20], index=dates), "QQQ": pd.Series([0.20], index=[dates[1]])}
+        regimes = {
+            "SPY": pd.Series("neutral", index=dates),
+            "QQQ": pd.Series("neutral", index=dates),
+        }
+
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.cash = 30_000.0 + 500.0 - 2_500.0 - 2_500.0
+        engine.book.legs["SPY"] = [
+            OptionLeg("call", 80.0, dates[1] + pd.Timedelta(days=365), 1, 25.0, dates[0], "leap", "SPY"),
+            OptionLeg("call", 110.0, dates[1], -1, 5.0, dates[0], "short_call", "SPY"),
+        ]
+        engine.book.legs["QQQ"] = [
+            OptionLeg("call", 80.0, dates[1] + pd.Timedelta(days=365), 1, 25.0, dates[0], "leap", "QQQ")
+        ]
+
+        book = engine.run_simulation(
+            bars_by_symbol=bars,
+            iv_by_symbol=ivs,
+            regime_by_symbol=regimes,
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+
+        stop_events = [r for r in book.realized if r.get("detail", {}).get("exit_reason") == "profit_target"]
+        fallback_events = [r for r in book.realized if r["kind"] == "iv_intrinsic_mtm_fallback"]
+        self.assertEqual(len(stop_events), 1)
+        self.assertEqual(pd.Timestamp(stop_events[0]["exit_date"]), dates[0])
+        self.assertEqual(fallback_events[0]["symbol"], "QQQ")
+
 
 class TestV1PMCCMechanics(unittest.TestCase):
     """Test V1 PMCC Classic details (§2.1)."""
@@ -654,6 +727,32 @@ class TestV2WheelMechanics(unittest.TestCase):
         self.assertEqual(engine.stock_stop_count, 1)
         self.assertEqual(book.shares.get("SLV", 0), 0)
 
+    def test_v2_stock_stop_without_covered_call_does_not_need_fresh_iv(self):
+        """Stock-only stop execution uses stock close and should not wait for option IV."""
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df = pd.DataFrame(
+            {"open": [75.0, 75.0, 75.0], "high": [75.0, 75.0, 75.0], "low": [75.0, 75.0, 75.0], "close": [75.0, 75.0, 75.0], "volume": [1000] * 3},
+            index=dates,
+        )
+        iv_series = pd.Series([0.20, 0.20], index=[dates[0], dates[2]])
+        regimes = pd.Series("neutral", index=dates)
+
+        engine = LeapEngine(starting_cash=20_000.0)
+        engine.book.shares["SLV"] = 100
+        engine.book.share_cost_basis["SLV"] = 100.0
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SLV": df},
+            iv_by_symbol={"SLV": iv_series},
+            regime_by_symbol={"SLV": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: decide_v2_wheel(eng, d, px, iv, reg),
+        )
+
+        stop_events = [r for r in book.realized if r["kind"] == "share_stop"]
+        self.assertEqual(len(stop_events), 1)
+        self.assertEqual(pd.Timestamp(stop_events[0]["exit_date"]), dates[1])
+        self.assertEqual(book.shares.get("SLV", 0), 0)
+
     def test_v2_csp_and_covered_call_are_not_profit_target_closed(self):
         """V2 wheel option legs are held to expiry; PT is a V1 short-call rule, not a wheel rule."""
         d = pd.Timestamp("2023-01-02")
@@ -777,6 +876,99 @@ class TestV3SpreadFinancingAndSignature(unittest.TestCase):
                 starting_cash=30_000.0,
             )
 
+    def test_v3_spread_entry_rejects_before_mutating_book(self):
+        """Invalid raw spread invariants must fail before cash/collateral/spread mutation."""
+        d = pd.Timestamp("2023-01-02")
+        engine = LeapEngine(starting_cash=30_000.0)
+        bad_raw = {
+            "entry_date": d,
+            "exit_date": d + pd.Timedelta(days=7),
+            "spread_type": "bull_put",
+            "short_strike": 99.0,
+            "long_strike": 98.0,
+            "credit_received": 999.0,
+            "max_loss": 1.0,
+            "close_debit": 0.0,
+            "realized_pnl": 999.0,
+            "symbol": "SPY",
+        }
+
+        with self.assertRaises(AssertionError):
+            engine._execute_spread_entry(d, bad_raw, {"SPY": 100.0}, {"SPY": 0.20})
+
+        self.assertEqual(engine.book.cash, 30_000.0)
+        self.assertEqual(engine.book.reserved_collateral, 0.0)
+        self.assertEqual(engine.book.active_spreads, [])
+
+    def test_v3_spread_entry_accepts_vendor_credit_above_entry_day_theoretical_debit(self):
+        """Structural raw invariants, not entry-day theoretical repricing, decide validity."""
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df_spy = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [100.0] * 3, "low": [100.0] * 3, "close": [100.0] * 3, "volume": [1000] * 3},
+            index=dates,
+        )
+        iv_series = pd.Series(0.12, index=dates)
+        regimes = pd.Series("neutral", index=dates)
+        boundary_raw = [
+            {
+                "entry_date": dates[0],
+                "exit_date": dates[2],
+                "spread_type": "bull_put",
+                "short_strike": 95.0,
+                "long_strike": 94.0,
+                "credit_received": 0.05,
+                "max_loss": 0.95,
+                "close_debit": 0.0,
+                "realized_pnl": 0.05,
+                "exit_reason": "probe",
+                "symbol": "SPY",
+            }
+        ]
+
+        report = run_v3_spread_financing(
+            bars_by_symbol={"SPY": df_spy},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            raw_trades=boundary_raw,
+            starting_cash=30_000.0,
+        )
+
+        short_cycles = [r for r in report.realized_events if r["kind"] == "short_cycle"]
+        self.assertEqual(len(short_cycles), 1)
+        self.assertAlmostEqual(short_cycles[0]["dollar_pnl"], 0.05 * 100.0 * 15)
+
+    def test_v3_iron_condor_signal_splits_before_engine_replay(self):
+        """The upstream raw generator must split iron_condor into replayable spread sides."""
+        dates = pd.bdate_range("2023-01-02", periods=300)
+        df_spy = create_synthetic_bars(start_date="2023-01-02", n_days=300, start_price=100.0, seed=77)
+        iv_series = pd.Series(0.25, index=dates)
+        regimes = pd.Series("neutral", index=dates)
+        strategy_name = "__test_iron_condor_split__"
+        original = backtest.ALL_STRATEGIES.get(strategy_name)
+        backtest.ALL_STRATEGIES[strategy_name] = lambda df: [StrategySignal(df.index[260], "iron_condor")]
+        try:
+            raw_trades = _generate_raw_trades(
+                strategy_name,
+                df_spy,
+                iv_series,
+                pd.Series(0.05, index=dates),
+            )
+        finally:
+            if original is None:
+                backtest.ALL_STRATEGIES.pop(strategy_name, None)
+            else:
+                backtest.ALL_STRATEGIES[strategy_name] = original
+
+        self.assertEqual({t["spread_type"] for t in raw_trades}, {"bull_put", "bear_call"})
+        report = run_v3_spread_financing(
+            bars_by_symbol={"SPY": df_spy},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            raw_trades=[dict(t, symbol="SPY") for t in raw_trades],
+            starting_cash=30_000.0,
+        )
+        self.assertGreaterEqual(report.metrics.n_trades, 1)
+
 
 class TestAdapterAndReporting(unittest.TestCase):
     """Test performance calculation adapter and 7-day rolling statistics (§5.5, §7)."""
@@ -795,6 +987,32 @@ class TestAdapterAndReporting(unittest.TestCase):
         self.assertAlmostEqual(metrics.total_pnl, 800.0)
         self.assertAlmostEqual(metrics.win_rate, 2.0 / 3.0)
         self.assertAlmostEqual(metrics.profit_factor, 1000.0 / 200.0)
+
+    def test_rolling_7d_uses_calendar_days_and_no_nan_stats(self):
+        """Sparse realized/equity dates still produce calendar 7-day windows with defined stats."""
+        book = SleeveBook(cash=30_000.0)
+        book.equity_curve = {
+            pd.Timestamp("2023-01-02"): 30_000.0,
+            pd.Timestamp("2023-01-03"): 30_100.0,
+        }
+        book.realized = [
+            {
+                "entry_date": pd.Timestamp("2023-01-02"),
+                "exit_date": pd.Timestamp("2023-01-10"),
+                "symbol": "SPY",
+                "kind": "short_cycle",
+                "dollar_pnl": 100.0,
+                "detail": {"contracts": 1},
+            }
+        ]
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book = book
+
+        report = _build_report("probe", book, engine)
+
+        self.assertEqual(report.rolling_7d_pnl.index.freqstr, "D")
+        self.assertEqual(report.rolling_7d_pnl.loc[pd.Timestamp("2023-01-10")], 100.0)
+        self.assertTrue(all(np.isfinite(v) for v in report.rolling_7d_stats.values()))
 
     def test_regime_calculation_zero_lookahead(self):
         """Verify calculate_adx_ema_regime runs without errors and produces valid regimes."""

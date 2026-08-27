@@ -44,6 +44,14 @@ def _option_price_for_mtm(
     return black_scholes_price(S, K, T, r, sigma, option_type)
 
 
+def _intrinsic_option_price(S: float, K: float, option_type: str) -> float:
+    if option_type == "call":
+        return max(0.0, float(S - K))
+    if option_type == "put":
+        return max(0.0, float(K - S))
+    raise ValueError("option_type must be 'call' or 'put'")
+
+
 def _spread_close_debit_for_mtm(
     spread_type: str,
     short_strike: float,
@@ -57,6 +65,20 @@ def _spread_close_debit_for_mtm(
     short_p = _option_price_for_mtm(S, short_strike, T, r, iv, opt_type)
     long_p = _option_price_for_mtm(S, long_strike, T, r, iv, opt_type)
     return max(0.0, min(abs(short_strike - long_strike), short_p - long_p))
+
+
+def _spread_intrinsic_debit(
+    spread_type: str,
+    short_strike: float,
+    long_strike: float,
+    S: float,
+) -> float:
+    width = abs(short_strike - long_strike)
+    if spread_type == "bull_put":
+        return max(0.0, min(width, short_strike - S))
+    if spread_type == "bear_call":
+        return max(0.0, min(width, S - short_strike))
+    raise ValueError("spread_type must be 'bull_put' or 'bear_call'")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,7 +187,11 @@ class SleeveBook:
             iv = iv_by_symbol.get(sym, 0.20)
             for leg in leg_list:
                 t_rem = max(0.0, (leg.expiry - current_date).days / 365.0)
-                px = _option_price_for_mtm(S, leg.strike, t_rem, r, iv, leg.option_type)
+                px = (
+                    _option_price_for_mtm(S, leg.strike, t_rem, r, iv, leg.option_type)
+                    if sym in iv_by_symbol or t_rem <= 0.0
+                    else _intrinsic_option_price(S, leg.strike, leg.option_type)
+                )
                 if leg.qty > 0:
                     total_leg_mtm += px * 100.0 * leg.qty
                 else:
@@ -177,8 +203,14 @@ class SleeveBook:
             S = current_prices.get(sp.symbol, 0.0)
             iv = iv_by_symbol.get(sp.symbol, 0.20)
             t_rem = max(0.0, (sp.exit_date - current_date).days / 365.0)
-            if current_date >= sp.exit_date:
+            if current_date == sp.entry_date:
+                close_debit = sp.credit_received
+            elif current_date >= sp.exit_date:
                 close_debit = sp.close_debit
+            elif sp.symbol not in iv_by_symbol:
+                close_debit = _spread_intrinsic_debit(
+                    sp.spread_type, sp.short_strike, sp.long_strike, S
+                )
             else:
                 close_debit = _spread_close_debit_for_mtm(
                     sp.spread_type, sp.short_strike, sp.long_strike, S, t_rem, r, iv
@@ -410,6 +442,7 @@ class LeapEngine:
         self.leap_sweep_count = 0
         self.bank_history: Dict[pd.Timestamp, float] = {}
         self._fresh_iv_symbols: set[str] = set()
+        self._intrinsic_iv_fallback_events: set[tuple[pd.Timestamp, str]] = set()
 
     def run_simulation(
         self,
@@ -473,6 +506,11 @@ class LeapEngine:
                         "no_prior_symbols": sorted(missing_iv_no_prior),
                     },
                 })
+            fallback_symbols = [
+                sym for sym in missing_iv_no_prior if self._has_open_iv_sensitive_position(sym, d)
+            ]
+            if fallback_symbols:
+                self._record_intrinsic_mtm_fallback(d, fallback_symbols)
 
             current_regimes = {
                 sym: str(regime_by_symbol[sym].get(d, "neutral")) for sym in regime_by_symbol
@@ -510,10 +548,12 @@ class LeapEngine:
             S = current_prices.get(sym, 0.0)
             for leg in leg_list:
                 t_rem = max(0.0, (leg.expiry - d).days / 365.0)
-                if t_rem > 0.0 and sym not in current_ivs:
-                    raise KeyError(f"Missing IV for open {sym} leg at {d}")
                 iv = current_ivs.get(sym, 0.20)
-                px = _option_price_for_mtm(S, leg.strike, t_rem, self.r, iv, leg.option_type)
+                px = (
+                    _option_price_for_mtm(S, leg.strike, t_rem, self.r, iv, leg.option_type)
+                    if sym in current_ivs or t_rem <= 0.0
+                    else _intrinsic_option_price(S, leg.strike, leg.option_type)
+                )
                 if leg.qty > 0:
                     total_leg_mtm += px * 100.0 * leg.qty
                 else:
@@ -523,11 +563,15 @@ class LeapEngine:
         for sp in self.book.active_spreads:
             S = current_prices.get(sp.symbol, 0.0)
             t_rem = max(0.0, (sp.exit_date - d).days / 365.0)
-            if d >= sp.exit_date:
+            if d == sp.entry_date:
+                close_debit = sp.credit_received
+            elif d >= sp.exit_date:
                 close_debit = sp.close_debit
+            elif sp.symbol not in current_ivs:
+                close_debit = _spread_intrinsic_debit(
+                    sp.spread_type, sp.short_strike, sp.long_strike, S
+                )
             else:
-                if sp.symbol not in current_ivs:
-                    raise KeyError(f"Missing IV for open {sp.symbol} spread at {d}")
                 iv = current_ivs[sp.symbol]
                 close_debit = _spread_close_debit_for_mtm(
                     sp.spread_type, sp.short_strike, sp.long_strike, S, t_rem, self.r, iv
@@ -541,10 +585,7 @@ class LeapEngine:
         return self.book.cash + total_leg_mtm + spread_mtm + total_stock_value
 
     def _can_calculate_equity(self, d: pd.Timestamp, current_ivs: Dict[str, float]) -> bool:
-        for sym, leg_list in self.book.legs.items():
-            if any((leg.expiry - d).days > 0 for leg in leg_list) and sym not in current_ivs:
-                return False
-        return all(d >= sp.exit_date or sp.symbol in current_ivs for sp in self.book.active_spreads)
+        return True
 
     def _assert_equity_continuity(
         self,
@@ -598,15 +639,16 @@ class LeapEngine:
         for order in orders_to_process:
             sym = order.symbol
             S = current_prices.get(sym, 0.0)
-            if sym not in current_ivs:
+            requires_fresh_iv = self._order_requires_fresh_iv(order, d)
+            if sym not in current_ivs and (requires_fresh_iv or order.order_type != "STOCK_STOP_CLOSE"):
                 self.pending_queue.append(order)
                 self.book.pending_debits += order.estimated_debit
                 continue
-            if self._order_requires_fresh_iv(order) and sym not in self._fresh_iv_symbols:
+            if requires_fresh_iv and sym not in self._fresh_iv_symbols:
                 self.pending_queue.append(order)
                 self.book.pending_debits += order.estimated_debit
                 continue
-            iv = current_ivs[sym]
+            iv = current_ivs.get(sym, 0.20)
             if S <= 0:
                 self.pending_queue.append(order)
                 self.book.pending_debits += order.estimated_debit
@@ -996,28 +1038,39 @@ class LeapEngine:
         current_ivs: Optional[Dict[str, float]] = None,
     ) -> None:
         """Enter a Strategy 7 raw spread on its already-confirmed vendor entry_date."""
+        spread_symbol = str(raw.get("symbol", "SPY"))
+        spread_type = str(raw["spread_type"])
+        short_strike = float(raw["short_strike"])
+        long_strike = float(raw["long_strike"])
         max_loss = float(raw["max_loss"])
         credit_received = float(raw["credit_received"])
+        width = self._validate_spread_raw_invariants(
+            spread_symbol, spread_type, short_strike, long_strike, credit_received, max_loss
+        )
         contracts = int(math.floor(self.book.available_cash * 0.05 / (max_loss * 100.0)))
         if contracts < 1:
             return
 
         current_prices = current_prices or {}
         current_ivs = current_ivs or {}
-        spread_symbol = str(raw.get("symbol", "SPY"))
         before_equity = (
             self._calculate_equity(d, current_prices, current_ivs)
             if spread_symbol in current_prices and self._can_calculate_equity(d, current_ivs)
             else None
         )
         collateral = max_loss * 100.0 * contracts
-        self.book.reserved_collateral += collateral
-        self.book.cash += credit_received * 100.0 * contracts
+        expected_collateral = (width - credit_received) * 100.0 * contracts
+        if abs(collateral - expected_collateral) > 1e-4:
+            raise AssertionError(
+                f"Spread collateral mismatch at {d}: symbol={spread_symbol}, "
+                f"collateral={collateral:.4f}, expected={expected_collateral:.4f}"
+            )
+
         sp = ActiveSpread(
             symbol=spread_symbol,
-            spread_type=str(raw["spread_type"]),
-            short_strike=float(raw["short_strike"]),
-            long_strike=float(raw["long_strike"]),
+            spread_type=spread_type,
+            short_strike=short_strike,
+            long_strike=long_strike,
             entry_date=pd.Timestamp(raw.get("entry_date", d)),
             exit_date=pd.Timestamp(raw["exit_date"]),
             contracts=contracts,
@@ -1027,32 +1080,48 @@ class LeapEngine:
             realized_pnl=float(raw.get("realized_pnl", 0.0)),
             exit_reason=str(raw.get("exit_reason", "")),
         )
+
+        self.book.reserved_collateral += collateral
+        self.book.cash += credit_received * 100.0 * contracts
         self.book.active_spreads.append(sp)
         if before_equity is not None:
-            S = current_prices[spread_symbol]
-            iv = current_ivs[spread_symbol]
-            t_rem = max(0.0, (sp.exit_date - d).days / 365.0)
-            entry_debit = (
-                sp.close_debit
-                if d >= sp.exit_date
-                else _spread_close_debit_for_mtm(
-                    sp.spread_type, sp.short_strike, sp.long_strike, S, t_rem, self.r, iv
-                )
-            )
-            if credit_received > entry_debit + 1e-4:
-                raise AssertionError(
-                    f"Spread entry credit exceeds same-day MTM debit at {d}: "
-                    f"symbol={spread_symbol}, credit={credit_received:.4f}, mtm_debit={entry_debit:.4f}"
-                )
-            expected_delta = (credit_received - entry_debit) * 100.0 * contracts
             self._assert_event_equity_change(
                 before_equity,
                 d,
                 current_prices,
                 current_ivs,
                 "spread_entry",
-                expected_delta=expected_delta,
+                expected_delta=0.0,
             )
+
+    @staticmethod
+    def _validate_spread_raw_invariants(
+        symbol: str,
+        spread_type: str,
+        short_strike: float,
+        long_strike: float,
+        credit_received: float,
+        max_loss: float,
+        tol: float = 1e-4,
+    ) -> float:
+        if spread_type not in {"bull_put", "bear_call"}:
+            raise AssertionError(f"Unsupported spread_type for {symbol}: {spread_type}")
+        width = abs(short_strike - long_strike)
+        if width <= 0.0:
+            raise AssertionError(f"Spread width must be positive for {symbol}")
+        if not (0.0 < credit_received <= width + tol):
+            raise AssertionError(
+                f"Spread credit outside width for {symbol}: credit={credit_received:.4f}, width={width:.4f}"
+            )
+        expected_max_loss = width - credit_received
+        if abs(max_loss - expected_max_loss) > tol:
+            raise AssertionError(
+                f"Spread max_loss mismatch for {symbol}: max_loss={max_loss:.4f}, "
+                f"expected={expected_max_loss:.4f}"
+            )
+        if max_loss <= tol:
+            raise AssertionError(f"Spread max_loss must be positive for {symbol}: max_loss={max_loss:.4f}")
+        return width
 
     def _step_expiry(
         self,
@@ -1317,9 +1386,44 @@ class LeapEngine:
                 leg.cumulative_short_credits += credit_dollars
                 break
 
-    @staticmethod
-    def _order_requires_fresh_iv(order: PendingOrder) -> bool:
-        return order.order_type in {"LEAP_BUY", "LEAP_ROLL", "SHORT_CALL_SELL", "CSP_SELL", "CC_SELL", "SPREAD_ENTRY"}
+    def _has_open_iv_sensitive_position(self, symbol: str, d: pd.Timestamp) -> bool:
+        return any((leg.expiry - d).days > 0 for leg in self.book.legs.get(symbol, [])) or any(
+            sp.symbol == symbol and d < sp.exit_date for sp in self.book.active_spreads
+        )
+
+    def _record_intrinsic_mtm_fallback(self, d: pd.Timestamp, symbols: List[str]) -> None:
+        new_symbols = []
+        for sym in sorted(symbols):
+            key = (d, sym)
+            if key not in self._intrinsic_iv_fallback_events:
+                self._intrinsic_iv_fallback_events.add(key)
+                new_symbols.append(sym)
+        if not new_symbols:
+            return
+        self.book.realized.append({
+            "entry_date": d,
+            "exit_date": d,
+            "symbol": ",".join(new_symbols),
+            "kind": "iv_intrinsic_mtm_fallback",
+            "dollar_pnl": 0.0,
+            "detail": {"reason": "missing_iv_no_prior_intrinsic_mtm"},
+        })
+
+    def _order_requires_fresh_iv(self, order: PendingOrder, d: pd.Timestamp) -> bool:
+        if order.order_type == "STOCK_STOP_CLOSE":
+            return any(
+                leg.role == "covered_call" and (leg.expiry - d).days > 0
+                for leg in self.book.legs.get(order.symbol, [])
+            )
+        return order.order_type in {
+            "LEAP_BUY",
+            "LEAP_CLOSE",
+            "LEAP_ROLL",
+            "SHORT_CALL_SELL",
+            "CSP_SELL",
+            "CC_SELL",
+            "SPREAD_ENTRY",
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1443,10 +1547,9 @@ def decide_v2_wheel(
 
     # 1. Wheel Management on SLV and TLT (SLV prioritized, then TLT)
     for sym in ("SLV", "TLT"):
-        if sym not in current_prices or sym not in current_ivs:
+        if sym not in current_prices:
             continue
         S = current_prices[sym]
-        iv = current_ivs[sym]
         regime = current_regimes.get(sym, "neutral")
 
         shares_held = engine.book.shares.get(sym, 0)
@@ -1468,7 +1571,7 @@ def decide_v2_wheel(
                 continue
 
             # CC entry if holding shares and no CC open
-            if cc_leg is None and not has_pending_cc and not has_pending_stock_stop:
+            if sym in current_ivs and cc_leg is None and not has_pending_cc and not has_pending_stock_stop:
                 engine.pending_queue.append(
                     PendingOrder(
                         order_type="CC_SELL",
@@ -1480,7 +1583,8 @@ def decide_v2_wheel(
 
         else:
             # CSP entry when not in bear regime
-            if csp_leg is None and not has_pending_csp and regime != "bear":
+            if sym in current_ivs and csp_leg is None and not has_pending_csp and regime != "bear":
+                iv = current_ivs[sym]
                 t_years = 7.0 / 365.0
                 est_strike = round_to_increment(
                     strike_for_delta(S, t_years, engine.r, iv, 0.25, "put"),
@@ -1773,10 +1877,14 @@ def _build_report(variant: str, book: SleeveBook, engine: LeapEngine) -> LeapBac
         {"date": dt.exit_date, "pnl": dt.dollar_pnl} for dt in dollar_trades
     ])
     if not realized_df.empty:
+        realized_df["date"] = pd.to_datetime(realized_df["date"]).dt.normalize()
         realized_index = pd.DatetimeIndex(realized_df["date"])
-        realized_calendar = equity_series.index.union(realized_index).sort_values()
+        equity_index = pd.DatetimeIndex(equity_series.index).normalize() if len(equity_series) else pd.DatetimeIndex([])
+        start = min(realized_index.min(), equity_index.min()) if len(equity_index) else realized_index.min()
+        end = max(realized_index.max(), equity_index.max()) if len(equity_index) else realized_index.max()
+        realized_calendar = pd.date_range(start=start, end=end, freq="D")
         daily_realized = realized_df.groupby("date")["pnl"].sum().reindex(realized_calendar, fill_value=0.0)
-        rolling_7d = daily_realized.rolling(7).sum().dropna()
+        rolling_7d = daily_realized.rolling(7, min_periods=1).sum()
         rolling_stats = {
             "mean": float(rolling_7d.mean()),
             "median": float(rolling_7d.median()),

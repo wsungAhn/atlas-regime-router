@@ -396,11 +396,16 @@ bank 음수 진입을 막는다 (cash는 실제 지출 그대로 차감 — 항�
 IV가 비어 있으면 그 시점 **이전의 마지막 IV를 forward-fill**해 MTM·자산항등식·
 만기일 주변 continuity 검산에만 사용한다. 이는 과거값이라 미래정보 누출이 아니며,
 금지되는 것은 미래 IV(`iloc[-1]` 같은 시리즈 꼬리값)를 결측일에 끌어오는 것이다.
-반대로 신규 진입·스윕 판단, fresh 가격터치형 PT/SL trigger, V3 spread entry
-gate처럼 "그날 옵션가"가 필요한 판단은 **fresh IV가 있는 심볼에만** 수행한다.
-IV 결측은 심볼 단위로 격리한다: SPY IV 결측이 SLV/TLT의 만기 정산·MTM·fresh IV가
-있는 주문 실행을 밀어서는 안 된다. 결측 사실은 `iv_coverage_skip` 이벤트로 남기되
-그날 전체 루프를 중단하지 않는다.
+반대로 신규 진입·스윕 판단, fresh 가격터치형 PT/SL trigger, LEAP 옵션 청산 실행,
+V3 spread entry처럼 "그날 옵션가"가 필요한 판단/체결은 **fresh IV가 있는 심볼에만**
+수행한다. V2 주식 손절 자체는 주식 종가만 필요하지만, 함께 닫을 covered call이 있으면
+그 콜 청산에는 fresh IV가 필요하므로 주문 실행을 미룬다. IV 결측은 심볼 단위로 격리한다:
+SPY IV 결측이 SLV/TLT의 만기 정산·MTM·fresh IV가 있는 주문 실행을 밀어서는 안 된다.
+결측 사실은 `iv_coverage_skip` 이벤트로 남기되 그날 전체 루프를 중단하지 않는다.
+시리즈 앞쪽 결측처럼 과거 IV도 없는데 이미 열린 옵션 포지션이 있으면, 해당 심볼의
+비만기 옵션 MTM은 내재가치로만 평가하고 `iv_intrinsic_mtm_fallback` 이벤트를 남긴다.
+이는 entry/trigger/옵션 청산 체결에는 쓰지 않고, sleeve 전체 항등식과 다른 심볼의
+정상 이벤트 진행을 보존하기 위한 보수적 대체값이다.
 
 청산은 두 클래스로 나뉜다 (감사 2R #1):
 
@@ -438,7 +443,8 @@ for d in trading_days:                        # SleeveBook 1개, 종목은 내�
                   funding 스윕 판정 (V2 월말 / V3 금요일):
                   cost ≤ min(bank, available_cash) && 레짐 확인
     5. MTM      — equity = cash + Σ signed_leg_mtm + shares × close (§5.2.1)
-                  (IV 결측 심볼은 과거 IV forward-fill, 미래 IV 사용 금지)
+                  (IV 결측 심볼은 과거 IV forward-fill, no-prior면 intrinsic fallback,
+                  미래 IV 사용 금지)
                   equity_curve[d] 기록 + 자산 항등식 assert
 ```
 
@@ -494,6 +500,16 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
 ```
 
 `backtest.py`·`portfolio.py`·`vendor/` **수정 0줄**.
+
+V3 spread entry의 회계 검증은 vendor raw 자체가 보유한 구조 불변식만 사용한다.
+신호일 IV로 산출된 raw credit을 진입일 IV의 theoretical close debit로 재채점하면,
+정상적인 overnight IV 하락·wide market·최소 tick credit을 "부의 창조"로 오판한다.
+따라서 진입 전 검증은 `width = |short_strike - long_strike|`,
+`0 < credit_received <= width`, `max_loss == width - credit_received`, `max_loss > 0`,
+`collateral == max_loss * 100 * contracts`, `contracts >= 1`로 제한한다. 진입 직후
+spread MTM은 entry 시점에 받은 credit을 liability로 잡아 cash inflow와 상쇄한다.
+이 구조가 equity 연속성을 구성적으로 보장하고, width를 넘는 credit이나 max_loss 불일치는
+raw 자체 불변식으로 거부한다. theoretical repricing은 이후 MTM/청산 경로에서만 사용한다.
 
 **어댑터 명세 (감사 1R #5 반영)**: 이전 판의 "`dt.dollar_pnl`만 읽는다"는
 **틀렸다** — `_metrics_from_dollar_trades(dollar_trades, equity_series, n_years)`는
@@ -562,9 +578,10 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
    숏 매도 직후 equity 불변(현금 유입 = 부채 MTM), 스윕 직후
    `premium_bank ≤ cash` 불변식, 담보 예치·pending 적재·스윕 직후
    `available_cash ≥ 0` 불변식(§5.2.1 원칙 4)도 함께 assert. V3 spread entry도
-   실제 `decide_v3_spread_financing → _execute_spread_entry` 경로에서 같은 gate를
-   통과해야 하며, raw credit이 같은 날 theoretical close debit보다 큰 불가능한
-   입력은 assert로 거부한다(credit haircut 손실만 허용, 부의 창조 금지).
+   실제 `decide_v3_spread_financing → _execute_spread_entry` 경로에서 구조 불변식
+   gate를 통과해야 하며, raw credit이 width를 넘거나 `max_loss != width - credit`이면
+   mutate 전에 assert로 거부한다. 신호일 IV로 만든 정상 raw를 진입일 IV theoretical
+   debit로 재채점하지 않는다.
 2. **배정 사이클**: 가격을 행사가 아래로 보내는 합성 시나리오에서 CSP 배정 →
    shares 증가·cash 감소 → CC 매도 → 가격 회복 → 콜어웨이 → 현금 복귀. 각 단계의
    realized 이벤트 kind가 순서대로 기록됨.
@@ -575,9 +592,10 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
 5. **롤 실현**: DTE<90 롤에서 realized 이벤트가 발생하고 equity가 연속 (롤 자체는
    P&L 중립 이벤트 + 실현/미실현 재분류).
 6. **미래정보 누출**: 백테스트 종료일 이후 봉을 추가해도 그 이전 equity_curve 불변.
-   IV 결측일 MTM은 그날 이전의 마지막 IV만 forward-fill하며, 미래 IV를 쓰지 않는
-   것을 별도 회귀 테스트로 고정한다. 결측일 realized 이벤트는 rolling 7일 실현
-   P&L 창에서 누락되면 안 된다.
+   IV 결측일 MTM은 그날 이전의 마지막 IV만 forward-fill하며, prior가 없으면 intrinsic
+   fallback을 기록한다. 미래 IV를 쓰지 않는 것을 별도 회귀 테스트로 고정한다. 결측일
+   realized 이벤트는 캘린더 기준 rolling 7일 실현 P&L 창에서 누락되면 안 되며,
+   관측치가 부족해도 리포트 통계는 NaN을 내지 않는다.
 7. **기존 무영향**: 기존 테스트 스위트 전체 통과 (수정 0줄이므로 당연해야 하나
    임포트 부작용 확인 목적).
 

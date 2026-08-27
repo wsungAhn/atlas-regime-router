@@ -85,12 +85,13 @@ The daily execution follows the strictly ordered 5-step lifecycle to eliminate l
 - **Month-End LEAP Sweep**: On month-end trading day, buy 1 contract delta 0.70 DTE 365 SPY Call if `cost <= min(premium_bank, available_cash)` and total LEAP cost <= 50% sleeve equity.
 
 ### 4.3 V3: Strategy 7 Credit Spread Financing LEAP Ladder (§2.3)
-- **Spread Underlyings**: SPY, QQQ, IWM. Replays raw trade stream from Strategy 7 (`bull_put`, `bear_call`, `iron_condor`).
+- **Spread Underlyings**: SPY, QQQ, IWM. Replays the raw Strategy 7 side trades emitted by `_generate_raw_trades`; `iron_condor` signals are split upstream into `bull_put` and `bear_call` raw trades before engine replay.
 - **Sizing**: 5% available cash risk rule:
   ```python
   contracts = floor(available_cash * 0.05 / (max_loss * 100))
   ```
 - **Collateral & MTM**: `max_loss * 100 * contracts` locked. Daily spread liability marked to market.
+- **Entry Validation**: Spread replay validates raw structural invariants (`credit_received <= width`, `max_loss == width - credit_received`, positive `max_loss`, and collateral/contract consistency) before mutating the sleeve. It does not reprice signal-day vendor credit against entry-day theoretical debit.
 - **Friday Funding Sweep**: Every Friday, if SPY (priority 1) or QQQ (priority 2) is in `bull` regime, buy 1 contract delta 0.70 DTE 365 Call funded from `premium_bank`.
 
 ---
@@ -99,7 +100,7 @@ The daily execution follows the strictly ordered 5-step lifecycle to eliminate l
 
 - **`calculate_metrics_from_dollar_trades`**: Correctly receives the actual sleeve equity series (based on `$30,000` sleeve capital) rather than a fallback `$100,000` capital, preventing CAGR / Sharpe / Calmar distortions.
 - **7-Day Rolling Realized P&L Statistics**:
-  - `rolling_7d_pnl`: Daily sum of realized P&L over trailing 7 trading days.
+  - `rolling_7d_pnl`: Daily sum of realized P&L over trailing 7 calendar days.
   - Distribution metrics: Mean, Median, 10th percentile (P10), 90th percentile (P90), Min, Max, Positive Rate.
 - **Detailed Event Counters**: Tracks `assignment_count`, `called_away_count`, `stock_stop_count`, `short_skip_count`, `leap_roll_count`, and `leap_sweep_count`.
 
