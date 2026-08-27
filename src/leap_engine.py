@@ -1275,6 +1275,10 @@ class LeapEngine:
                             # ITM assignment: buy stock at strike
                             assignment_cost = leg.strike * 100.0 * q
                             self.book.cash -= assignment_cost
+                            # Assignment spends cash the premium_bank sub-ledger may have
+                            # claimed a share of; re-clamp so the bank never outlives the
+                            # pool it's a subset of (§5.2.1 invariant 1).
+                            self.book.premium_bank = min(self.book.premium_bank, self.book.cash)
                             self.book.shares[sym] = self.book.shares.get(sym, 0) + 100 * q
                             self.book.share_cost_basis[sym] = leg.strike - leg.entry_price
                             self.assignment_count += 1

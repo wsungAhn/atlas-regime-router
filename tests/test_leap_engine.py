@@ -238,6 +238,52 @@ class TestAssetIdentityP0Gate(unittest.TestCase):
                 decide_fn=lambda eng, d, px, iv, reg: None,
             )
 
+    def test_csp_assignment_reclamps_premium_bank_to_reduced_cash(self):
+        """
+        Real-data regression (2024-10-31 SLV run, R12 audit finding): a CSP
+        assignment spends cash on shares but does not itself touch
+        premium_bank. If premium_bank was already built up close to cash,
+        the assignment debit alone can push premium_bank above the new,
+        smaller cash balance and violate §5.2.1 invariant 1
+        (premium_bank <= cash). The engine must re-clamp on assignment.
+        """
+        d0 = pd.Timestamp("2023-01-02")
+        dates = pd.bdate_range(d0, periods=2)
+        df = pd.DataFrame(
+            {"open": [30.0] * 2, "high": [30.0] * 2, "low": [30.0] * 2, "close": [29.0] * 2, "volume": [1000] * 2},
+            index=dates,
+        )
+        iv_series = pd.Series(0.25, index=dates)
+        regimes = pd.Series("neutral", index=dates)
+
+        engine = LeapEngine(starting_cash=4_000.0)
+        # premium_bank already claims almost all of cash before the assignment.
+        engine.book.premium_bank = 3_500.0
+        engine.book.reserved_collateral = 3_000.0
+        engine.book.legs["SLV"] = [
+            OptionLeg(
+                option_type="put",
+                strike=30.0,  # ITM at close=29.0 -> assignment costs 30*100*1=3000
+                expiry=dates[0],
+                qty=-1,
+                entry_price=1.0,
+                entry_date=dates[0] - pd.Timedelta(days=7),
+                role="csp",
+                symbol="SLV",
+                collateral_reserved=3_000.0,
+            )
+        ]
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SLV": df},
+            iv_by_symbol={"SLV": iv_series},
+            regime_by_symbol={"SLV": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+
+        self.assertEqual(engine.assignment_count, 1)
+        self.assertLessEqual(book.premium_bank, book.cash + 1e-4)
+
     def test_regression_injection_short_call_entry_missing_cash_credit(self):
         """
         Verify event-level continuity catches a short-option entry that creates
