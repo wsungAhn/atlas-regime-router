@@ -1,6 +1,8 @@
 # design-wheel-pmcc-leap-strategy
 
-**상태**: 설계 (검토 대기, 감사 착수 전) — 이 문서는 **구현 승인 게이트**다. 이 문서 자체는
+<!-- lint:doc-meta round=1 -->
+
+**상태**: 설계 (감사 1라운드 반영 완료, 재감사 대기) — 이 문서는 **구현 승인 게이트**다. 이 문서 자체는
 `src/signals.py`·launchd 설정·라이브 경로를 건드릴 권한을 주지 않는다 (Trading Safety).
 
 - 작성: 2026-08-26 PDT
@@ -13,6 +15,8 @@
 ---
 
 ## 선행조사
+
+(레포 내 검색: ① / 외부 선행작업: ② / 결론: ③)
 
 ### ① 레포 내 조사
 
@@ -36,7 +40,7 @@
 |---|---|---|---|---|
 | tastytrade PMCC 가이드라인 | tastytrade research (projectfinance/optionalpha 요약 경유) | 콘텐츠(코드 아님) | 현행 | **관례 채택**: 롱 레그 delta ≥ 0.70~0.80·DTE 300일+, 숏 레그 delta ≤ 0.35·45DTE(주간도 통용), **"트레이드 비용 < 행사가 폭의 75%"** 건전성 규칙 |
 | Blue Collar Investor PMCC 방법론 | thebluecollarinvestor.com | 콘텐츠 | 현행 | **관례 채택**: LEAP delta 0.75~1.0, **만기 90일 전 LEAP 롤** |
-| Cboe BXM/PUT 인덱스 방법론 | cdn.cboe.com (BXM_Methodology.pdf, PutWrite Methodology) | 공개 방법론 문서 | 현행(공식) | **관례 채택**: 커버드콜/풋라이트의 표준 벤치마크 롤 규칙 — ATM 매도·만기 보유·만기일 재롤. 숏 레그 "만기까지 보유 + 현금정산" 모델의 근거 |
+| Cboe BXM/PUT 인덱스 방법론 | cdn.cboe.com (BXM_Methodology.pdf, PutWrite Methodology) | 공개 방법론 문서 | 현행(공식) | **관례 채택 (범위 한정)**: 벤치마크 롤 규칙(만기 보유·만기일 재롤)의 근거로만 쓴다. **SPX 인덱스(현금결제·유럽형) 방법론이라 ETF 옵션(실물결제·미국식)의 배정 현실 근거는 아니다** — V1의 현금정산은 Cboe 근거가 아니라 §5.3의 명시적 단순화 가정 (감사 1R #3 반영) |
 | AQR "PutWrite vs BuyWrite" | aqr.com 백서 | 학술 백서 | 2017~ | 참고 — 풋라이트와 커버드콜의 등가성(풋콜 패리티). wheel의 CSP 국면과 CC 국면을 같은 엔진 코드로 다뤄도 됨을 뒷받침 |
 | optopsy | github.com/goldspanlabs/optopsy (구 michaelchu) | **GPL-3.0** | 2024~25 활동 | **불채택** — GPL-3(이 레포에 코드 유입 불가), 그리고 실제 옵션체인 이력 데이터를 전제로 한다. 이 레포는 BS 근사 노선(§backtest.py 독스트링에 명시된 기존 결정)이라 데이터 전제부터 안 맞음. 델타타깃 행사가 선택·수명주기 이벤트 개념만 참고 |
 | QuantConnect LEAN wheel 구현 | quantconnect.com 포럼/LEAN | Apache-2.0 | 현행 | **불채택** — 프레임워크 통째 도입은 기존 검증자산(vendor 엔진·사이저·리포터) 폐기와 같다 (`design-multi-asset-combined-backtest.md`의 vectorbt 불채택과 동일 논리). 배정(assignment) 이벤트 처리 순서(만기 → 배정 → 주식 전환 → CC 국면 전환)만 참고 |
@@ -48,7 +52,8 @@
 - **거래 수명주기 엔진: 신규 병렬 엔진** — `credit_spread_simulator.py`를 확장하지
   않는다 (§5.1에 이유). 신규 파일 1개 (`src/leap_engine.py`).
 - **전략 관례: 발명하지 않고 채택** — LEAP delta 0.70~0.80 / DTE~365 / 90일 전 롤
-  (tastytrade·BCI), 숏 레그 만기보유+현금정산 (Cboe BXM/PUT 방법론).
+  (tastytrade·BCI), 숏 레그 만기보유·만기일 재롤 (Cboe BXM/PUT — 롤 캘린더 근거로만).
+  V1의 ITM 현금정산은 채택된 관례가 아니라 **이 설계의 단순화 가정**이다 (§5.3).
 - 외부 라이브러리 유입 0 (optopsy는 GPL, LEAN은 프레임워크 통째라 불채택).
 
 ---
@@ -114,7 +119,7 @@ wheel + PMCC(LEAP 파이낸싱) 계열은 구조가 다르다:
 | LEAP 진입 | 레짐이 bull로 **전환된 다음 거래일**, delta 0.80 콜 (`strike_for_delta`), DTE 365 |
 | LEAP 사이징 | 계약당 비용 ≤ 슬리브 자본의 40% → 계약수 = `floor(0.4 * sleeve_equity / (leap_cost*100))`, 최소 1계약이 안 되면 그 종목 스킵(로그) |
 | 숏 콜 진입 | LEAP 보유 중 + 숏 레그 없음 → delta 0.20 콜 매도, DTE 7, 수량 = LEAP 계약수. **단 숏 행사가 > LEAP 행사가 + 순비용**(tastytrade 75% 규칙의 취지: 콜어웨이 시나리오에서도 손실이 안 나는 행사가만) — 조건 불충족 시 그 주는 매도 스킵(로그) |
-| 숏 콜 청산 | ① 프리미엄 50% 익절 ② 프리미엄 2.0x 손절(기존 전략과 동일 상수) ③ 만기 도달 — ITM이면 **현금정산**(내재가치 지불; LEAP는 그대로 보유. 유럽형 근사 — §5.3) |
+| 숏 콜 청산 | ① 프리미엄 50% 익절 ② 프리미엄 2.0x 손절(기존 전략과 동일 상수) ③ 만기 도달 — ITM이면 **현금정산**(내재가치 지불; LEAP는 그대로 보유). **주의: 이건 ETF 옵션 현실(실물배정·숏스탁 발생·LEAP 언와인드)이 아니라 명시적 단순화 가정이다** — §5.3의 "V1 정산 근사" 참조. V1 결과는 이 근사 하의 낙관 편향 상한으로 읽는다 |
 | 숏 콜 재진입 | 청산 다음 거래일 (연속 롤) |
 | LEAP 롤 | DTE < 90 → 청산 후 같은 규칙으로 재진입 (BCI 90일 규칙). 이때 실현 P&L 발생 |
 | LEAP 청산 | ① 레짐이 bear로 전환 ② LEAP 가치가 진입가의 -50% (하드 스톱) — 청산 시 숏 레그도 동시 청산 (네이키드 콜 금지) |
@@ -139,7 +144,7 @@ SPY LEAP로 한다. (이 비대칭이 6종 ETF 유니버스에서 wheel이 성�
 | CSP 만기 | OTM → 프리미엄 전액 실현, 다음 거래일 재진입. ITM → **배정**: `strike*100*qty` 지불, 주식 보유 전환 |
 | CC 국면 | 주식 보유 중 → delta 0.25 콜 매도, DTE 7 (단 행사가 ≥ 배정단가 — 손실 콜어웨이 방지; ATM보다 낮으면 배정단가로 스냅). ITM 만기 → 콜어웨이(주식 매도 + 프리미엄 실현) → CSP 국면 복귀 |
 | CC 국면 제한 | 배정 후 주가가 배정단가 -20% 아래로 가면 **주식 손절** (wheel의 고전적 파산 경로 — "물리면 영원히 CC" — 차단). 로그에 명시 |
-| **LEAP 스윕** | 월말(매월 마지막 거래일)마다: `premium_bank`(그 달 실현 프리미엄 누계) ≥ 그 시점 SPY delta 0.70/DTE 365 콜 1계약 비용이면 매수, bank 차감. 미달이면 이월 |
+| **LEAP 스윕** | 월말(매월 마지막 거래일) 종가로 판단, **다음 거래일 체결**(§5.3): `premium_bank`(실현 프리미엄 누계, 이월 포함 — §5.2.1) ≥ 그 시점 SPY delta 0.70/DTE 365 콜 1계약 비용이면 매수, cash·bank 동시 차감. 미달이면 이월 |
 | LEAP 관리 | 매수한 LEAP는 **보유 전용** (숏 매도 없음 — V1과의 통제변인 분리). DTE < 90 롤, -50% 스톱, bear 전환 시 청산은 V1과 동일 |
 | 리스크 상한 | LEAP 누적 비용이 슬리브 자본의 50% 도달 시 스윕 중단(현금 이월). wheel 자체는 현금담보라 레버리지 0 |
 
@@ -147,17 +152,44 @@ SPY LEAP로 한다. (이 비대칭이 6종 ETF 유니버스에서 wheel이 성�
 V1과 달리 숏 레그와 롱 레그가 **다른 종목**이라 상관 리스크가 낮고, 배정 메커니즘을
 실제로 요구하는 유일한 변형이다 (엔진의 배정 경로 검증도 겸한다).
 
-### 2.3 V3 — Bull-Put 스프레드 파이낸싱 LEAP 래더 (기존 챔피언과의 브릿지)
+**기대 빈도의 정직한 추정 (감사 1R #7 반영)**: SPY delta 0.70/DTE 365 콜은 현
+BS 근사로 계약당 ~$7k다. SLV(~$3k 담보)·TLT(~$9k 담보) 주간 delta 0.25 프리미엄으로
+$30k 슬리브가 이걸 모으려면 **수개월~1년 이상 이월이 정상**이고, 3년 백테스트에서
+스윕이 0~수 회에 그칠 수 있다. 즉 V2는 "LEAP 스윕 전략"이라기보다 **"대부분 기간
+현금이 이월되는 wheel + 드문 스윕"** 으로 읽어야 하며, 스윕 0회면 순수 wheel
+베이스라인으로서의 가치만 남는다 (그것대로 V1/V3 대비 통제군으로 유효). 리포트에
+스윕 횟수·bank 잔고 추이를 필수 항목으로 넣어 이 추정을 실측으로 판정한다.
+임계값을 낮추려고 저가 LEAP(저델타·단기)로 바꾸지 않는다 — §4의 근사 오차
+논리(딥 ITM이라 IV 오차 영향이 작다)가 깨진다.
 
-숏 레그를 네이키드 CSP가 아니라 **기존에 검증된 bull_put 크레딧 스프레드**로 대체한
-변형. 숏 사이클은 기존 vendor 엔진을 사이클 단위로 그대로 호출하고, 신규 엔진은
-LEAP 원장만 관리한다 — 3종 중 **엔진 신규 코드가 가장 적다** (Working Skeleton
-First: 구현 순서 V3 → V1 → V2 권고, §9).
+### 2.3 V3 — 전략7 스프레드 파이낸싱 LEAP 래더 (기존 챔피언과의 브릿지)
+
+숏 레그를 네이키드 CSP가 아니라 **기존에 검증된 전략7 크레딧 스프레드 사이클**로
+대체한 변형. 거래 라이프사이클(진입가·PT/SL 경로·청산)은 vendor
+`run_portfolio_simulation`이 계산한 **raw 거래(계약당, 사이징 전)** 를 그대로 쓰고,
+신규 엔진은 사이징과 LEAP 원장만 관리한다.
+
+**사이징 명세 (감사 1R #4 반영 — 기존 사이저 재사용 아님)**:
+`scale_trades_to_dollars`는 쓰지 않는다 — 그 함수는 자기 완결 잔고로 복리하는데
+V3에서는 LEAP 스윕이 같은 현금을 인출하므로 그 복리 가정이 깨진다 (돈 이중 사용).
+대신 `leap_engine`이 vendor raw 거래 스트림을 진입일 순으로 재생하며 자체 사이징한다:
+
+1. `run_portfolio_simulation(전략7 신호, 기존 파라미터)` → raw trade 리스트 (계약당).
+2. 진입일 순 재생: `contracts = floor(book.cash × 0.05 / (max_loss × 100))`,
+   0계약이면 스킵(로그). 진입 시 담보 `max_loss × 100 × q`를 cash에서 예치
+   (§5.2.1 항등식에는 예치도 cash의 일부 — 별도 계정 없이 "가용 cash" 계산에서만 차감).
+3. 청산일에 `dollar_pnl = realized_pnl × 100 × q` 반영, 담보 해제, 양수 실현분 bank 적립.
+
+킬스위치·동적 risk_pct 등 `scale_trades_to_dollars`의 나머지 기능은 **의도적으로
+안 가져온다** — 슬리브는 상대비교용 백테스트고, 그 기능들이 필요해지면 그때가
+사이저 통합을 다시 설계할 시점이다 (지금 하면 두 사이저의 이원화 관리).
+이 재생 루프는 ~15줄이고, "V3이 신규 코드 최소"라는 이전 판정은 이만큼 **하향
+수정**된다 — 그래도 배정·숏레그 자체 관리가 없어 3종 중 최소는 유지.
 
 | 항목 | 규칙 |
 |---|---|
-| 숏 사이클 | SPY·QQQ·IWM에 전략7(`7_atlas_mvp`) 신호 그대로 + 기존 `run_portfolio_simulation` 파라미터 그대로 (DTE 7, delta 0.20, width 1.5%, PT 50%, SL 2.0x). 슬리브 자본에서 리스크 5%/건 사이징 |
-| **funding** | 스프레드 실현 프리미엄 누계가 `premium_bank`에 적립 → 주말(매주 금요일 종가)마다 bank ≥ SPY 또는 QQQ delta 0.70/DTE 365 콜 1계약 비용 && 해당 종목 bull 레짐이면 매수 (레짐 게이트 — 하락장에서 LEAP를 사 모으는 자살 방지) |
+| 숏 사이클 | SPY·QQQ·IWM에 전략7(`7_atlas_mvp`) 신호 그대로 + 기존 `run_portfolio_simulation` 파라미터 그대로 (DTE 7, delta 0.20, width 1.5%, PT 50%, SL 2.0x). **전략7이 내는 3종 구조(bull_put·bear_call·iron_condor) 전부 그대로 거래한다** — bull_put만 골라내지 않는다 (감사 1R #8 반영: 변형 이름의 "Bull-Put 파이낸싱"은 대표 구조 지칭이었으나 부정확해 아래처럼 정정) |
+| **funding** | **세 구조 모두의** 실현 프리미엄 중 양수 실현분이 `premium_bank`에 적립 (§5.2.1 — bank는 cash의 하위 원장) → 매주 금요일 종가 판단, **다음 거래일 체결**(§5.3): bank ≥ SPY 또는 QQQ delta 0.70/DTE 365 콜 1계약 비용 && 해당 종목 bull 레짐이면 매수 (레짐 게이트 — 하락장에서 LEAP를 사 모으는 자살 방지) |
 | LEAP 관리 | V2와 동일 (보유 전용, DTE<90 롤, -50% 스톱, bear 청산) |
 | 리스크 상한 | 스프레드 자체가 정의된 리스크(width−credit) — 배정 모델링 불필요. LEAP 누적 50% 상한 동일 |
 
@@ -172,7 +204,7 @@ V2와의 차이는 숏 레그의 리스크 정의 방식(무제한 배정 vs 정
 |---|---|---|---|---|
 | V1 | 커버드 콜 (LEAP 담보) | 숏과 같은 종목 | 현금정산 근사 | 주간 프리미엄 > LEAP 세타 |
 | V2 | 네이키드 CSP/CC (현금담보) | 다른 종목 (SPY) | **실제 모델링** | LEAP 재투자 > 현금 복리 |
-| V3 | bull_put 스프레드 (기존 검증) | SPY/QQQ | 불필요 | 검증된 수확기 + LEAP 되먹임 |
+| V3 | 전략7 스프레드 3종 (기존 검증) | SPY/QQQ | 불필요 | 검증된 수확기 + LEAP 되먹임 |
 
 ---
 
@@ -249,32 +281,91 @@ class Book:                 # 종목당 1개
 `dollar_pnl`이 **이미 달러**라는 게 기존 raw trade dict와의 결정적 차이다 —
 사이징이 엔진 안(북의 현금)에서 일어나므로 사후 스케일링이 없다 (§5.4).
 
+### 5.2.1 회계 모델 (감사 1R #1 반영 — 현금 흐름 시점의 완전 명세)
+
+원칙 3개:
+
+1. **`cash`가 유일한 돈이다.** `premium_bank`는 **cash의 하위 원장(sub-ledger)**,
+   즉 "cash 중 스윕 판정에 쓸 수 있는 몫"을 추적하는 회계 태그일 뿐 별도의
+   지출 가능 현금이 아니다. 스윕으로 LEAP를 사면 `cash`와 `premium_bank`를
+   **동시에** 차감한다 — 돈이 두 번 쓰일 경로가 없다. `premium_bank ≤ cash`가
+   불변식이고, 자산 항등식에는 `premium_bank`가 **등장하지 않는다**.
+2. **옵션 현금은 진입 시점에 움직인다.** 숏 매도 → 진입일에
+   `cash += credit × 100 × qty` (haircut 적용 후). 롱 매수 → 진입일에
+   `cash -= price × 100 × qty`. 만기/청산은 청산 현금 흐름
+   (`cash -= close_debit × 100 × qty` 등)만 일으킨다 — "만기 때 프리미엄 실현"은
+   현금 이벤트가 아니라 **realized 이벤트 로그의 분류**다.
+3. **레그 MTM은 부호 있는 자산가치다.** 롱 레그 MTM = `+price × 100 × qty`,
+   숏 레그 MTM = `−price × 100 × |qty|` (부채). 자산 항등식:
+
+   ```
+   equity(d) = cash + Σ signed_leg_mtm(d) + shares × close(d)
+   ```
+
+   숏 매도 직후를 검산하면: cash가 credit만큼 늘고 숏 레그 MTM이 −credit이라
+   equity 불변 (거래는 부를 만들지 않는다) — 이 상쇄가 항등식이 닫혀 있다는
+   증명의 핵심이고, 테스트 1(§8)이 매 이벤트 직후 이걸 assert한다.
+
+이벤트별 원장 분개 (전부 이 표가 정본, 루프 의사코드는 이 표를 따른다):
+
+| 이벤트 | cash | premium_bank | legs / shares |
+|---|---|---|---|
+| 숏 옵션 매도 (진입) | `+credit×100×q` | 변동 없음 (아직 미실현) | 숏 레그 추가 |
+| 숏 옵션 청산/만기 OTM | `−close_debit×100×q` (OTM 만기면 0) | `+net_realized` (양수일 때만; V2/V3) | 숏 레그 제거 |
+| 숏 옵션 만기 ITM (V1 현금정산) | `−내재가치×100×q` | net 실현이 양수면 `+` | 숏 레그 제거, LEAP 불변 |
+| CSP 배정 (V2) | `−strike×100×q` | 변동 없음 | 풋 제거, `shares += 100q` |
+| 콜어웨이 (V2) | `+strike×100×q` | 주식+프리미엄 net 실현 양수분 `+` | 콜 제거, `shares −= 100q` |
+| LEAP 매수 (신규/스윕) | `−cost×100×q` | 스윕이면 **동시 차감** `−cost×100×q` | LEAP 추가 |
+| LEAP 청산/롤 청산분 | `+price×100×q` | 변동 없음 | LEAP 제거 |
+| 주식 손절 (V2) | `+px×100q` | 변동 없음 | shares 0 |
+
+`premium_bank`에는 **실현 net이 양수인 사이클의 실현분만** 적립한다 (손실 사이클은
+bank를 깎지 않는다 — bank는 "스윕 자격 판정용 누계"이지 손익계산서가 아니다.
+손실은 cash에 이미 반영돼 있고, `premium_bank ≤ cash` 클램프가 과대적립을 막는다).
+
 ### 5.3 이벤트 루프
 
 일자(daily bar)가 바깥 루프. 하루 안의 처리 순서를 고정한다 (순서가 결과를 바꾸므로
 명세가 필요한 지점):
 
+**타이밍 원칙 (감사 1R #2 반영)**: 그날 종가로 **판단**한 것은 전부 **다음
+거래일에 체결**한다 — vendor 엔진이 signal_date 다음 거래일에 진입하는 관례
+(`credit_spread_simulator.py:397`)와 동일. 종가를 보고 그 종가에 진입하는 경로는
+루프 구조상 존재하지 않는다: 진입·스윕 판단은 `pending` 큐에 넣고 다음 거래일
+스텝 1에서 그날 종가로 체결한다.
+
 ```
 for d in trading_days:                        # 종목별 Book 각각
-    1. EXPIRY   — 오늘 만기 레그 정산:
-                  숏콜 OTM → 프리미엄 전액 실현 / ITM →
-                    (V1, LEAP 담보) 내재가치 현금정산, LEAP 유지
-                    (V2, 주식 담보) 콜어웨이: 주식 strike 매도 + 프리미엄 실현
-                  CSP OTM → 프리미엄 실현 / ITM → 배정: cash -= strike*100*qty,
+    1. EXECUTE  — 전일 종가 기준으로 pending에 쌓인 주문을 오늘 종가로 체결:
+                  LEAP 신규/롤 재진입, 숏 레그 매도, CSP/CC 진입, funding 스윕 매수
+                  (체결가는 오늘 종가 기준 BS — 판단일 정보만 쓰고 체결일 가격을 씀)
+    2. EXPIRY   — 오늘 만기 레그 정산 (만기는 판단이 아니라 계약 조건이므로 당일):
+                  숏콜 OTM → 만기 소멸 (close_debit 0) / ITM →
+                    (V1, LEAP 담보) 내재가치 현금정산, LEAP 유지 (§5.3 "V1 정산 근사")
+                    (V2, 주식 담보) 콜어웨이: 주식 strike 매도 + 콜 소멸
+                  CSP OTM → 소멸 / ITM → 배정: cash -= strike*100*qty,
                     shares += 100*qty, cost_basis = strike - premium
-    2. TRIGGER  — 만기 전 청산 트리거 (그날 종가 MTM 기준):
+    3. TRIGGER  — 만기 전 청산 트리거 (그날 종가 MTM 기준, **당일 체결**):
                   숏 레그 50% PT / 2.0x SL, LEAP -50% 스톱,
                   레짐 bear 전환 → LEAP+숏 동시 청산, V2 주식 -20% 손절
-    3. ROLL     — LEAP DTE < 90 → 청산(실현) 후 재진입
-    4. ENTRY    — 변형별 진입 규칙 (§2): LEAP 신규, 숏 레그 재매도, CSP/CC
-    5. FUNDING  — 스윕 판정 (V2 월말 / V3 금요일): bank → LEAP 매수
-    6. MTM      — equity = cash + Σ(leg MTM × 100 × qty) + shares × close
+                  (PT/SL 당일 체결은 vendor `simulate_trade`의 기존 관례와 동일 —
+                  트리거 판정과 체결이 같은 종가라 미래정보가 아니다)
+    4. DECIDE   — 오늘 종가 기준 진입/롤/스윕 **판단**만 → pending 큐 적재:
+                  LEAP DTE<90 롤, 변형별 진입 규칙 (§2),
+                  funding 스윕 판정 (V2 월말 / V3 금요일): bank ≥ 비용 && 레짐 확인
+    5. MTM      — equity = cash + Σ signed_leg_mtm + shares × close (§5.2.1)
                   equity_curve[d] 기록 + 자산 항등식 assert
 ```
 
 - **배정은 만기 시점만** (유럽형 근사). 미국식 조기배정(배당락 전 딥 ITM 콜)은
-  모델링하지 않는다 — BS 자체가 유럽형이고, 조기배정은 보유자에게 대체로 유리
-  (시간가치 포기를 받는 쪽)라 이 근사는 보수적이거나 중립이다. 리포트에 명시.
+  모델링하지 않는다. **"V1 정산 근사" (감사 1R #3 반영)**: V1의 ITM 숏콜
+  내재가치 현금정산은 유럽형 현금결제를 가정한 **명시적 단순화**다. 실제 SPY/QQQ
+  옵션은 미국식·실물결제라 ITM 만기는 숏스탁을 만들고, 청산하려면 LEAP 일부
+  언와인드 또는 주식 매수가 필요하며, 배당락 전 조기배정 리스크도 있다 — 이
+  마찰비용(스프레드·언와인드 슬리피지·조기배정의 잔여 시간가치 상실)을 전부
+  생략하므로 **V1 결과는 낙관 편향 상한(upper bound)으로 읽어야 한다**. 이건
+  Cboe BXM이 뒷받침하는 관례가 아니다 (BXM은 SPX 현금결제 인덱스 방법론).
+  리포트 헤더에 이 가정을 명시한다.
 - 같은 날 PT·SL 동시 도달 시 **SL 우선** (`design-multi-asset-combined-backtest.md §4.2`와 동일한 보수 규칙).
 - 갭·슬리피지·수수료 미반영 — 기존 크레딧 스프레드 백테스트와 동일 수준의 근사
   (`credit_haircut_pct` 5%는 숏 레그 진입 크레딧에 동일 적용해 비교 가능성 유지).
@@ -310,9 +401,25 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
     #    배정/콜어웨이 횟수, 숏 매도 스킵 횟수(V1의 75% 규칙), LEAP 롤 이력
 ```
 
-`backtest.py`·`portfolio.py`·`vendor/` **수정 0줄**. `_metrics_from_dollar_trades`가
-`dt.dollar_pnl`만 읽으므로 어댑터로 충분하다 (읽는 속성이 늘어 있으면 구현 시
-확인 — 현재 코드 기준으론 `dollar_pnl` 단일 속성).
+`backtest.py`·`portfolio.py`·`vendor/` **수정 0줄**.
+
+**어댑터 명세 (감사 1R #5 반영)**: 이전 판의 "`dt.dollar_pnl`만 읽는다"는
+**틀렸다** — `_metrics_from_dollar_trades(dollar_trades, equity_series, n_years)`는
+`equity_series`와 모듈 상수 `STARTING_EQUITY`($100k)도 쓴다
+(`backtest.py:248,252,256-259`). 코드를 실제로 읽고 확정한 재사용 조건:
+
+1. `equity_series` = **슬리브 자체의 `equity_curve`** ($30k 시작)를 반드시 넘긴다.
+   비우면 안 된다 — 빈 시리즈 폴백(`np.cumsum(pnls) + STARTING_EQUITY`,
+   `backtest.py:252`)이 $100k 기준 곡선을 만들어 max_drawdown·final_equity가 오염된다.
+2. `n_years` = 백테스트 실제 연수.
+3. `STARTING_EQUITY`($100k)가 남는 자리는 sharpe(`pnls/SE`의 mean/std **비율** —
+   SE 소거)와 calmar(`cagr_like/mdd_pct` = `total_pnl/(n_years×max_dd)` — SE 소거)
+   뿐이라 **수치가 스케일 불변으로 옳다**. max_drawdown·final_equity는 1의
+   equity_series에서 오고, total_pnl·win_rate·profit_factor는 SE 무관.
+
+즉 조건 1을 지키는 한 함수 수정 없이 재사용 가능하고, 이 소거 논리는
+`tests/test_leap_engine.py`에 주석으로 남긴다 (STARTING_EQUITY가 향후 sharpe
+공식 변경 등으로 소거가 깨지면 이 재사용도 깨진다 — 그때는 자체 metrics 함수로 대체).
 
 ---
 
@@ -335,8 +442,14 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
 대회 채점은 **창 안 실현 P&L**이다. 이 계열에서 창 안에 실현되는 것은 숏 사이클
 (주간)뿐이고 LEAP 손익은 대부분 미실현이다. 즉:
 
-- **V1/V3이 대회 적합** (주간 실현 사이클 존재). V2는 배정 주기가 끼면 실현이
-  더 불규칙 — 대회보다는 운용 연구 성격.
+- **V1/V3의 대회 적합은 결론이 아니라 검증할 가설이다** (감사 1R #6 반영):
+  주간 실현 사이클이 있긴 하지만, 슬리브의 30~80%가 LEAP 비용으로 묶이면 7일
+  창에서 실현 P&L을 만드는 가용 자본이 기존 챔피언(전략7 combined, $100k 전액
+  가동)보다 **작다**. 따라서 대회 적합 판정은 "임의 7일 rolling 창의 실현 P&L
+  분포가 기존 챔피언 분포를 이길 때만" 성립하는 조건부 명제고, 그 비교가
+  백테스트 리포트의 필수 항목이다. 이기지 못하면 이 계열 전체가 대회 제출이
+  아니라 운용 연구다. V2는 배정 주기까지 끼어 실현이 더 불규칙 — 처음부터
+  운용 연구 성격.
 - 창의성 점수 서사는 V3이 최강: "검증된 프리미엄 수확기가 자기 수확물로 장기
   볼록성을 사 모은다"는 한 문장이 된다.
 - 백테스트 리포트의 **7일 창 실현 P&L 분포**(루브릭 항목)가 대회 투입 여부의
@@ -350,8 +463,10 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
 `tests/test_leap_engine.py` — 기존 pytest, 프레임워크 추가 없음. 전부 합성 가격
 데이터 (API 불필요).
 
-1. **현금 보존식 (게이트)**: 매 스텝 `equity == cash + Σleg_mtm + shares*px`가
-   전 구간 성립. 진입·청산·배정·롤·스윕 각 이벤트 직후 검증.
+1. **현금 보존식 (게이트)**: 매 스텝 `equity == cash + Σsigned_leg_mtm + shares*px`
+   (§5.2.1)가 전 구간 성립. 진입·청산·배정·롤·스윕 각 이벤트 직후 검증. 특히
+   숏 매도 직후 equity 불변(현금 유입 = 부채 MTM), 스윕 직후
+   `premium_bank ≤ cash` 불변식도 함께 assert.
 2. **배정 사이클**: 가격을 행사가 아래로 보내는 합성 시나리오에서 CSP 배정 →
    shares 증가·cash 감소 → CC 매도 → 가격 회복 → 콜어웨이 → 현금 복귀. 각 단계의
    realized 이벤트 kind가 순서대로 기록됨.
@@ -389,6 +504,26 @@ Tier 2+ (신규 모듈·설계문서 존재) → **Codex 핸드오프 대상** (
 
 **건드리지 않는 것**: `src/signals.py`, `src/mcp_runner.py`, `src/vendor/*`,
 `src/backtest.py`, `src/portfolio.py`, launchd 설정, 라이브 체크아웃 전체.
+
+---
+
+## 감사 라운드 이력
+
+### 1라운드 (2026-08-26, codex exec gpt-5.5, 판정: NOT CLEAN — P1 6건, P2 3건)
+
+각 지적은 코드 원문 대조로 재검증한 뒤 판정했다 (감사를 그대로 믿지 않음).
+
+| # | 지적 요지 | 판정 | 근거·반영 |
+|---|---|---|---|
+| 1 (P1) | cash/premium_bank 분리 불명확, 진입 현금흐름 미명세 — 돈 이중 사용 가능 | **수용** | 사실 — 이전 판은 "만기 때 프리미엄 실현"만 말해 진입 현금 유입이 없는 회계였다. §5.2.1 신설: cash 단일 원장, bank는 하위 원장(항등식 비등장, `bank ≤ cash` 불변식, 스윕 시 동시 차감), 이벤트별 분개 표, 숏 매도 직후 equity 불변 검산. 테스트 1에 반영 |
+| 2 (P1) | 종가 판단 → 같은 날 진입은 룩어헤드; vendor는 next-day entry (`credit_spread_simulator.py:397`) | **수용** | 코드 확인 — vendor는 `index > signal_date`로 다음 거래일 진입. §5.3 루프를 EXECUTE(pending 체결)/DECIDE(판단→큐) 분리로 재구성: 판단은 종가, 체결은 다음 거래일 종가. PT/SL은 vendor 관례대로 당일 체결(판정·체결이 같은 종가라 룩어헤드 아님) |
+| 3 (P1) | V1 ITM 현금정산의 Cboe BXM 인용은 SPX 현금결제 방법론 — ETF 실물배정 근거 아님 | **수용** | 사실 — BXM/PUT은 SPX 인덱스(유럽형·현금결제). 실물배정 모델링 대신 **명시적 단순화 가정** 노선 채택: §5.3 "V1 정산 근사"에 낙관 편향 상한임을 명기, 선행조사 ②·③의 Cboe 인용 범위를 롤 캘린더로 축소, V1 표에도 경고 |
+| 4 (P1) | V3 "vendor 엔진 그대로 호출"은 함수 시그니처·사이징 소유권과 충돌 | **수용** | 코드 확인 — `run_portfolio_simulation`은 신호 리스트 전체를 받아 내부 상태 관리, 사이징은 `scale_trades_to_dollars` 소관인데 그 사이저는 안 쓰기로 했으니 공백이었다. §2.3에 명세 확정: vendor는 raw 거래 스트림 생성까지만 재사용, 사이징은 leap_engine 자체 재생 루프(cash 5%/건, 담보 예치·해제) — `scale_trades_to_dollars` 재사용은 LEAP 스윕이 같은 현금을 빼가는 순간 그 함수의 복리 가정이 깨져 기각. "V3 신규 코드 최소" 주장 하향 |
+| 5 (P1) | `_metrics_from_dollar_trades`가 dollar_pnl만 읽는다는 주장 오류 — equity_series·STARTING_EQUITY·n_years 사용 | **부분 수용** | 지적의 사실관계는 맞다 (`backtest.py:248-264` 확인, 이전 판 주장 철회). 단 "$30k를 넣으면 $100k 지표와 섞인다"는 절반만 맞다: sharpe·calmar에서 STARTING_EQUITY는 비율로 **소거**되고, max_dd·final_equity는 호출자가 주는 equity_series에서 나온다. §5.5에 정확한 재사용 조건 명세 (슬리브 equity_curve 필수 전달 — 빈 시리즈 폴백이 유일한 오염 경로) |
+| 6 (P1) | V1/V3 "대회 적합" 단정 과함 — LEAP가 자본을 묶어 7일 실현 P&L 생산력이 기존보다 줄 수 있음 | **수용** | `one-page-submission.md:25,42` 확인 (realized P&L 채점, weekly DTE 전환 이유). §7을 조건부 가설로 강등: "7일 rolling 실현 P&L 분포가 기존 챔피언을 이길 때만 적합" |
+| 7 (P2) | V2 스윕이 규모상 거의 발동 안 할 수 있음 (SPY 0.70 LEAP ~$7k vs SLV/TLT 월 프리미엄) | **수용** | 산수 타당. §2.2에 기대 빈도 추정 명기: 스윕 0~수 회가 정상, 미발동 시 순수 wheel 통제군으로 재해석. 임계 완화(저델타 LEAP)는 §4 근사 논리 훼손이라 기각 |
+| 8 (P2) | 전략7은 bear_call·iron_condor도 냄 — V3 "Bull-Put"은 부정확, 그 프리미엄의 bank 귀속 미명세 | **수용** | `strategies.py:158-164` 확인. V3 명칭을 "전략7 스프레드 파이낸싱"으로 정정, 3종 구조 전부 거래·전부 bank 적립 명시 |
+| 9 (P2) | doc-meta 부재 등 lint WARN 13건 | **수용** | doc-meta round=1 추가, 이 섹션 제목에 라운드 토큰, 선행조사 라벨 3종 추가. C3 "§ 반복 언급" WARN은 상호참조가 문서 가독성에 필요해 잔류 허용 (ERROR 아님) |
 
 ---
 
