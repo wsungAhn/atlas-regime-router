@@ -1,8 +1,8 @@
 # design-wheel-pmcc-leap-strategy
 
-<!-- lint:doc-meta round=1 -->
+<!-- lint:doc-meta round=2 -->
 
-**상태**: 설계 (감사 1라운드 반영 완료, 재감사 대기) — 이 문서는 **구현 승인 게이트**다. 이 문서 자체는
+**상태**: 설계 (감사 2라운드 반영 완료, 재감사 대기) — 이 문서는 **구현 승인 게이트**다. 이 문서 자체는
 `src/signals.py`·launchd 설정·라이브 경로를 건드릴 권한을 주지 않는다 (Trading Safety).
 
 - 작성: 2026-08-26 PDT
@@ -140,11 +140,11 @@ SPY LEAP로 한다. (이 비대칭이 6종 ETF 유니버스에서 wheel이 성�
 
 | 항목 | 규칙 |
 |---|---|
-| CSP 진입 | SLV·TLT 각각, 레짐 bear가 **아닐 때**(bull/neutral), delta 0.25 풋 매도, DTE 7, 현금담보 100% 예치. 수량 = 담보 가능 최대 (SLV 우선, 남는 현금으로 TLT) |
+| CSP 진입 | SLV·TLT 각각, 레짐 bear가 **아닐 때**(bull/neutral), delta 0.25 풋 매도, DTE 7, 현금담보 100% 예치(`reserved_collateral`로 예약 — §5.2.1 원칙 4). 수량 = `available_cash`로 담보 가능한 최대 (SLV 우선, 남는 `available_cash`로 TLT) |
 | CSP 만기 | OTM → 프리미엄 전액 실현, 다음 거래일 재진입. ITM → **배정**: `strike*100*qty` 지불, 주식 보유 전환 |
 | CC 국면 | 주식 보유 중 → delta 0.25 콜 매도, DTE 7 (단 행사가 ≥ 배정단가 — 손실 콜어웨이 방지; ATM보다 낮으면 배정단가로 스냅). ITM 만기 → 콜어웨이(주식 매도 + 프리미엄 실현) → CSP 국면 복귀 |
 | CC 국면 제한 | 배정 후 주가가 배정단가 -20% 아래로 가면 **주식 손절** (wheel의 고전적 파산 경로 — "물리면 영원히 CC" — 차단). 로그에 명시 |
-| **LEAP 스윕** | 월말(매월 마지막 거래일) 종가로 판단, **다음 거래일 체결**(§5.3): `premium_bank`(실현 프리미엄 누계, 이월 포함 — §5.2.1) ≥ 그 시점 SPY delta 0.70/DTE 365 콜 1계약 비용이면 매수, cash·bank 동시 차감. 미달이면 이월 |
+| **LEAP 스윕** | 월말(매월 마지막 거래일) 종가로 판단, **다음 거래일 체결**(§5.3): SPY delta 0.70/DTE 365 콜 1계약 비용 `cost`가 `cost ≤ min(premium_bank, available_cash)` (§5.2.1 원칙 4 — bank는 실현 프리미엄 누계·이월 포함)이면 매수, cash·bank 동시 차감. 미달이면 이월 |
 | LEAP 관리 | 매수한 LEAP는 **보유 전용** (숏 매도 없음 — V1과의 통제변인 분리). DTE < 90 롤, -50% 스톱, bear 전환 시 청산은 V1과 동일 |
 | 리스크 상한 | LEAP 누적 비용이 슬리브 자본의 50% 도달 시 스윕 중단(현금 이월). wheel 자체는 현금담보라 레버리지 0 |
 
@@ -161,12 +161,14 @@ $30k 슬리브가 이걸 모으려면 **수개월~1년 이상 이월이 정상**
 스윕 횟수·bank 잔고 추이를 필수 항목으로 넣어 이 추정을 실측으로 판정한다.
 임계값을 낮추려고 저가 LEAP(저델타·단기)로 바꾸지 않는다 — §4의 근사 오차
 논리(딥 ITM이라 IV 오차 영향이 작다)가 깨진다.
+결론무효화: **부분** — 스윕이 0회면 "LEAP 재투자 > 현금 복리" 가설(V2의 존재
+이유)은 검증 불가로 무효가 되지만, 순수 wheel 통제군으로서의 결론은 유지된다.
 
 ### 2.3 V3 — 전략7 스프레드 파이낸싱 LEAP 래더 (기존 챔피언과의 브릿지)
 
 숏 레그를 네이키드 CSP가 아니라 **기존에 검증된 전략7 크레딧 스프레드 사이클**로
-대체한 변형. 거래 라이프사이클(진입가·PT/SL 경로·청산)은 vendor
-`run_portfolio_simulation`이 계산한 **raw 거래(계약당, 사이징 전)** 를 그대로 쓰고,
+대체한 변형. 거래 라이프사이클(진입가·PT/SL 경로·청산)은
+`backtest._generate_raw_trades`가 계산한 **raw 거래(계약당, 사이징 전)** 를 그대로 쓰고,
 신규 엔진은 사이징과 LEAP 원장만 관리한다.
 
 **사이징 명세 (감사 1R #4 반영 — 기존 사이저 재사용 아님)**:
@@ -174,22 +176,34 @@ $30k 슬리브가 이걸 모으려면 **수개월~1년 이상 이월이 정상**
 V3에서는 LEAP 스윕이 같은 현금을 인출하므로 그 복리 가정이 깨진다 (돈 이중 사용).
 대신 `leap_engine`이 vendor raw 거래 스트림을 진입일 순으로 재생하며 자체 사이징한다:
 
-1. `run_portfolio_simulation(전략7 신호, 기존 파라미터)` → raw trade 리스트 (계약당).
-2. 진입일 순 재생: `contracts = floor(book.cash × 0.05 / (max_loss × 100))`,
-   0계약이면 스킵(로그). 진입 시 담보 `max_loss × 100 × q`를 cash에서 예치
-   (§5.2.1 항등식에는 예치도 cash의 일부 — 별도 계정 없이 "가용 cash" 계산에서만 차감).
-3. 청산일에 `dollar_pnl = realized_pnl × 100 × q` 반영, 담보 해제, 양수 실현분 bank 적립.
+1. `backtest._generate_raw_trades("7_atlas_mvp", df, mtm_iv, risk_pct_series)`
+   (`backtest.py:312`) → raw trade 리스트 (계약당). **`run_portfolio_simulation`을
+   직접 부르지 않는다 (감사 2R #3 반영)** — vendor 함수는 `candidate_signal_dates`
+   리스트와 단일 `spread_type`을 받는 시그니처라 전략7 신호를 그대로 못 받고,
+   전략7의 `iron_condor`를 bull_put/bear_call 양쪽으로 분해하는 것도
+   `_generate_raw_trades`의 그룹핑 루프(`backtest.py:333`)다. private 헬퍼지만
+   임포트 재사용만 하고 `backtest.py`는 수정하지 않는다 (§5.5의 0줄 유지).
+2. 진입일 순 재생: `contracts = floor(available_cash × 0.05 / (max_loss × 100))`
+   (§5.2.1 원칙 4), 0계약이면 스킵(로그). 진입 시 담보 `max_loss × 100 × q`를
+   `reserved_collateral`로 예약.
+3. 청산일에 `dollar_pnl = realized_pnl × 100 × q` 반영, 담보 예약 해제, 양수 실현분 bank 적립.
 
-킬스위치·동적 risk_pct 등 `scale_trades_to_dollars`의 나머지 기능은 **의도적으로
-안 가져온다** — 슬리브는 상대비교용 백테스트고, 그 기능들이 필요해지면 그때가
-사이저 통합을 다시 설계할 시점이다 (지금 하면 두 사이저의 이원화 관리).
+**V3은 전략7의 신호 생성·청산 로직만 재사용한다 (감사 2R #4 반영).** 사이징
+(available_cash 고정 5%/건)과 킬스위치 미사용은 이 슬리브의 **새 선택**이지
+전략7의 확장이 아니다 — 전략7 본체는 거래별 `risk_pct`(ATR% 백분위 기반 2~10%
+volatility-scaled, `backtest.py:342` / `one-page-submission.md` "AI Logic" 절)와
+킬스위치를 쓴다. 즉 V3은 "전략7이 LEAP 파이낸싱을 단 것"이 아니라 **관련되지만
+별개인 실험**이고, 백테스트 리포트에 "raw signal/exit만 재사용, sizing·risk
+gates는 별도 실험"을 명시 표기한다. 킬스위치·동적 risk_pct를 안 가져오는 이유:
+슬리브는 상대비교용 백테스트고, 그 기능들이 필요해지면 그때가 사이저 통합을
+다시 설계할 시점이다 (지금 하면 두 사이저의 이원화 관리).
 이 재생 루프는 ~15줄이고, "V3이 신규 코드 최소"라는 이전 판정은 이만큼 **하향
 수정**된다 — 그래도 배정·숏레그 자체 관리가 없어 3종 중 최소는 유지.
 
 | 항목 | 규칙 |
 |---|---|
 | 숏 사이클 | SPY·QQQ·IWM에 전략7(`7_atlas_mvp`) 신호 그대로 + 기존 `run_portfolio_simulation` 파라미터 그대로 (DTE 7, delta 0.20, width 1.5%, PT 50%, SL 2.0x). **전략7이 내는 3종 구조(bull_put·bear_call·iron_condor) 전부 그대로 거래한다** — bull_put만 골라내지 않는다 (감사 1R #8 반영: 변형 이름의 "Bull-Put 파이낸싱"은 대표 구조 지칭이었으나 부정확해 아래처럼 정정) |
-| **funding** | **세 구조 모두의** 실현 프리미엄 중 양수 실현분이 `premium_bank`에 적립 (§5.2.1 — bank는 cash의 하위 원장) → 매주 금요일 종가 판단, **다음 거래일 체결**(§5.3): bank ≥ SPY 또는 QQQ delta 0.70/DTE 365 콜 1계약 비용 && 해당 종목 bull 레짐이면 매수 (레짐 게이트 — 하락장에서 LEAP를 사 모으는 자살 방지) |
+| **funding** | **세 구조 모두의** 실현 프리미엄 중 양수 실현분이 `premium_bank`에 적립 (§5.2.1 — bank는 cash의 하위 원장) → 매주 금요일 종가 판단, **다음 거래일 체결**(§5.3): SPY 또는 QQQ delta 0.70/DTE 365 콜 1계약 비용 `cost ≤ min(premium_bank, available_cash)` (§5.2.1 원칙 4) && 해당 종목 bull 레짐이면 매수 (레짐 게이트 — 하락장에서 LEAP를 사 모으는 자살 방지) |
 | LEAP 관리 | V2와 동일 (보유 전용, DTE<90 롤, -50% 스톱, bear 청산) |
 | 리스크 상한 | 스프레드 자체가 정의된 리스크(width−credit) — 배정 모델링 불필요. LEAP 누적 50% 상한 동일 |
 
@@ -226,6 +240,8 @@ V2와의 차이는 숏 레그의 리스크 정의 방식(무제한 배정 vs 정
 무시한다. LEAP 딥 ITM(delta 0.8)은 시간가치 비중이 작아 IV 오차의 가격 영향이
 상대적으로 작다 — 딥 ITM을 관례로 쓰는 이유가 설계상 근사 오차도 줄여준다.
 ATM LEAP(delta 0.5) 변형을 안 만드는 이유이기도 하다 (근사 오차가 결과를 지배).
+결론무효화: **아니오** — 결론이 절대 수익이 아니라 변형 간 상대비교이고, 세 변형이
+같은 IV 근사를 공유하므로 오차가 비교 방향을 뒤집을 경로가 좁다 (딥 ITM 한정 조건 하).
 
 ---
 
@@ -245,8 +261,9 @@ ATM LEAP(delta 0.5) 변형을 안 만드는 이유이기도 하다 (근사 오�
    래퍼가 어댑터 지옥이 된다.
 3. 단, **가격 프리미티브는 공유한다** — `black_scholes_price`/`strike_for_delta`/
    `estimate_historical_vol`은 순수함수라 양쪽 엔진이 그대로 임포트. "같은 가격모델,
-   다른 수명주기 엔진"이 유지된다. V3의 숏 사이클은 아예 vendor 엔진을 사이클
-   단위로 호출한다 (per-cycle로는 vendor의 가정이 전부 성립하므로).
+   다른 수명주기 엔진"이 유지된다. V3의 숏 사이클은 `backtest._generate_raw_trades`
+   경유로 vendor 엔진을 통째 재사용한다 (per-cycle로는 vendor의 가정이 전부
+   성립하므로 — 호출 명세는 §2.3).
 
 ### 5.2 데이터 모델
 
@@ -306,6 +323,24 @@ class Book:                 # 종목당 1개
    equity 불변 (거래는 부를 만들지 않는다) — 이 상쇄가 항등식이 닫혀 있다는
    증명의 핵심이고, 테스트 1(§8)이 매 이벤트 직후 이걸 assert한다.
 
+4. **`available_cash`가 지출 판정의 유일한 기준이다 (감사 2R #2 반영).** cash에는
+   담보로 묶인 몫과 pending 큐에 이미 배정된 몫이 섞여 있으므로, 원시 `cash`를
+   임계값과 비교하면 담보와 스윕이 같은 돈을 두 번 쓸 수 있다. 정의:
+
+   ```
+   reserved_collateral = Σ CSP 현금담보(strike×100×q, V2)
+                       + Σ 스프레드 담보(max_loss×100×q, V3)
+   pending_debits      = pending 큐에 적재된 매수/진입 주문의 예상 비용 합
+   available_cash      = cash − reserved_collateral − pending_debits
+   ```
+
+   모든 지출 판정은 `available_cash` 기준: CSP 담보 예치 가능 수량(V2),
+   LEAP 스윕 `cost ≤ min(premium_bank, available_cash)` (V2 월말·V3 금요일 공통),
+   V3 스프레드 사이징 `contracts = floor(available_cash × 0.05 / (max_loss×100))`.
+   불변식: `available_cash ≥ 0` (담보 예치·pending 적재 직후 포함) — 테스트 1에서
+   `premium_bank ≤ cash`와 함께 assert. 담보는 별도 계좌가 아니라 cash 안의
+   예약 태그이므로 자산 항등식(§5.2.1 원칙 3)에는 여전히 등장하지 않는다.
+
 이벤트별 원장 분개 (전부 이 표가 정본, 루프 의사코드는 이 표를 따른다):
 
 | 이벤트 | cash | premium_bank | legs / shares |
@@ -328,11 +363,25 @@ bank를 깎지 않는다 — bank는 "스윕 자격 판정용 누계"이지 손�
 일자(daily bar)가 바깥 루프. 하루 안의 처리 순서를 고정한다 (순서가 결과를 바꾸므로
 명세가 필요한 지점):
 
-**타이밍 원칙 (감사 1R #2 반영)**: 그날 종가로 **판단**한 것은 전부 **다음
-거래일에 체결**한다 — vendor 엔진이 signal_date 다음 거래일에 진입하는 관례
-(`credit_spread_simulator.py:397`)와 동일. 종가를 보고 그 종가에 진입하는 경로는
-루프 구조상 존재하지 않는다: 진입·스윕 판단은 `pending` 큐에 넣고 다음 거래일
-스텝 1에서 그날 종가로 체결한다.
+**타이밍 원칙 (감사 1R #2 · 2R #1 반영)**: 그날 종가로 **판단**한 것은 전부
+**다음 거래일에 체결**한다 — vendor 엔진이 signal_date 다음 거래일에 진입하는
+관례(`credit_spread_simulator.py:397`)와 동일. 종가를 보고 그 종가에 진입하는
+경로는 루프 구조상 존재하지 않는다: 진입·스윕 판단은 `pending` 큐에 넣고 다음
+거래일 스텝 1에서 그날 종가로 체결한다.
+
+청산은 두 클래스로 나뉜다 (감사 2R #1):
+
+- **가격 터치형 (PT/SL)**: 당일 종가 판정·당일 종가 체결. vendor `simulate_trade`의
+  세션 루프가 종가 MTM으로 PT/SL을 판정하고 그 종가를 청산가로 쓰는 관례
+  (`credit_spread_simulator.py:309-331`)와 동일 — 판정과 체결이 같은 종가라
+  룩어헤드가 아니고, 기존 10전략 백테스트와의 비교 가능성을 유지한다.
+- **전략 판단형 (레짐 bear 전환 청산, LEAP -50% 스톱, V2 주식 -20% 손절)**:
+  종가로 확인한 조건에 근거한 재량적 청산 결정이므로, "확인한 그 종가에 체결"은
+  MOC 사전 제출 없이는 라이브에서 불가능한 체결이다. 진입과 동일하게
+  **DECIDE(당일 종가 판단) → pending → 다음 거래일 EXECUTE(그날 종가 체결)** 로
+  보낸다. 갭 하락 하루치 노출이 추가되는 게 정직한 모델이고, -50%/-20% 스톱은
+  체결일 가격 기준으로 실제 손실이 임계보다 깊을 수 있다 — 리포트에 트리거일
+  대비 체결일 슬리피지를 로그로 남긴다.
 
 ```
 for d in trading_days:                        # 종목별 Book 각각
@@ -345,14 +394,16 @@ for d in trading_days:                        # 종목별 Book 각각
                     (V2, 주식 담보) 콜어웨이: 주식 strike 매도 + 콜 소멸
                   CSP OTM → 소멸 / ITM → 배정: cash -= strike*100*qty,
                     shares += 100*qty, cost_basis = strike - premium
-    3. TRIGGER  — 만기 전 청산 트리거 (그날 종가 MTM 기준, **당일 체결**):
-                  숏 레그 50% PT / 2.0x SL, LEAP -50% 스톱,
-                  레짐 bear 전환 → LEAP+숏 동시 청산, V2 주식 -20% 손절
-                  (PT/SL 당일 체결은 vendor `simulate_trade`의 기존 관례와 동일 —
-                  트리거 판정과 체결이 같은 종가라 미래정보가 아니다)
-    4. DECIDE   — 오늘 종가 기준 진입/롤/스윕 **판단**만 → pending 큐 적재:
+    3. TRIGGER  — 가격 터치형 청산만 (그날 종가 MTM 기준, **당일 체결**):
+                  숏 레그 50% PT / 2.0x SL
+                  (vendor `simulate_trade`의 close-to-close 관례와 동일,
+                  `credit_spread_simulator.py:309-331` — 판정·체결이 같은 종가)
+    4. DECIDE   — 오늘 종가 기준 **판단**만 → pending 큐 적재 (다음 거래일 체결):
                   LEAP DTE<90 롤, 변형별 진입 규칙 (§2),
-                  funding 스윕 판정 (V2 월말 / V3 금요일): bank ≥ 비용 && 레짐 확인
+                  전략 판단형 청산 — LEAP -50% 스톱, 레짐 bear 전환 →
+                  LEAP+숏 동시 청산, V2 주식 -20% 손절 (감사 2R #1),
+                  funding 스윕 판정 (V2 월말 / V3 금요일):
+                  cost ≤ min(bank, available_cash) && 레짐 확인
     5. MTM      — equity = cash + Σ signed_leg_mtm + shares × close (§5.2.1)
                   equity_curve[d] 기록 + 자산 항등식 assert
 ```
@@ -366,6 +417,11 @@ for d in trading_days:                        # 종목별 Book 각각
   생략하므로 **V1 결과는 낙관 편향 상한(upper bound)으로 읽어야 한다**. 이건
   Cboe BXM이 뒷받침하는 관례가 아니다 (BXM은 SPX 현금결제 인덱스 방법론).
   리포트 헤더에 이 가정을 명시한다.
+  결론무효화 (V1 현금정산): **부분** — V1의 절대 수치는 상한이라 단독으로는 결론
+  근거가 못 되지만, "상한조차 기존 챔피언에 못 미치면 탈락"이라는 부정 방향
+  판정에는 그대로 유효하다.
+  결론무효화 (조기배정 제외): **아니오** — 생략된 마찰의 방향이 알려져 있고(낙관),
+  위 상한 해석에 이미 포섭된다.
 - 같은 날 PT·SL 동시 도달 시 **SL 우선** (`design-multi-asset-combined-backtest.md §4.2`와 동일한 보수 규칙).
 - 갭·슬리피지·수수료 미반영 — 기존 크레딧 스프레드 백테스트와 동일 수준의 근사
   (`credit_haircut_pct` 5%는 숏 레그 진입 크레딧에 동일 적용해 비교 가능성 유지).
@@ -386,6 +442,8 @@ for d in trading_days:                        # 종목별 Book 각각
 **알려진 천장**: 고정 분할은 슬리브 간 예산 경합을 모델링하지 않는다. multi-asset
 설계가 만드는 경합 모델과의 통합은 이 계열이 백테스트에서 생존한 **다음** 라운드의
 일이다 (Working Skeleton First — 지금 통합하면 두 미검증 시스템을 동시에 짓는 것).
+결론무효화: **아니오** — 고정 30/70 분할은 슬리브 **내부** 비교(V1/V2/V3 상호,
+그리고 동일 $30k 기준 지표)의 유효성을 건드리지 않는다.
 
 ### 5.5 기존 플로우 접속점
 
@@ -450,6 +508,8 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
   백테스트 리포트의 필수 항목이다. 이기지 못하면 이 계열 전체가 대회 제출이
   아니라 운용 연구다. V2는 배정 주기까지 끼어 실현이 더 불규칙 — 처음부터
   운용 연구 성격.
+  결론무효화: **부분** — 분포 비교에서 지면 "대회 제출" 결론만 무효가 되고,
+  운용 연구로서의 결론(가설 1·2의 답)은 유지된다.
 - 창의성 점수 서사는 V3이 최강: "검증된 프리미엄 수확기가 자기 수확물로 장기
   볼록성을 사 모은다"는 한 문장이 된다.
 - 백테스트 리포트의 **7일 창 실현 P&L 분포**(루브릭 항목)가 대회 투입 여부의
@@ -466,7 +526,8 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
 1. **현금 보존식 (게이트)**: 매 스텝 `equity == cash + Σsigned_leg_mtm + shares*px`
    (§5.2.1)가 전 구간 성립. 진입·청산·배정·롤·스윕 각 이벤트 직후 검증. 특히
    숏 매도 직후 equity 불변(현금 유입 = 부채 MTM), 스윕 직후
-   `premium_bank ≤ cash` 불변식도 함께 assert.
+   `premium_bank ≤ cash` 불변식, 담보 예치·pending 적재·스윕 직후
+   `available_cash ≥ 0` 불변식(§5.2.1 원칙 4)도 함께 assert.
 2. **배정 사이클**: 가격을 행사가 아래로 보내는 합성 시나리오에서 CSP 배정 →
    shares 증가·cash 감소 → CC 매도 → 가격 회복 → 콜어웨이 → 현금 복귀. 각 단계의
    realized 이벤트 kind가 순서대로 기록됨.
@@ -524,6 +585,18 @@ Tier 2+ (신규 모듈·설계문서 존재) → **Codex 핸드오프 대상** (
 | 7 (P2) | V2 스윕이 규모상 거의 발동 안 할 수 있음 (SPY 0.70 LEAP ~$7k vs SLV/TLT 월 프리미엄) | **수용** | 산수 타당. §2.2에 기대 빈도 추정 명기: 스윕 0~수 회가 정상, 미발동 시 순수 wheel 통제군으로 재해석. 임계 완화(저델타 LEAP)는 §4 근사 논리 훼손이라 기각 |
 | 8 (P2) | 전략7은 bear_call·iron_condor도 냄 — V3 "Bull-Put"은 부정확, 그 프리미엄의 bank 귀속 미명세 | **수용** | `strategies.py:158-164` 확인. V3 명칭을 "전략7 스프레드 파이낸싱"으로 정정, 3종 구조 전부 거래·전부 bank 적립 명시 |
 | 9 (P2) | doc-meta 부재 등 lint WARN 13건 | **수용** | doc-meta round=1 추가, 이 섹션 제목에 라운드 토큰, 선행조사 라벨 3종 추가. C3 "§ 반복 언급" WARN은 상호참조가 문서 가독성에 필요해 잔류 허용 (ERROR 아님) |
+
+### 2라운드 (2026-08-26, codex exec gpt-5.5, 판정: NOT CLEAN — P1 2건, P2 3건)
+
+각 지적은 코드·문서 원문 대조로 재검증한 뒤 판정했다.
+
+| # | 지적 요지 | 판정 | 근거·반영 |
+|---|---|---|---|
+| 1 (P1) | TRIGGER가 PT/SL(vendor 관례)과 전략 판단형 exit(bear 전환·LEAP -50%·주식 -20%)을 전부 "종가 확인 후 같은 종가 체결"로 묶음 — 후자는 라이브 불가능 체결 | **수용** | `credit_spread_simulator.py:309-331` 확인 — vendor의 same-close는 PT/SL 가격 터치에만 존재. §5.3을 두 클래스로 분리: PT/SL은 close-to-close 유지(vendor 호환·비교 가능성), 전략 판단형 3종은 DECIDE→다음 거래일 EXECUTE로 이동(진입과 동일 규율). 갭 노출 하루 추가가 정직한 모델 — 트리거일 대비 체결일 슬리피지 로그 요구 추가 |
+| 2 (P1) | 담보/예약 현금 명세 부재 — bank와 담보가 같은 cash를 동시에 쓸 수 있음 | **수용** | 사실 — §5.2.1은 `bank ≤ cash`만 있었고 담보는 V3 본문의 산문 한 줄뿐. §5.2.1 원칙 4 신설: `reserved_collateral`·`pending_debits`·`available_cash` 정의, 모든 지출 판정(V2 CSP 수량·V2/V3 스윕·V3 사이징)을 `available_cash` 기준으로 재기술, 스윕 조건 `cost ≤ min(premium_bank, available_cash)` 고정, `available_cash ≥ 0` 불변식을 테스트 1에 추가 |
+| 3 (P2) | V3의 `run_portfolio_simulation(전략7 신호, ...)` 호출 명세가 실제 시그니처(`candidate_signal_dates`+단일 `spread_type`)와 불일치, iron_condor 분해는 backtest 헬퍼 소관 | **수용** | `credit_spread_simulator.py:360-374`·`backtest.py:312-344` 확인 — iron_condor→bull_put/bear_call 분해와 그룹핑은 `_generate_raw_trades`(backtest.py:333)가 한다. §2.3 스텝 1을 `backtest._generate_raw_trades("7_atlas_mvp", df, mtm_iv, risk_pct_series)` 재사용으로 확정 (private 헬퍼지만 임포트만, backtest.py 수정 0줄 유지), §5.1의 서술도 정정 |
+| 4 (P2) | V3 고정 5% 사이징·킬스위치 미사용은 전략7(risk_pct 2~10% volatility-scaled + 킬스위치)과 다른 전략 — "기존 챔피언의 자연 확장" 서사 과장 | **수용** | `backtest.py:342`·`one-page-submission.md:22` 확인. §2.3에 명시: V3은 signal/exit만 재사용, sizing·risk gates는 이 슬리브의 새 선택 — "관련되지만 별개인 실험"이며 리포트에 이 분리를 표기하도록 요구 |
+| 5 (P2) | 1R에서 추가된 Limitations/가정 항목들에 `결론무효화` 판정 라벨 부재 | **수용** | 각 항목에 자체 판정으로 라벨 부여 (감사 제안 라벨은 참고만, 전부 재판단): IV 근사(§4)=**아니오**(상대비교+딥 ITM 한정), V1 현금정산(§5.3)=**부분**(절대 수치 무효·상한 판정 유효), 조기배정 제외(§5.3)=**아니오**(방향 기지·상한에 포섭), V2 스윕 저빈도(§2.2)=**부분**(재투자 가설 무효·통제군 유지), 슬리브 경합 제외(§5.4)=**아니오**(슬리브 내부 비교 무영향), 대회 적합 조건부(§7)=**부분**(제출 결론만 무효) — 감사 제안과 결과적으로 일치하나 §5.4를 명시 추가 판정 |
 
 ---
 
