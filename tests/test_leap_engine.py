@@ -220,6 +220,62 @@ class TestAssetIdentityP0Gate(unittest.TestCase):
                 decide_fn=lambda eng, d, px, iv, reg: None,
             )
 
+    def test_regression_injection_short_call_entry_missing_cash_credit(self):
+        """
+        Verify event-level continuity catches a short-option entry that creates
+        the liability but forgets the matching cash credit.
+        """
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df = pd.DataFrame(
+            {"open": [105.0] * 3, "high": [105.0] * 3, "low": [105.0] * 3, "close": [105.0] * 3, "volume": [1000] * 3},
+            index=dates,
+        )
+        iv_series = pd.Series(0.20, index=dates)
+        regimes = pd.Series("bull", index=dates)
+
+        class BuggyShortCallSellEngine(LeapEngine):
+            def _step_execute(self, d, current_prices, current_ivs):
+                orders_to_process = list(self.pending_queue)
+                self.pending_queue.clear()
+                self.book.pending_debits = 0.0
+                for order in orders_to_process:
+                    if order.order_type != "SHORT_CALL_SELL":
+                        continue
+                    before_equity = self._calculate_equity(d, current_prices, current_ivs)
+                    S = current_prices[order.symbol]
+                    iv = current_ivs[order.symbol]
+                    strike = 105.0
+                    t_years = order.target_dte / 365.0
+                    raw_credit = black_scholes_price(S, strike, t_years, self.r, iv, "call")
+                    credit_received = raw_credit * (1.0 - self.credit_haircut_pct)
+                    # BUG: adds the short liability but omits `cash += credit_received * 100`.
+                    self.book.legs.setdefault(order.symbol, []).append(
+                        OptionLeg("call", strike, d + pd.Timedelta(days=order.target_dte), -1, credit_received, d, "short_call", order.symbol)
+                    )
+                    expected_delta = -(raw_credit - credit_received) * 100.0
+                    self._assert_event_equity_change(
+                        before_equity,
+                        d,
+                        current_prices,
+                        current_ivs,
+                        "buggy_short_call_sell",
+                        expected_delta=expected_delta,
+                    )
+
+        engine = BuggyShortCallSellEngine(starting_cash=30_000.0)
+
+        def decide_fn(eng, d, px, iv, reg):
+            if d == dates[0]:
+                eng.pending_queue.append(PendingOrder(order_type="SHORT_CALL_SELL", symbol="SPY", target_dte=7))
+
+        with self.assertRaises(AssertionError):
+            engine.run_simulation(
+                bars_by_symbol={"SPY": df},
+                iv_by_symbol={"SPY": iv_series},
+                regime_by_symbol={"SPY": regimes},
+                decide_fn=decide_fn,
+            )
+
     def test_regression_injection_bank_exceeds_cash(self):
         """Verify that premium_bank > cash triggers an invariant assertion failure."""
         book = SleeveBook(cash=1_000.0, premium_bank=1_500.0)
@@ -327,6 +383,35 @@ class TestInvariantsAndTiming(unittest.TestCase):
         skip_events = [r for r in book.realized if r["kind"] == "iv_coverage_skip"]
         self.assertEqual(len(skip_events), 1)
         self.assertEqual(pd.Timestamp(skip_events[0]["exit_date"]), dates[1])
+
+    def test_iv_gap_still_settles_expiry_on_that_close(self):
+        """Missing IV on expiry day must not defer intrinsic settlement to a future close."""
+        dates = pd.bdate_range("2023-01-02", periods=2)
+        df = pd.DataFrame(
+            {"open": [90.0, 130.0], "high": [90.0, 130.0], "low": [90.0, 130.0], "close": [90.0, 130.0], "volume": [1000, 1000]},
+            index=dates,
+        )
+        iv_series = pd.Series([0.20], index=[dates[1]])
+        regimes = pd.Series("neutral", index=dates)
+
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.cash = 30_100.0
+        engine.book.legs["SPY"] = [
+            OptionLeg("call", 100.0, dates[0], -1, 1.0, dates[0] - pd.Timedelta(days=7), "short_call", "SPY")
+        ]
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+
+        short_events = [r for r in book.realized if r["kind"] == "short_cycle"]
+        self.assertEqual(len(short_events), 1)
+        self.assertEqual(pd.Timestamp(short_events[0]["exit_date"]), dates[0])
+        self.assertEqual(short_events[0]["detail"]["reason"], "expiry_otm")
+        self.assertEqual(short_events[0]["detail"]["close_price"], 90.0)
+        self.assertEqual(engine.book.cash, 30_100.0)
 
 
 class TestV1PMCCMechanics(unittest.TestCase):

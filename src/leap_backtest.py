@@ -6,18 +6,31 @@ stateful `leap_engine` without modifying the established backtest/vendor flows.
 """
 from __future__ import annotations
 
+import argparse
+import os
 from typing import Dict, Iterable, Literal
 
 import pandas as pd
+from alpaca.data.historical.stock import StockHistoricalDataClient
 
-from backtest import _generate_raw_trades, _risk_pct_series, _rolling_iv_series, fetch_daily_bars
-from leap_engine import (
-    LeapBacktestReport,
-    calculate_adx_ema_regime,
-    run_v1_pmcc,
-    run_v2_wheel,
-    run_v3_spread_financing,
-)
+try:
+    from .backtest import _generate_raw_trades, _risk_pct_series, _rolling_iv_series, fetch_daily_bars
+    from .leap_engine import (
+        LeapBacktestReport,
+        calculate_adx_ema_regime,
+        run_v1_pmcc,
+        run_v2_wheel,
+        run_v3_spread_financing,
+    )
+except ImportError:  # Allows `python src/leap_backtest.py` during local runs.
+    from backtest import _generate_raw_trades, _risk_pct_series, _rolling_iv_series, fetch_daily_bars
+    from leap_engine import (
+        LeapBacktestReport,
+        calculate_adx_ema_regime,
+        run_v1_pmcc,
+        run_v2_wheel,
+        run_v3_spread_financing,
+    )
 
 LEAP_UNIVERSE = ("SPY", "QQQ", "GLD", "TLT", "SLV", "IWM")
 V1_SYMBOLS = ("SPY", "QQQ")
@@ -66,13 +79,13 @@ def generate_v3_raw_trades(
 
 
 def run_leap_family(
-    client,
     variant: VariantName,
     years: int = 3,
     starting_cash: float = 30_000.0,
     strategy_name: str = "7_atlas_mvp",
 ) -> LeapBacktestReport:
     """Run one LEAP-family variant using the repository's existing data pipeline."""
+    client = StockHistoricalDataClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"])
     normalized = variant.lower()
     if normalized in {"v1", "pmcc"}:
         bars, ivs, regimes = prepare_leap_inputs(client, V1_SYMBOLS, years=years)
@@ -88,3 +101,34 @@ def run_leap_family(
         return run_v3_spread_financing(bars, ivs, regimes, raw_trades, starting_cash=starting_cash)
 
     raise ValueError("variant must be one of: v1, v2, v3, pmcc, wheel, spread_financing")
+
+
+def _format_summary(report: LeapBacktestReport) -> str:
+    metrics = report.metrics
+    return (
+        f"{report.variant}: trades={metrics.n_trades}, total_pnl={metrics.total_pnl:.2f}, "
+        f"final_equity={metrics.final_equity:.2f}, max_drawdown={metrics.max_drawdown:.2f}, "
+        f"leap_sweeps={report.leap_sweep_count}, assignments={report.assignment_count}"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Run LEAP / PMCC / Wheel family backtests.")
+    parser.add_argument("variant", choices=("v1", "v2", "v3", "pmcc", "wheel", "spread_financing"))
+    parser.add_argument("--years", type=int, default=3)
+    parser.add_argument("--starting-cash", type=float, default=30_000.0)
+    parser.add_argument("--strategy-name", default="7_atlas_mvp")
+    args = parser.parse_args(argv)
+
+    report = run_leap_family(
+        args.variant,
+        years=args.years,
+        starting_cash=args.starting_cash,
+        strategy_name=args.strategy_name,
+    )
+    print(_format_summary(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

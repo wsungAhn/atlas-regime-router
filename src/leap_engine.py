@@ -443,6 +443,11 @@ class LeapEngine:
                 for sym in bars_by_symbol
                 if sym not in iv_by_symbol or d not in iv_by_symbol[sym].index
             ]
+            current_ivs = {
+                sym: float(iv_by_symbol[sym].loc[d])
+                for sym in bars_by_symbol
+                if sym in iv_by_symbol and d in iv_by_symbol[sym].index
+            }
             if missing_iv:
                 self.book.realized.append({
                     "entry_date": d,
@@ -452,9 +457,11 @@ class LeapEngine:
                     "dollar_pnl": 0.0,
                     "detail": {"reason": "missing_iv_for_trading_day"},
                 })
+                # Expiry settlement is contractual and intrinsic at expiry, so it does
+                # not need IV. Entry, PT/SL trigger, DECIDE, and MTM do need IV.
+                self._step_expiry(d, current_prices, current_ivs)
                 continue
 
-            current_ivs = {sym: float(iv_by_symbol[sym].loc[d]) for sym in bars_by_symbol}
             current_regimes = {
                 sym: str(regime_by_symbol[sym].get(d, "neutral")) for sym in regime_by_symbol
             }
@@ -489,9 +496,11 @@ class LeapEngine:
         total_leg_mtm = 0.0
         for sym, leg_list in self.book.legs.items():
             S = current_prices.get(sym, 0.0)
-            iv = current_ivs.get(sym, 0.20)
             for leg in leg_list:
                 t_rem = max(0.0, (leg.expiry - d).days / 365.0)
+                if t_rem > 0.0 and sym not in current_ivs:
+                    raise KeyError(f"Missing IV for open {sym} leg at {d}")
+                iv = current_ivs.get(sym, 0.20)
                 px = _option_price_for_mtm(S, leg.strike, t_rem, self.r, iv, leg.option_type)
                 if leg.qty > 0:
                     total_leg_mtm += px * 100.0 * leg.qty
@@ -501,11 +510,13 @@ class LeapEngine:
         spread_mtm = 0.0
         for sp in self.book.active_spreads:
             S = current_prices.get(sp.symbol, 0.0)
-            iv = current_ivs.get(sp.symbol, 0.20)
             t_rem = max(0.0, (sp.exit_date - d).days / 365.0)
             if d >= sp.exit_date:
                 close_debit = sp.close_debit
             else:
+                if sp.symbol not in current_ivs:
+                    raise KeyError(f"Missing IV for open {sp.symbol} spread at {d}")
+                iv = current_ivs[sp.symbol]
                 close_debit = _spread_close_debit_for_mtm(
                     sp.spread_type, sp.short_strike, sp.long_strike, S, t_rem, self.r, iv
                 )
@@ -517,6 +528,12 @@ class LeapEngine:
         )
         return self.book.cash + total_leg_mtm + spread_mtm + total_stock_value
 
+    def _can_calculate_equity(self, d: pd.Timestamp, current_ivs: Dict[str, float]) -> bool:
+        for sym, leg_list in self.book.legs.items():
+            if any((leg.expiry - d).days > 0 for leg in leg_list) and sym not in current_ivs:
+                return False
+        return all(d >= sp.exit_date or sp.symbol in current_ivs for sp in self.book.active_spreads)
+
     def _assert_equity_continuity(
         self,
         before_equity: float,
@@ -524,15 +541,32 @@ class LeapEngine:
         current_prices: Dict[str, float],
         current_ivs: Dict[str, float],
         label: str,
+        expected_delta: float = 0.0,
         tol: float = 1e-4,
     ) -> None:
         after_equity = self._calculate_equity(d, current_prices, current_ivs)
-        if abs(after_equity - before_equity) > tol:
+        actual_delta = after_equity - before_equity
+        if abs(actual_delta - expected_delta) > tol:
             raise AssertionError(
                 f"Equity continuity violation during {label} at {d}: "
                 f"before={before_equity:.4f}, after={after_equity:.4f}, "
-                f"diff={after_equity - before_equity:.4f}"
+                f"diff={actual_delta:.4f}, expected={expected_delta:.4f}"
             )
+
+    def _assert_event_equity_change(
+        self,
+        before_equity: Optional[float],
+        d: pd.Timestamp,
+        current_prices: Dict[str, float],
+        current_ivs: Dict[str, float],
+        label: str,
+        expected_delta: float = 0.0,
+    ) -> None:
+        if before_equity is None:
+            return
+        self._assert_equity_continuity(
+            before_equity, d, current_prices, current_ivs, label, expected_delta=expected_delta
+        )
 
     def _step_execute(
         self,
@@ -557,6 +591,7 @@ class LeapEngine:
                 continue
 
             if order.order_type == "LEAP_BUY":
+                before_equity = self._calculate_equity(d, current_prices, current_ivs)
                 t_years = order.target_dte / 365.0
                 strike = round_to_increment(
                     strike_for_delta(S, t_years, self.r, iv, order.target_delta, "call"),
@@ -593,6 +628,9 @@ class LeapEngine:
                             "dollar_pnl": 0.0,
                             "detail": {"strike": strike, "cost": cost, "qty": 1, "is_sweep": True},
                         })
+                        self._assert_event_equity_change(
+                            before_equity, d, current_prices, current_ivs, "leap_sweep_buy"
+                        )
                 else:
                     # Standard LEAP entry (V1)
                     contracts = order.qty
@@ -619,9 +657,13 @@ class LeapEngine:
                             "dollar_pnl": 0.0,
                             "detail": {"strike": strike, "cost": cost, "qty": contracts},
                         })
+                        self._assert_event_equity_change(
+                            before_equity, d, current_prices, current_ivs, "leap_entry"
+                        )
 
             elif order.order_type == "LEAP_ROLL":
                 # Close existing LEAP and attached short call, then enter new LEAP
+                before_equity = self._calculate_equity(d, current_prices, current_ivs)
                 sym_legs = self.book.legs.get(sym, [])
                 leap_leg = None
                 short_leg = None
@@ -695,11 +737,17 @@ class LeapEngine:
                         symbol=sym,
                     )
                     self.book.legs.setdefault(sym, []).append(new_leg)
+                if leap_leg is not None or short_leg is not None:
+                    self._assert_event_equity_change(
+                        before_equity, d, current_prices, current_ivs, "leap_roll"
+                    )
 
             elif order.order_type == "LEAP_CLOSE":
                 # Strategic LEAP close (bear regime or -50% hard stop)
+                before_equity = self._calculate_equity(d, current_prices, current_ivs)
                 sym_legs = self.book.legs.get(sym, [])
                 remaining_legs = []
+                closed_any = False
                 for leg in sym_legs:
                     if leg.role == "leap":
                         t_rem = max(0.0, (leg.expiry - d).days / 365.0)
@@ -715,6 +763,7 @@ class LeapEngine:
                             "dollar_pnl": dollar_pnl,
                             "detail": {"reason": order.reason, "close_price": close_px},
                         })
+                        closed_any = True
                     elif leg.role == "short_call":
                         t_rem = max(0.0, (leg.expiry - d).days / 365.0)
                         close_px = _option_price_for_mtm(S, leg.strike, t_rem, self.r, iv, "call")
@@ -729,12 +778,18 @@ class LeapEngine:
                             "dollar_pnl": dollar_pnl,
                             "detail": {"reason": f"leap_close_{order.reason}", "close_price": close_px},
                         })
+                        closed_any = True
                     else:
                         remaining_legs.append(leg)
                 self.book.legs[sym] = remaining_legs
+                if closed_any:
+                    self._assert_event_equity_change(
+                        before_equity, d, current_prices, current_ivs, "leap_close"
+                    )
 
             elif order.order_type == "SHORT_CALL_SELL":
                 # Sell covered call under LEAP (V1)
+                before_equity = self._calculate_equity(d, current_prices, current_ivs)
                 sym_legs = self.book.legs.get(sym, [])
                 leap_leg = next((l for l in sym_legs if l.role == "leap"), None)
                 if leap_leg is None:
@@ -750,6 +805,7 @@ class LeapEngine:
                 if strike > leap_leg.strike + net_cost:
                     raw_credit = black_scholes_price(S, strike, t_years, self.r, iv, "call")
                     credit_received = raw_credit * (1.0 - self.credit_haircut_pct)
+                    expected_delta = -(raw_credit - credit_received) * 100.0 * leap_leg.qty
                     self.book.cash += credit_received * 100.0 * leap_leg.qty
                     short_leg = OptionLeg(
                         option_type="call",
@@ -762,6 +818,14 @@ class LeapEngine:
                         symbol=sym,
                     )
                     self.book.legs[sym].append(short_leg)
+                    self._assert_event_equity_change(
+                        before_equity,
+                        d,
+                        current_prices,
+                        current_ivs,
+                        "short_call_sell",
+                        expected_delta=expected_delta,
+                    )
                 else:
                     self.short_skip_count += 1
                     self.book.realized.append({
@@ -779,6 +843,7 @@ class LeapEngine:
 
             elif order.order_type == "CSP_SELL":
                 # Sell Cash-Secured Put (V2)
+                before_equity = self._calculate_equity(d, current_prices, current_ivs)
                 t_years = order.target_dte / 365.0
                 strike = round_to_increment(
                     strike_for_delta(S, t_years, self.r, iv, order.target_delta, "put"),
@@ -789,6 +854,7 @@ class LeapEngine:
                 if max_contracts >= 1:
                     raw_credit = black_scholes_price(S, strike, t_years, self.r, iv, "put")
                     credit_received = raw_credit * (1.0 - self.credit_haircut_pct)
+                    expected_delta = -(raw_credit - credit_received) * 100.0 * max_contracts
                     total_collateral = collateral_per_contract * max_contracts
                     self.book.reserved_collateral += total_collateral
                     self.book.cash += credit_received * 100.0 * max_contracts
@@ -804,9 +870,18 @@ class LeapEngine:
                         collateral_reserved=total_collateral,
                     )
                     self.book.legs.setdefault(sym, []).append(csp_leg)
+                    self._assert_event_equity_change(
+                        before_equity,
+                        d,
+                        current_prices,
+                        current_ivs,
+                        "csp_sell",
+                        expected_delta=expected_delta,
+                    )
 
             elif order.order_type == "CC_SELL":
                 # Sell Covered Call against assigned shares (V2)
+                before_equity = self._calculate_equity(d, current_prices, current_ivs)
                 shares_held = self.book.shares.get(sym, 0)
                 contracts = shares_held // 100
                 if contracts >= 1:
@@ -820,6 +895,7 @@ class LeapEngine:
                     strike = max(theo_strike, round_to_increment(cost_basis, self.strike_increment))
                     raw_credit = black_scholes_price(S, strike, t_years, self.r, iv, "call")
                     credit_received = raw_credit * (1.0 - self.credit_haircut_pct)
+                    expected_delta = -(raw_credit - credit_received) * 100.0 * contracts
                     self.book.cash += credit_received * 100.0 * contracts
                     cc_leg = OptionLeg(
                         option_type="call",
@@ -832,9 +908,18 @@ class LeapEngine:
                         symbol=sym,
                     )
                     self.book.legs.setdefault(sym, []).append(cc_leg)
+                    self._assert_event_equity_change(
+                        before_equity,
+                        d,
+                        current_prices,
+                        current_ivs,
+                        "cc_sell",
+                        expected_delta=expected_delta,
+                    )
 
             elif order.order_type == "STOCK_STOP_CLOSE":
                 # Strategic stock stop loss (-20%) liquidation (V2)
+                before_equity = self._calculate_equity(d, current_prices, current_ivs)
                 shares_held = self.book.shares.get(sym, 0)
                 if shares_held > 0:
                     proceeds = S * shares_held
@@ -872,13 +957,22 @@ class LeapEngine:
                         else:
                             remaining_legs.append(leg)
                     self.book.legs[sym] = remaining_legs
+                    self._assert_event_equity_change(
+                        before_equity, d, current_prices, current_ivs, "stock_stop_close"
+                    )
 
             elif order.order_type == "SPREAD_ENTRY":
                 # Enter Strategy 7 raw credit spread (V3)
                 if order.raw_trade is not None:
-                    self._execute_spread_entry(d, order.raw_trade)
+                    self._execute_spread_entry(d, order.raw_trade, current_prices, current_ivs)
 
-    def _execute_spread_entry(self, d: pd.Timestamp, raw: Dict[str, Any]) -> None:
+    def _execute_spread_entry(
+        self,
+        d: pd.Timestamp,
+        raw: Dict[str, Any],
+        current_prices: Optional[Dict[str, float]] = None,
+        current_ivs: Optional[Dict[str, float]] = None,
+    ) -> None:
         """Enter a Strategy 7 raw spread on its already-confirmed vendor entry_date."""
         max_loss = float(raw["max_loss"])
         credit_received = float(raw["credit_received"])
@@ -886,11 +980,19 @@ class LeapEngine:
         if contracts < 1:
             return
 
+        current_prices = current_prices or {}
+        current_ivs = current_ivs or {}
+        spread_symbol = str(raw.get("symbol", "SPY"))
+        before_equity = (
+            self._calculate_equity(d, current_prices, current_ivs)
+            if spread_symbol in current_prices and self._can_calculate_equity(d, current_ivs)
+            else None
+        )
         collateral = max_loss * 100.0 * contracts
         self.book.reserved_collateral += collateral
         self.book.cash += credit_received * 100.0 * contracts
         sp = ActiveSpread(
-            symbol=str(raw.get("symbol", "SPY")),
+            symbol=spread_symbol,
             spread_type=str(raw["spread_type"]),
             short_strike=float(raw["short_strike"]),
             long_strike=float(raw["long_strike"]),
@@ -904,6 +1006,26 @@ class LeapEngine:
             exit_reason=str(raw.get("exit_reason", "")),
         )
         self.book.active_spreads.append(sp)
+        if before_equity is not None:
+            S = current_prices[spread_symbol]
+            iv = current_ivs[spread_symbol]
+            t_rem = max(0.0, (sp.exit_date - d).days / 365.0)
+            entry_debit = (
+                sp.close_debit
+                if d >= sp.exit_date
+                else _spread_close_debit_for_mtm(
+                    sp.spread_type, sp.short_strike, sp.long_strike, S, t_rem, self.r, iv
+                )
+            )
+            expected_delta = (credit_received - entry_debit) * 100.0 * contracts
+            self._assert_event_equity_change(
+                before_equity,
+                d,
+                current_prices,
+                current_ivs,
+                "spread_entry",
+                expected_delta=expected_delta,
+            )
 
     def _step_expiry(
         self,
@@ -912,7 +1034,11 @@ class LeapEngine:
         current_ivs: Dict[str, float],
     ) -> None:
         """Step 2: Settle options expiring on date d (§5.3)."""
-        before_equity = self._calculate_equity(d, current_prices, current_ivs)
+        before_equity = (
+            self._calculate_equity(d, current_prices, current_ivs)
+            if self._can_calculate_equity(d, current_ivs)
+            else None
+        )
 
         # Settle active spreads expiring today (V3)
         remaining_spreads = []
@@ -1074,7 +1200,8 @@ class LeapEngine:
                     remaining_legs.append(leg)
             self.book.legs[sym] = remaining_legs
 
-        self._assert_equity_continuity(before_equity, d, current_prices, current_ivs, "expiry")
+        if before_equity is not None:
+            self._assert_equity_continuity(before_equity, d, current_prices, current_ivs, "expiry")
 
     def _step_trigger(
         self,
@@ -1083,6 +1210,8 @@ class LeapEngine:
         current_ivs: Dict[str, float],
     ) -> None:
         """Step 3: Price-touch PT exits on open short legs (same-day close MTM fill, §5.3)."""
+        before_equity = self._calculate_equity(d, current_prices, current_ivs)
+        closed_any = False
         for sym, leg_list in list(self.book.legs.items()):
             remaining_legs = []
             for leg in leg_list:
@@ -1104,6 +1233,7 @@ class LeapEngine:
                     is_sl = current_price >= leg.entry_price * self.stop_loss_multiple
 
                 if is_sl or is_pt:
+                    closed_any = True
                     exit_reason = "stop_loss" if is_sl else "profit_target"
                     q = abs(leg.qty)
                     cost_to_close = current_price * 100.0 * q
@@ -1133,6 +1263,8 @@ class LeapEngine:
                 else:
                     remaining_legs.append(leg)
             self.book.legs[sym] = remaining_legs
+        if closed_any:
+            self._assert_equity_continuity(before_equity, d, current_prices, current_ivs, "trigger")
 
     def _step_mtm(
         self,
