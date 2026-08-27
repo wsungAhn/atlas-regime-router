@@ -164,6 +164,18 @@ class SleeveBook:
         """Available cash for new commitments (§5.2.1 Principle 4)."""
         return self.cash - self.reserved_collateral - self.pending_debits
 
+    def debit_cash(self, amount: float) -> None:
+        """
+        Spend cash on something premium_bank does not itself track (stock
+        assignment, option buybacks, spread settlement, LEAP entry/roll).
+        premium_bank is a sub-ledger tag on part of cash, not an independent
+        account, so any outflow that shrinks the pool must re-clamp the tag
+        to it (§5.2.1 invariant 1). Sites that spend explicitly FROM the bank
+        (the LEAP sweep buy) manage premium_bank themselves and don't use this.
+        """
+        self.cash -= amount
+        self.premium_bank = min(self.premium_bank, self.cash)
+
     def assert_invariants(
         self,
         equity: float,
@@ -746,7 +758,7 @@ class LeapEngine:
                     contracts = order.qty
                     total_cost = cost_per_contract * contracts
                     if contracts >= 1 and total_cost <= self.book.available_cash:
-                        self.book.cash -= total_cost
+                        self.book.debit_cash(total_cost)
                         expiry_date = d + pd.Timedelta(days=order.target_dte)
                         leg = OptionLeg(
                             option_type="call",
@@ -812,7 +824,7 @@ class LeapEngine:
                     t_rem = max(0.0, (short_leg.expiry - d).days / 365.0)
                     close_px = _option_price_for_mtm(S, short_leg.strike, t_rem, self.r, iv, "call")
                     cost_to_close = close_px * 100.0 * abs(short_leg.qty)
-                    self.book.cash -= cost_to_close
+                    self.book.debit_cash(cost_to_close)
                     dollar_pnl = (short_leg.entry_price - close_px) * 100.0 * abs(short_leg.qty)
                     self.book.realized.append({
                         "entry_date": short_leg.entry_date,
@@ -835,7 +847,7 @@ class LeapEngine:
                 roll_qty = leap_leg.qty if leap_leg else 1
                 total_cost = new_cost * 100.0 * roll_qty
                 if total_cost <= self.book.available_cash and roll_qty >= 1:
-                    self.book.cash -= total_cost
+                    self.book.debit_cash(total_cost)
                     new_leg = OptionLeg(
                         option_type="call",
                         strike=new_strike,
@@ -878,7 +890,7 @@ class LeapEngine:
                         t_rem = max(0.0, (leg.expiry - d).days / 365.0)
                         close_px = _option_price_for_mtm(S, leg.strike, t_rem, self.r, iv, "call")
                         cost_to_close = close_px * 100.0 * abs(leg.qty)
-                        self.book.cash -= cost_to_close
+                        self.book.debit_cash(cost_to_close)
                         dollar_pnl = (leg.entry_price - close_px) * 100.0 * abs(leg.qty)
                         self.book.realized.append({
                             "entry_date": leg.entry_date,
@@ -1054,7 +1066,7 @@ class LeapEngine:
                         if leg.role == "covered_call":
                             t_rem = max(0.0, (leg.expiry - d).days / 365.0)
                             close_px = _option_price_for_mtm(S, leg.strike, t_rem, self.r, iv, "call")
-                            self.book.cash -= close_px * 100.0 * abs(leg.qty)
+                            self.book.debit_cash(close_px * 100.0 * abs(leg.qty))
                             cc_pnl = (leg.entry_price - close_px) * 100.0 * abs(leg.qty)
                             self.book.realized.append({
                                 "entry_date": leg.entry_date,
@@ -1188,7 +1200,7 @@ class LeapEngine:
             if d >= sp.exit_date:
                 collateral = sp.max_loss * 100.0 * sp.contracts
                 self.book.reserved_collateral -= collateral
-                self.book.cash -= sp.close_debit * 100.0 * sp.contracts
+                self.book.debit_cash(sp.close_debit * 100.0 * sp.contracts)
                 # Cash moved credit-in / debit-out, so reported P&L must be that same
                 # difference; a vendor realized_pnl that disagrees would make metrics
                 # diverge from the equity curve (§1 cash conservation).
@@ -1244,7 +1256,7 @@ class LeapEngine:
                         else:
                             intrinsic = S - leg.strike
                             debit_dollar = intrinsic * 100.0 * q
-                            self.book.cash -= debit_dollar
+                            self.book.debit_cash(debit_dollar)
                             dollar_pnl = (leg.entry_price - intrinsic) * 100.0 * q
                             self._record_leap_credit(sym, (leg.entry_price - intrinsic) * q)
                             self.book.realized.append({
@@ -1274,11 +1286,7 @@ class LeapEngine:
                         else:
                             # ITM assignment: buy stock at strike
                             assignment_cost = leg.strike * 100.0 * q
-                            self.book.cash -= assignment_cost
-                            # Assignment spends cash the premium_bank sub-ledger may have
-                            # claimed a share of; re-clamp so the bank never outlives the
-                            # pool it's a subset of (§5.2.1 invariant 1).
-                            self.book.premium_bank = min(self.book.premium_bank, self.book.cash)
+                            self.book.debit_cash(assignment_cost)
                             self.book.shares[sym] = self.book.shares.get(sym, 0) + 100 * q
                             self.book.share_cost_basis[sym] = leg.strike - leg.entry_price
                             self.assignment_count += 1
@@ -1394,7 +1402,7 @@ class LeapEngine:
                     exit_reason = "stop_loss" if is_sl else "profit_target"
                     q = abs(leg.qty)
                     cost_to_close = current_price * 100.0 * q
-                    self.book.cash -= cost_to_close
+                    self.book.debit_cash(cost_to_close)
                     if leg.role == "csp":
                         self.book.reserved_collateral -= leg.collateral_reserved
 

@@ -284,6 +284,102 @@ class TestAssetIdentityP0Gate(unittest.TestCase):
         self.assertEqual(engine.assignment_count, 1)
         self.assertLessEqual(book.premium_bank, book.cash + 1e-4)
 
+    def test_losing_spread_expiry_reclamps_premium_bank_to_reduced_cash(self):
+        """
+        Real-engine-path regression (Gemini second-opinion audit, 2026-08-27):
+        a losing V3 credit spread only adds to premium_bank when dollar_pnl > 0
+        (winning trades), but the cash debit for close_debit happens
+        unconditionally. A big enough loss against an already-built-up
+        premium_bank pushes it above the shrunk cash, the same invariant
+        violation class as the CSP-assignment bug above.
+        """
+        d0 = pd.Timestamp("2023-01-02")
+        dates = pd.bdate_range(d0, periods=2)
+        df = pd.DataFrame(
+            {"open": [100.0] * 2, "high": [100.0] * 2, "low": [100.0] * 2, "close": [100.0] * 2, "volume": [1000] * 2},
+            index=dates,
+        )
+        iv_series = pd.Series(0.25, index=dates)
+        regimes = pd.Series("neutral", index=dates)
+
+        engine = LeapEngine(starting_cash=6_000.0)
+        engine.book.premium_bank = 5_500.0
+        engine.book.reserved_collateral = 4_000.0
+        engine.book.active_spreads = [
+            ActiveSpread(
+                symbol="SPY",
+                spread_type="bull_put",
+                short_strike=99.0,
+                long_strike=95.0,
+                entry_date=dates[0] - pd.Timedelta(days=7),
+                exit_date=dates[0],
+                contracts=10,
+                credit_received=1.0,
+                max_loss=4.0,
+                close_debit=5.0,  # loss: cash moves -$5000, dollar_pnl = -$4000
+                realized_pnl=-4.0,
+                exit_reason="expiry",
+            )
+        ]
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+
+        self.assertEqual(len(book.active_spreads), 0)
+        self.assertLessEqual(book.premium_bank, book.cash + 1e-4)
+
+    def test_leap_roll_reclamps_premium_bank_to_reduced_cash(self):
+        """
+        Real-engine-path regression (Gemini second-opinion audit, 2026-08-27):
+        a DTE<90 LEAP_ROLL closes the old short call and buys a new 365-day
+        LEAP, both cash debits, without ever touching premium_bank. A large
+        enough roll cost against an already-built-up premium_bank pushes it
+        above the shrunk cash.
+        """
+        d0 = pd.Timestamp("2023-01-02")
+        dates = pd.bdate_range(d0, periods=2)
+        df = pd.DataFrame(
+            {"open": [100.0] * 2, "high": [100.0] * 2, "low": [100.0] * 2, "close": [100.0] * 2, "volume": [1000] * 2},
+            index=dates,
+        )
+        iv_series = pd.Series(0.60, index=dates)  # high IV -> expensive new LEAP, forces a big debit
+        regimes = pd.Series("neutral", index=dates)
+
+        engine = LeapEngine(starting_cash=18_000.0)
+        engine.book.premium_bank = 17_000.0
+        engine.book.legs["SPY"] = [
+            OptionLeg(
+                option_type="call",
+                strike=80.0,
+                expiry=dates[0] + pd.Timedelta(days=30),  # DTE < 90 -> roll fires
+                qty=1,
+                entry_price=25.0,
+                entry_date=dates[0] - pd.Timedelta(days=335),
+                role="leap",
+                symbol="SPY",
+            )
+        ]
+
+        def decide_fn(eng, d, px, iv, reg):
+            if d == dates[0]:
+                eng.pending_queue.append(
+                    PendingOrder(order_type="LEAP_ROLL", symbol="SPY", reason="dte_under_90_roll")
+                )
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=decide_fn,
+        )
+
+        self.assertGreaterEqual(engine.leap_roll_count, 1)
+        self.assertLessEqual(book.premium_bank, book.cash + 1e-4)
+
     def test_regression_injection_short_call_entry_missing_cash_credit(self):
         """
         Verify event-level continuity catches a short-option entry that creates
