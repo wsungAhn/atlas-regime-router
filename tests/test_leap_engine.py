@@ -1338,6 +1338,24 @@ class TestAdapterAndReporting(unittest.TestCase):
         self.assertEqual(engine.book.premium_bank, 0.0)
         self.assertGreater(engine.book.available_cash, 0.0)
 
+    def test_funding_sweep_skips_with_reason_when_execution_cash_is_short(self):
+        """A gap the sleeve can no longer afford logs leap_sweep_skip and rolls the bank forward."""
+        dates = pd.to_datetime(["2023-01-05", "2023-01-06", "2023-01-09"])
+        friday_cost = self._spy_sweep_cost(100.0)
+        bank = friday_cost + 1.0
+        regimes = pd.Series("bull", index=dates)
+
+        engine, book = self._run_v3_sweep_probe(bank, regimes, prices=[100.0, 100.0, 5_000.0])
+
+        self.assertGreater(self._spy_sweep_cost(5_000.0), 30_000.0)
+        self.assertEqual(engine.leap_sweep_count, 0)
+        skips = [r for r in book.realized if r["kind"] == "leap_sweep_skip"]
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["detail"]["reason"], "insufficient_execution_cash")
+        # Bank is rolled forward untouched: nothing was bought, so nothing is spent.
+        self.assertAlmostEqual(engine.book.premium_bank, bank, places=4)
+        self.assertAlmostEqual(engine.book.cash, 30_000.0, places=4)
+
     def test_v3_friday_funding_sweep(self):
         """Verify V3 Friday funding sweep buys SPY/QQQ LEAP using accumulated premium_bank."""
         dates = pd.bdate_range("2023-01-02", periods=10)

@@ -731,7 +731,11 @@ class LeapEngine:
                             "kind": "leap_sweep_skip",
                             "dollar_pnl": 0.0,
                             "detail": {
-                                "reason": "insufficient_execution_cash",
+                                "reason": (
+                                    "insufficient_execution_cash"
+                                    if cost_per_contract > available_cash
+                                    else "empty_premium_bank"
+                                ),
                                 "cost": cost_per_contract,
                                 "premium_bank": self.book.premium_bank,
                                 "available_cash": available_cash,
