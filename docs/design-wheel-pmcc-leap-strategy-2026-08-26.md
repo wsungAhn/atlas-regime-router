@@ -1,10 +1,10 @@
 # design-wheel-pmcc-leap-strategy
 
-**상태**: 설계 (검토 대기) — 이 문서는 **구현 승인 게이트**다. 이 문서 자체는
+**상태**: 설계 (검토 대기, 감사 착수 전) — 이 문서는 **구현 승인 게이트**다. 이 문서 자체는
 `src/signals.py`·launchd 설정·라이브 경로를 건드릴 권한을 주지 않는다 (Trading Safety).
 
 - 작성: 2026-08-26 PDT
-- 워크트리: `.claude/worktrees/agent-ad25809d59c0a2b00` (라이브 체크아웃과 분리)
+- 워크트리: `atlas-options-hackathon-worktrees/wheel-pmcc-leap` 브랜치 `wheel-pmcc-leap-strategy` (라이브 체크아웃과 분리)
 - 목적: **wheel + PMCC(LEAP 파이낸싱) 계열 전략 2~3종**을 이 레포의 유동성 ETF
   유니버스(SPY/QQQ/GLD/TLT/SLV/IWM)에 맞게 설계하고, 그걸 실제로 시뮬레이션할 수
   있는 **상태 유지형(stateful) 멀티레그 백테스트 엔진 확장**을 설계한다.
@@ -28,7 +28,7 @@
 | `src/backtest.py` (491줄) | `fetch_daily_bars`/`fetch_intraday_bars`(parquet 캐시), `_rolling_iv_series`, `_risk_pct_series`, `_metrics_from_dollar_trades`, `run_combined_portfolio*` | 데이터 fetch·IV·리포팅 **재사용**, 사이징(`scale_trades_to_dollars`)은 **재사용 불가** (§5.4 — 진입일순 1회 정산 모델이 지속 포지션과 안 맞음) |
 | `src/strategies.py` (254줄) | 10개 순수 신호함수, `StrategySignal(date, spread_type, level, weight)`. 전략7의 ADX/EMA 레짐판정 | 레짐 게이트(§3)로 **재사용** |
 | `src/portfolio.py` | `scale_trades_to_dollars` = 진입일순 복리 + min-heap 정산 + 킬스위치. **거래가 (진입일, 청산일, max_loss)로 완결된다는 가정** | LEAP 계열엔 부적합 (§5.4) — 자본 분할 방식으로 우회 |
-| `docs/design-multi-asset-backtest.md` | 슬리브 구조·환원 정합성 루브릭의 선례 | 문서 형식·검증 패턴 차용 |
+| `design-multi-asset-combined-backtest.md` | 슬리브 구조·환원 정합성 루브릭의 선례 | 문서 형식·검증 패턴 차용 |
 
 ### ② 레포 밖 선행작업
 
@@ -39,7 +39,7 @@
 | Cboe BXM/PUT 인덱스 방법론 | cdn.cboe.com (BXM_Methodology.pdf, PutWrite Methodology) | 공개 방법론 문서 | 현행(공식) | **관례 채택**: 커버드콜/풋라이트의 표준 벤치마크 롤 규칙 — ATM 매도·만기 보유·만기일 재롤. 숏 레그 "만기까지 보유 + 현금정산" 모델의 근거 |
 | AQR "PutWrite vs BuyWrite" | aqr.com 백서 | 학술 백서 | 2017~ | 참고 — 풋라이트와 커버드콜의 등가성(풋콜 패리티). wheel의 CSP 국면과 CC 국면을 같은 엔진 코드로 다뤄도 됨을 뒷받침 |
 | optopsy | github.com/goldspanlabs/optopsy (구 michaelchu) | **GPL-3.0** | 2024~25 활동 | **불채택** — GPL-3(이 레포에 코드 유입 불가), 그리고 실제 옵션체인 이력 데이터를 전제로 한다. 이 레포는 BS 근사 노선(§backtest.py 독스트링에 명시된 기존 결정)이라 데이터 전제부터 안 맞음. 델타타깃 행사가 선택·수명주기 이벤트 개념만 참고 |
-| QuantConnect LEAN wheel 구현 | quantconnect.com 포럼/LEAN | Apache-2.0 | 현행 | **불채택** — 프레임워크 통째 도입은 기존 검증자산(vendor 엔진·사이저·리포터) 폐기와 같다 (multi-asset 설계의 vectorbt 불채택과 동일 논리). 배정(assignment) 이벤트 처리 순서(만기 → 배정 → 주식 전환 → CC 국면 전환)만 참고 |
+| QuantConnect LEAN wheel 구현 | quantconnect.com 포럼/LEAN | Apache-2.0 | 현행 | **불채택** — 프레임워크 통째 도입은 기존 검증자산(vendor 엔진·사이저·리포터) 폐기와 같다 (`design-multi-asset-combined-backtest.md`의 vectorbt 불채택과 동일 논리). 배정(assignment) 이벤트 처리 순서(만기 → 배정 → 주식 전환 → CC 국면 전환)만 참고 |
 | AlphaBot / trader | `~/dev/Auto_bot`, `~/dev/trader` | 사내 | — | 확인 — 양쪽 다 LEAP/PMCC/wheel 시뮬 없음 (AlphaBot R1-B는 이 레포 vendor의 원본, 동일 단일거래 모델) |
 
 ### ③ 결론
@@ -68,7 +68,7 @@ wheel + PMCC(LEAP 파이낸싱) 계열은 구조가 다르다:
 1. 주간 숏 프리미엄이 LEAP 보유비용을 실제로 얼마나 상쇄하나? (PMCC의 존재 이유 검증)
 2. 프리미엄을 현금으로 쌓는 것 vs LEAP에 재투자하는 것 — 3년 복리에서 어느 쪽이 이기나?
 3. **대회 7일 채점창** 안에서 이 계열이 실현 P&L을 얼마나 내나? (LEAP 자체는 창 안에서
-   미실현 — 숏 레그 주간 사이클만 실현된다. multi-asset 설계 §7의 지적과 동일한 함정)
+   미실현 — 숏 레그 주간 사이클만 실현된다. `design-multi-asset-combined-backtest.md §7`의 지적과 동일한 함정)
 
 ### 성공 기준 (Acceptance Rubric — 구현 착수 **전** 고정)
 
@@ -275,7 +275,7 @@ for d in trading_days:                        # 종목별 Book 각각
 - **배정은 만기 시점만** (유럽형 근사). 미국식 조기배정(배당락 전 딥 ITM 콜)은
   모델링하지 않는다 — BS 자체가 유럽형이고, 조기배정은 보유자에게 대체로 유리
   (시간가치 포기를 받는 쪽)라 이 근사는 보수적이거나 중립이다. 리포트에 명시.
-- 같은 날 PT·SL 동시 도달 시 **SL 우선** (multi-asset 설계 §4.2와 동일한 보수 규칙).
+- 같은 날 PT·SL 동시 도달 시 **SL 우선** (`design-multi-asset-combined-backtest.md §4.2`와 동일한 보수 규칙).
 - 갭·슬리피지·수수료 미반영 — 기존 크레딧 스프레드 백테스트와 동일 수준의 근사
   (`credit_haircut_pct` 5%는 숏 레그 진입 크레딧에 동일 적용해 비교 가능성 유지).
 
