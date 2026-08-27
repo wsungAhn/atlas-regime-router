@@ -1356,6 +1356,45 @@ class TestAdapterAndReporting(unittest.TestCase):
         self.assertAlmostEqual(engine.book.premium_bank, bank, places=4)
         self.assertAlmostEqual(engine.book.cash, 30_000.0, places=4)
 
+    def test_funding_sweep_skip_reason_distinguishes_empty_bank(self):
+        """A queued sweep that reaches execution with an empty bank says so, not 'short cash'."""
+        dates = pd.to_datetime(["2023-01-05", "2023-01-06"])
+        prices = [100.0, 100.0]
+        df = pd.DataFrame(
+            {"open": prices, "high": prices, "low": prices, "close": prices, "volume": [1000] * 2},
+            index=dates,
+        )
+        iv_series = pd.Series(0.20, index=dates)
+        regimes = pd.Series("bull", index=dates)
+
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.premium_bank = 0.0  # bank spent elsewhere before this order executes
+        engine.pending_queue.append(
+            PendingOrder(
+                order_type="LEAP_BUY",
+                symbol="SPY",
+                target_delta=0.70,
+                target_dte=365,
+                qty=1,
+                role="leap",
+                is_sweep=True,
+                estimated_debit=self._spy_sweep_cost(100.0),
+            )
+        )
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+
+        skips = [r for r in book.realized if r["kind"] == "leap_sweep_skip"]
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["detail"]["reason"], "empty_premium_bank")
+        self.assertLess(skips[0]["detail"]["cost"], skips[0]["detail"]["available_cash"])
+        self.assertEqual(engine.leap_sweep_count, 0)
+
     def test_v3_friday_funding_sweep(self):
         """Verify V3 Friday funding sweep buys SPY/QQQ LEAP using accumulated premium_bank."""
         dates = pd.bdate_range("2023-01-02", periods=10)
