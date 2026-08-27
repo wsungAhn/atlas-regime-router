@@ -166,43 +166,58 @@ class TestAssetIdentityP0Gate(unittest.TestCase):
         for dt, eq in book.equity_curve.items():
             self.assertGreater(eq, 20_000.0)
 
-    def test_regression_injection_short_entry_missing_cash(self):
+    def test_regression_injection_assignment_missing_cash_debit(self):
         """
-        Verify that if an engine bug fails to credit cash on short option sale,
-        the asset identity check strictly fails immediately (§5.2.1).
+        Verify that a real engine-path accounting bug fails during run_simulation.
+        Regression injected: CSP assignment adds shares but forgets cash -= strike*100*q.
         """
-        book = SleeveBook(cash=30_000.0)
-        d = pd.Timestamp("2023-01-02")
-        S = 100.0
-        iv = 0.25
-        r = 0.045
-
-        # Sell short call at $3.00, but BUG: forgot `book.cash += 300.0`
-        leg = OptionLeg(
-            option_type="call",
-            strike=105.0,
-            expiry=d + pd.Timedelta(days=7),
-            qty=-1,
-            entry_price=3.0,
-            entry_date=d,
-            role="short_call",
-            symbol="SPY",
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df = pd.DataFrame(
+            {"open": [90.0] * 3, "high": [90.0] * 3, "low": [90.0] * 3, "close": [90.0] * 3, "volume": [1000] * 3},
+            index=dates,
         )
-        book.legs["SPY"] = [leg]
+        iv_series = pd.Series(0.25, index=dates)
+        regimes = pd.Series("neutral", index=dates)
 
-        # Actual MTM calculation:
-        t_rem = 7.0 / 365.0
-        short_mtm = -black_scholes_price(S, 105.0, t_rem, r, iv, "call") * 100.0
-        reported_equity = 30_000.0  # If someone recorded equity as 30,000 without realizing cash wasn't credited
+        class BuggyAssignmentEngine(LeapEngine):
+            def _step_expiry(self, d, current_prices, current_ivs):
+                before_equity = self._calculate_equity(d, current_prices, current_ivs)
+                remaining = []
+                for leg in self.book.legs.get("SPY", []):
+                    if d >= leg.expiry and leg.role == "csp":
+                        q = abs(leg.qty)
+                        self.book.reserved_collateral -= leg.collateral_reserved
+                        # BUG: missing `self.book.cash -= leg.strike * 100.0 * q`
+                        self.book.shares["SPY"] = self.book.shares.get("SPY", 0) + 100 * q
+                        self.book.share_cost_basis["SPY"] = leg.strike - leg.entry_price
+                    else:
+                        remaining.append(leg)
+                self.book.legs["SPY"] = remaining
+                self._assert_equity_continuity(before_equity, d, current_prices, current_ivs, "buggy_assignment")
 
-        # Asset identity MUST fail because reported_equity != book.cash + short_mtm
+        engine = BuggyAssignmentEngine(starting_cash=30_000.0)
+        engine.book.cash = 30_100.0
+        engine.book.reserved_collateral = 10_000.0
+        engine.book.legs["SPY"] = [
+            OptionLeg(
+                option_type="put",
+                strike=100.0,
+                expiry=dates[0],
+                qty=-1,
+                entry_price=1.0,
+                entry_date=dates[0] - pd.Timedelta(days=7),
+                role="csp",
+                symbol="SPY",
+                collateral_reserved=10_000.0,
+            )
+        ]
+
         with self.assertRaises(AssertionError):
-            book.assert_invariants(
-                equity=reported_equity,
-                current_prices={"SPY": S},
-                iv_by_symbol={"SPY": iv},
-                current_date=d,
-                r=r,
+            engine.run_simulation(
+                bars_by_symbol={"SPY": df},
+                iv_by_symbol={"SPY": iv_series},
+                regime_by_symbol={"SPY": regimes},
+                decide_fn=lambda eng, d, px, iv, reg: None,
             )
 
     def test_regression_injection_bank_exceeds_cash(self):
@@ -290,6 +305,29 @@ class TestInvariantsAndTiming(unittest.TestCase):
         self.assertEqual(len(close_events), 1)
         self.assertEqual(pd.Timestamp(close_events[0]["exit_date"]), dates[3])
 
+    def test_iv_coverage_gap_skips_day_without_future_fallback(self):
+        """Missing IV on a trading day must skip that day instead of using the series tail."""
+        dates = pd.bdate_range("2023-01-02", periods=4)
+        df = pd.DataFrame(
+            {"open": [100.0] * 4, "high": [101.0] * 4, "low": [99.0] * 4, "close": [100.0] * 4, "volume": [1000] * 4},
+            index=dates,
+        )
+        iv_series = pd.Series([0.20, 0.20, 0.99], index=[dates[0], dates[2], dates[3]])
+        regimes = pd.Series("neutral", index=dates)
+
+        engine = LeapEngine(starting_cash=30_000.0)
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+
+        self.assertNotIn(dates[1], book.equity_curve)
+        skip_events = [r for r in book.realized if r["kind"] == "iv_coverage_skip"]
+        self.assertEqual(len(skip_events), 1)
+        self.assertEqual(pd.Timestamp(skip_events[0]["exit_date"]), dates[1])
+
 
 class TestV1PMCCMechanics(unittest.TestCase):
     """Test V1 PMCC Classic details (§2.1)."""
@@ -344,7 +382,7 @@ class TestV1PMCCMechanics(unittest.TestCase):
         """Verify ITM short call expiry cash settles intrinsic value while preserving the LEAP (§2.1)."""
         dates = pd.bdate_range("2023-01-02", periods=10)
         # Price starts at 104, rises steadily so PT is never hit, reaching 110 at expiry
-        prices = [104.0, 105.0, 106.0, 107.0, 108.0, 109.0, 110.0, 110.0, 110.0, 110.0]
+        prices = [105.0, 106.0, 107.0, 108.0, 109.0, 109.5, 110.0, 110.0, 110.0, 110.0]
         df = pd.DataFrame(
             {"open": prices, "high": prices, "low": prices, "close": prices, "volume": [1000] * 10},
             index=dates,
@@ -368,13 +406,13 @@ class TestV1PMCCMechanics(unittest.TestCase):
             strike=105.0,
             expiry=dates[6],
             qty=-1,
-            entry_price=1.50,
+            entry_price=2.50,
             entry_date=dates[0],
             role="short_call",
             symbol="SPY",
         )
         engine.book.legs["SPY"] = [leap, short_call]
-        engine.book.cash = 27_950.0
+        engine.book.cash = 27_650.0
 
         def dummy_decide(eng, d, px, iv, reg):
             pass
@@ -395,8 +433,39 @@ class TestV1PMCCMechanics(unittest.TestCase):
 
         settle_events = [r for r in book.realized if r.get("detail", {}).get("reason") == "expiry_itm_cash_settle"]
         self.assertEqual(len(settle_events), 1)
-        # Realized dollar pnl: (1.50 - 5.00) * 100 = -$350.00
-        self.assertAlmostEqual(settle_events[0]["dollar_pnl"], -350.0)
+        # Realized dollar pnl: (2.50 - 5.00) * 100 = -$250.00
+        self.assertAlmostEqual(settle_events[0]["dollar_pnl"], -250.0)
+
+    def test_v1_short_call_stop_loss_at_2x_entry(self):
+        """Verify V1 PMCC short calls use the 2.0x stop-loss rule before expiry (§2.1)."""
+        dates = pd.bdate_range("2023-01-02", periods=5)
+        # Day 0 keeps the short call ~ATM (MTM 0.90 vs 0.80 entry: no PT at 0.40, no SL at 1.60),
+        # so the 2.0x stop is the first exit rule that can fire, on the day-1 gap to 130.
+        prices = [105.0, 130.0, 130.0, 130.0, 130.0]
+        df = pd.DataFrame(
+            {"open": prices, "high": prices, "low": prices, "close": prices, "volume": [1000] * 5},
+            index=dates,
+        )
+        iv_series = pd.Series(0.20, index=dates)
+        regimes = pd.Series("bull", index=dates)
+
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.legs["SPY"] = [
+            OptionLeg("call", 80.0, dates[0] + pd.Timedelta(days=365), 1, 25.0, dates[0], "leap", "SPY"),
+            OptionLeg("call", 105.0, dates[4], -1, 0.80, dates[0], "short_call", "SPY"),
+        ]
+        engine.book.cash = 27_550.0
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+
+        stop_events = [r for r in book.realized if r.get("detail", {}).get("exit_reason") == "stop_loss"]
+        self.assertEqual(len(stop_events), 1)
+        self.assertEqual([leg.role for leg in book.legs["SPY"]], ["leap"])
 
 
 class TestV2WheelMechanics(unittest.TestCase):
@@ -460,6 +529,25 @@ class TestV2WheelMechanics(unittest.TestCase):
         self.assertEqual(engine.stock_stop_count, 1)
         self.assertEqual(book.shares.get("SLV", 0), 0)
 
+    def test_v2_csp_and_covered_call_are_not_profit_target_closed(self):
+        """V2 wheel option legs are held to expiry; PT is a V1 short-call rule, not a wheel rule."""
+        d = pd.Timestamp("2023-01-02")
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.cash = 30_500.0
+        engine.book.reserved_collateral = 2_000.0
+        engine.book.shares["SLV"] = 100
+        engine.book.share_cost_basis["SLV"] = 20.0
+        engine.book.legs["SLV"] = [
+            OptionLeg("put", 20.0, d + pd.Timedelta(days=7), -1, 5.0, d, "csp", "SLV", collateral_reserved=2_000.0),
+            OptionLeg("call", 25.0, d + pd.Timedelta(days=7), -1, 5.0, d, "covered_call", "SLV"),
+        ]
+
+        engine._step_trigger(d, {"SLV": 22.0}, {"SLV": 0.20})
+
+        self.assertEqual([leg.role for leg in engine.book.legs["SLV"]], ["csp", "covered_call"])
+        self.assertEqual(engine.book.reserved_collateral, 2_000.0)
+        self.assertEqual(engine.book.realized, [])
+
 
 class TestV3SpreadFinancingAndSignature(unittest.TestCase):
     """Test V3 Strategy 7 Credit Spread Financing (§2.3) and Signature Verification."""
@@ -522,6 +610,8 @@ class TestV3SpreadFinancingAndSignature(unittest.TestCase):
 
         self.assertGreater(report.metrics.n_trades, 0)
         self.assertGreater(report.metrics.total_pnl, 0.0)
+        first_short_cycle = next(r for r in report.realized_events if r["kind"] == "short_cycle")
+        self.assertEqual(pd.Timestamp(first_short_cycle["entry_date"]), dates[1])
         # Invariant checks were executed at every step
         self.assertEqual(len(report.equity_series), len(dates))
 
