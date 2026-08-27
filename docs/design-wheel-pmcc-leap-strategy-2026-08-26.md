@@ -1,9 +1,14 @@
 # design-wheel-pmcc-leap-strategy
 
-<!-- lint:doc-meta round=2 -->
+<!-- lint:doc-meta round=3 -->
 
-**상태**: 설계 (감사 2라운드 반영 완료, 재감사 대기) — 이 문서는 **구현 승인 게이트**다. 이 문서 자체는
+**상태**: 설계 (감사 3라운드 CLEAN — 단 3라운드는 대체 감사자) — 이 문서는 **구현 승인 게이트**다. 이 문서 자체는
 `src/signals.py`·launchd 설정·라이브 경로를 건드릴 권한을 주지 않는다 (Trading Safety).
+
+> **Codex 핸드오프 전 필수**: 3라운드 CLEAN은 대체 감사자(Gemini — Codex 쿼터 소진)
+> 판정이라 이 레포의 Tier 2+ 필수 Codex 감사 요건을 단독으로 충족하지 못한다.
+> 구현 핸드오프 전에 실제 `codex exec` 감사 1라운드를 반드시 재실행할 것
+> (쿼터 리셋 ~2026-08-27 01:09 PDT).
 
 - 작성: 2026-08-26 PDT
 - 워크트리: `atlas-options-hackathon-worktrees/wheel-pmcc-leap` 브랜치 `wheel-pmcc-leap-strategy` (라이브 체크아웃과 분리)
@@ -115,10 +120,10 @@ wheel + PMCC(LEAP 파이낸싱) 계열은 구조가 다르다:
 
 | 항목 | 규칙 |
 |---|---|
-| 대상 | SPY, QQQ (bull 레짐인 종목만; 둘 다 bull이면 둘 다, 각각 독립 북) |
+| 대상 | SPY, QQQ (bull 레짐인 종목만; 둘 다 bull이면 둘 다 — 레그 관리는 종목별 독립, 현금은 슬리브 공유 §5.2) |
 | LEAP 진입 | 레짐이 bull로 **전환된 다음 거래일**, delta 0.80 콜 (`strike_for_delta`), DTE 365 |
 | LEAP 사이징 | 계약당 비용 ≤ 슬리브 자본의 40% → 계약수 = `floor(0.4 * sleeve_equity / (leap_cost*100))`, 최소 1계약이 안 되면 그 종목 스킵(로그) |
-| 숏 콜 진입 | LEAP 보유 중 + 숏 레그 없음 → delta 0.20 콜 매도, DTE 7, 수량 = LEAP 계약수. **단 숏 행사가 > LEAP 행사가 + 순비용**(tastytrade 75% 규칙의 취지: 콜어웨이 시나리오에서도 손실이 안 나는 행사가만) — 조건 불충족 시 그 주는 매도 스킵(로그) |
+| 숏 콜 진입 | LEAP 보유 중 + 숏 레그 없음 → delta 0.20 콜 매도, DTE 7, 수량 = LEAP 계약수. **단 숏 행사가 > LEAP 행사가 + 순비용**(tastytrade 75% 규칙의 취지: 콜어웨이 시나리오에서도 손실이 안 나는 행사가만). **순비용의 정의는 동적** (감사 3R P2-2): `net_cost = LEAP 진입비용(1주당) − 그 LEAP 위에서 걷은 숏콜 실현 크레딧 누계(1주당)` — LEAP 진입 시점에 고정되는 값이 아니라 주간 프리미엄이 쌓일수록 감소한다. 따라서 LEAP 수명 초기(누적 크레딧이 적을 때)엔 이 조건 미충족으로 연속 매도 스킵이 여러 주 이어질 수 있고, **그건 버그가 아니라 기대 동작**이다(로그로 추적). 조건 불충족 시 그 주는 매도 스킵(로그) |
 | 숏 콜 청산 | ① 프리미엄 50% 익절 ② 프리미엄 2.0x 손절(기존 전략과 동일 상수) ③ 만기 도달 — ITM이면 **현금정산**(내재가치 지불; LEAP는 그대로 보유). **주의: 이건 ETF 옵션 현실(실물배정·숏스탁 발생·LEAP 언와인드)이 아니라 명시적 단순화 가정이다** — §5.3의 "V1 정산 근사" 참조. V1 결과는 이 근사 하의 낙관 편향 상한으로 읽는다 |
 | 숏 콜 재진입 | 청산 다음 거래일 (연속 롤) |
 | LEAP 롤 | DTE < 90 → 청산 후 같은 규칙으로 재진입 (BCI 90일 규칙). 이때 실현 P&L 발생 |
@@ -280,23 +285,34 @@ class OptionLeg:
     role: str               # "leap" | "short_call" | "csp" | "covered_call"
 
 @dataclass
-class Book:                 # 종목당 1개
-    symbol: str
-    cash: float             # 이 북에 배정된 현금 (담보 예치 포함)
-    shares: int             # wheel 배정 주식 (V2만 사용)
-    share_cost_basis: float
-    legs: list[OptionLeg]
-    premium_bank: float     # funding 스윕 대기 프리미엄 (V2/V3)
-    realized: list[dict]    # 실현 이벤트 로그 (아래 스키마)
-    equity_curve: dict[pd.Timestamp, float]  # 매일 MTM
+class SleeveBook:           # 슬리브당 1개 — 돈은 슬리브 수준에서 공유 (감사 3R P2-1)
+    cash: float             # 슬리브 유일의 현금 (담보 예치 포함, §5.2.1 원칙 1)
+    premium_bank: float     # funding 스윕 대기 프리미엄 (V2/V3) — cash의 하위 원장
+    reserved_collateral: float  # §5.2.1 원칙 4
+    legs: dict[str, list[OptionLeg]]   # symbol → 레그 목록
+    shares: dict[str, int]             # symbol → wheel 배정 주식 (V2만 사용)
+    share_cost_basis: dict[str, float] # symbol → 배정단가
+    realized: list[dict]    # 실현 이벤트 로그 (아래 스키마 — symbol 필드 포함)
+    equity_curve: dict[pd.Timestamp, float]  # 매일 슬리브 전체 MTM
 
 # 실현 이벤트 스키마 — 기존 리포팅과의 접점
 # {entry_date, exit_date, symbol, kind: "short_cycle"|"leap_roll"|"leap_close"|
 #  "assignment"|"called_away"|"share_stop", dollar_pnl: float, detail: {...}}
 ```
 
+**북은 슬리브당 1개, 종목당이 아니다 (감사 3R P2-1 반영)**: 이전 판의
+`Book(symbol, cash, ...)` per-symbol 모델은 틀렸다 — V2(SLV/TLT wheel → SPY LEAP
+스윕)와 V3(SPY/QQQ/IWM 스프레드 → SPY/QQQ LEAP 스윕)은 숏 레그가 번 프리미엄이
+**다른 종목**의 LEAP 매수로 흐르고, V1도 "슬리브 합산 80% 상한"·"남는
+`available_cash`로 TLT" 같은 규칙이 전부 슬리브 공유 현금을 전제한다. 종목별
+독립 지갑으로 구현하면 이 흐름이 전부 끊긴다. 따라서 `cash`/`premium_bank`/
+`reserved_collateral`/`available_cash`는 슬리브 수준 단일 값이고, 종목별로 갈리는
+것은 `legs`/`shares`/`share_cost_basis` **뿐**이다. Codex 구현 시 per-symbol
+지갑을 만들지 말 것. (§2.1의 "각각 독립 북"은 레그 관리가 종목별 독립이라는
+뜻으로 정정 — 현금은 공유.)
+
 `dollar_pnl`이 **이미 달러**라는 게 기존 raw trade dict와의 결정적 차이다 —
-사이징이 엔진 안(북의 현금)에서 일어나므로 사후 스케일링이 없다 (§5.4).
+사이징이 엔진 안(슬리브 북의 현금)에서 일어나므로 사후 스케일링이 없다 (§5.4).
 
 ### 5.2.1 회계 모델 (감사 1R #1 반영 — 현금 흐름 시점의 완전 명세)
 
@@ -358,6 +374,12 @@ class Book:                 # 종목당 1개
 bank를 깎지 않는다 — bank는 "스윕 자격 판정용 누계"이지 손익계산서가 아니다.
 손실은 cash에 이미 반영돼 있고, `premium_bank ≤ cash` 클램프가 과대적립을 막는다).
 
+**스윕 체결 시 바닥 클램프 (감사 3R P3-1)**: 스윕 사이징은 DECIDE일 종가 기준인데
+체결은 다음 거래일 종가라(§5.3) 갭 상승 시 `actual_cost > 판단일 cost`가 될 수
+있다. 체결 시 `premium_bank = max(0.0, premium_bank − actual_cost)`로 차감해
+bank 음수 진입을 막는다 (cash는 실제 지출 그대로 차감 — 항등식 불변, 바닥은
+하위 원장인 bank에만 적용).
+
 ### 5.3 이벤트 루프
 
 일자(daily bar)가 바깥 루프. 하루 안의 처리 순서를 고정한다 (순서가 결과를 바꾸므로
@@ -384,7 +406,7 @@ bank를 깎지 않는다 — bank는 "스윕 자격 판정용 누계"이지 손�
   대비 체결일 슬리피지를 로그로 남긴다.
 
 ```
-for d in trading_days:                        # 종목별 Book 각각
+for d in trading_days:                        # SleeveBook 1개, 종목은 내부 순회 (§5.2)
     1. EXECUTE  — 전일 종가 기준으로 pending에 쌓인 주문을 오늘 종가로 체결:
                   LEAP 신규/롤 재진입, 숏 레그 매도, CSP/CC 진입, funding 스윕 매수
                   (체결가는 오늘 종가 기준 BS — 판단일 정보만 쓰고 체결일 가격을 씀)
@@ -451,7 +473,7 @@ for d in trading_days:                        # 종목별 Book 각각
 # src/leap_backtest.py (신규, 오케스트레이터 — backtest.py는 수정하지 않음)
 def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
     # 1. fetch_daily_bars / _rolling_iv_series / 레짐 시리즈 (전부 기존 함수 임포트)
-    # 2. Book 초기화 (슬리브 자본 $30k를 변형별 규칙대로 종목 북에 분배)
+    # 2. SleeveBook 초기화 (슬리브 자본 $30k 단일 cash — 종목별 분배 없음, §5.2)
     # 3. leap_engine.run(books, bars, iv, regime, variant_rules)
     # 4. realized 이벤트 → 경량 어댑터(dollar_pnl 속성만 있는 namedtuple)로 감싸
     #    _metrics_from_dollar_trades(...) 재사용 → StrategyResult
@@ -597,6 +619,23 @@ Tier 2+ (신규 모듈·설계문서 존재) → **Codex 핸드오프 대상** (
 | 3 (P2) | V3의 `run_portfolio_simulation(전략7 신호, ...)` 호출 명세가 실제 시그니처(`candidate_signal_dates`+단일 `spread_type`)와 불일치, iron_condor 분해는 backtest 헬퍼 소관 | **수용** | `credit_spread_simulator.py:360-374`·`backtest.py:312-344` 확인 — iron_condor→bull_put/bear_call 분해와 그룹핑은 `_generate_raw_trades`(backtest.py:333)가 한다. §2.3 스텝 1을 `backtest._generate_raw_trades("7_atlas_mvp", df, mtm_iv, risk_pct_series)` 재사용으로 확정 (private 헬퍼지만 임포트만, backtest.py 수정 0줄 유지), §5.1의 서술도 정정 |
 | 4 (P2) | V3 고정 5% 사이징·킬스위치 미사용은 전략7(risk_pct 2~10% volatility-scaled + 킬스위치)과 다른 전략 — "기존 챔피언의 자연 확장" 서사 과장 | **수용** | `backtest.py:342`·`one-page-submission.md:22` 확인. §2.3에 명시: V3은 signal/exit만 재사용, sizing·risk gates는 이 슬리브의 새 선택 — "관련되지만 별개인 실험"이며 리포트에 이 분리를 표기하도록 요구 |
 | 5 (P2) | 1R에서 추가된 Limitations/가정 항목들에 `결론무효화` 판정 라벨 부재 | **수용** | 각 항목에 자체 판정으로 라벨 부여 (감사 제안 라벨은 참고만, 전부 재판단): IV 근사(§4)=**아니오**(상대비교+딥 ITM 한정), V1 현금정산(§5.3)=**부분**(절대 수치 무효·상한 판정 유효), 조기배정 제외(§5.3)=**아니오**(방향 기지·상한에 포섭), V2 스윕 저빈도(§2.2)=**부분**(재투자 가설 무효·통제군 유지), 슬리브 경합 제외(§5.4)=**아니오**(슬리브 내부 비교 무영향), 대회 적합 조건부(§7)=**부분**(제출 결론만 무효) — 감사 제안과 결과적으로 일치하나 §5.4를 명시 추가 판정 |
+
+### 3라운드 (2026-08-26, Gemini/Antigravity — `degraded_substitution: codex_unavailable→gemini`, 판정: CLEAN — P0 0건, P1 0건)
+
+실 Codex CLI가 쿼터 소진(리셋 ~2026-08-27 01:09 PDT)이라 랩 머신의 Gemini/
+Antigravity로 대체 수행 — 문서 전문 + 인용 코드 발췌를 인라인으로 넘긴 자체완결
+리뷰(감사자 측 라이브 파일시스템 접근 없음). **이 CLEAN은 대체 감사자 판정이므로
+Tier 2+ 필수 Codex 감사 요건을 단독으로 충족하지 못한다 — Codex 구현 핸드오프 전
+실제 `codex exec` 감사 1라운드 재실행 필수** (문서 상단 경고 참조).
+
+부수 지적 P2 2건·P3 2건 — 전부 수용·반영:
+
+| # | 지적 요지 | 판정 | 근거·반영 |
+|---|---|---|---|
+| 1 (P2) | §5.2 `Book`이 per-symbol인데 V2/V3(과 V1의 슬리브 합산 규칙)은 슬리브 공유 cash/bank를 전제 — 종목별 독립 지갑으로 오구현될 위험 | **수용** | 사실 — 스윕은 다른 종목으로 돈이 흐른다. §5.2를 `SleeveBook`(슬리브 단일 cash/premium_bank/reserved_collateral + 종목별 legs/shares dict)으로 재정의, §2.1·§5.3·§5.5의 per-symbol 북 서술 정정 |
+| 2 (P2) | V1 "숏 행사가 > LEAP 행사가 + 순비용"의 순비용이 정적 값으로 오독 가능 | **수용** | §2.1에 동적 정의 명기: `net_cost = LEAP 진입비용 − 숏콜 실현 크레딧 누계` (수명 따라 감소), 초기 연속 매도 스킵은 기대 동작임을 명시 |
+| 3 (P3) | 스윕 체결일 갭 상승 시 premium_bank 음수 가능 | **수용** | §5.2.1에 바닥 클램프 명기: `premium_bank = max(0.0, premium_bank − actual_cost)` (cash는 실지출 차감 — 항등식 불변) |
+| 4 (P3) | doc-meta round=2 미갱신 | **수용** | round=3으로 갱신 |
 
 ---
 
