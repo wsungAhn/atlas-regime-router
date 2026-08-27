@@ -33,6 +33,7 @@ from leap_engine import (
     PendingOrder,
     SleeveBook,
     StrategyResult,
+    _build_report,
     black_scholes_delta,
     black_scholes_price,
     calculate_adx_ema_regime,
@@ -361,8 +362,8 @@ class TestInvariantsAndTiming(unittest.TestCase):
         self.assertEqual(len(close_events), 1)
         self.assertEqual(pd.Timestamp(close_events[0]["exit_date"]), dates[3])
 
-    def test_iv_coverage_gap_skips_day_without_future_fallback(self):
-        """Missing IV on a trading day must skip that day instead of using the series tail."""
+    def test_iv_coverage_gap_records_equity_without_future_fallback(self):
+        """Missing IV uses prior IV for MTM and never pulls a future IV tail value."""
         dates = pd.bdate_range("2023-01-02", periods=4)
         df = pd.DataFrame(
             {"open": [100.0] * 4, "high": [101.0] * 4, "low": [99.0] * 4, "close": [100.0] * 4, "volume": [1000] * 4},
@@ -372,6 +373,11 @@ class TestInvariantsAndTiming(unittest.TestCase):
         regimes = pd.Series("neutral", index=dates)
 
         engine = LeapEngine(starting_cash=30_000.0)
+        entry_price = black_scholes_price(100.0, 90.0, 365.0 / 365.0, engine.r, 0.20, "call")
+        engine.book.cash -= entry_price * 100.0
+        engine.book.legs["SPY"] = [
+            OptionLeg("call", 90.0, dates[0] + pd.Timedelta(days=365), 1, entry_price, dates[0], "leap", "SPY")
+        ]
         book = engine.run_simulation(
             bars_by_symbol={"SPY": df},
             iv_by_symbol={"SPY": iv_series},
@@ -379,7 +385,11 @@ class TestInvariantsAndTiming(unittest.TestCase):
             decide_fn=lambda eng, d, px, iv, reg: None,
         )
 
-        self.assertNotIn(dates[1], book.equity_curve)
+        self.assertIn(dates[1], book.equity_curve)
+        expected_gap_equity = engine.book.cash + black_scholes_price(100.0, 90.0, 364.0 / 365.0, engine.r, 0.20, "call") * 100.0
+        future_tail_equity = engine.book.cash + black_scholes_price(100.0, 90.0, 364.0 / 365.0, engine.r, 0.99, "call") * 100.0
+        self.assertAlmostEqual(book.equity_curve[dates[1]], expected_gap_equity, places=4)
+        self.assertNotAlmostEqual(book.equity_curve[dates[1]], future_tail_equity, places=2)
         skip_events = [r for r in book.realized if r["kind"] == "iv_coverage_skip"]
         self.assertEqual(len(skip_events), 1)
         self.assertEqual(pd.Timestamp(skip_events[0]["exit_date"]), dates[1])
@@ -412,6 +422,36 @@ class TestInvariantsAndTiming(unittest.TestCase):
         self.assertEqual(short_events[0]["detail"]["reason"], "expiry_otm")
         self.assertEqual(short_events[0]["detail"]["close_price"], 90.0)
         self.assertEqual(engine.book.cash, 30_100.0)
+        self.assertIn(dates[0], book.equity_curve)
+
+    def test_final_iv_gap_assignment_updates_report_final_equity(self):
+        """An expiry event on a final IV gap day must still drive equity metrics."""
+        dates = pd.bdate_range("2023-01-02", periods=2)
+        df = pd.DataFrame(
+            {"open": [105.0, 90.0], "high": [105.0, 90.0], "low": [105.0, 90.0], "close": [105.0, 90.0], "volume": [1000, 1000]},
+            index=dates,
+        )
+        iv_series = pd.Series([0.20], index=[dates[0]])
+        regimes = pd.Series("neutral", index=dates)
+
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.cash = 30_100.0
+        engine.book.reserved_collateral = 10_000.0
+        engine.book.legs["SPY"] = [
+            OptionLeg("put", 100.0, dates[1], -1, 1.0, dates[0] - pd.Timedelta(days=7), "csp", "SPY", collateral_reserved=10_000.0)
+        ]
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: None,
+        )
+        report = _build_report("probe", book, engine)
+
+        self.assertIn(dates[1], book.equity_curve)
+        self.assertEqual(book.shares["SPY"], 100)
+        self.assertAlmostEqual(report.metrics.final_equity, 29_100.0)
 
 
 class TestV1PMCCMechanics(unittest.TestCase):
@@ -643,11 +683,14 @@ class TestV3SpreadFinancingAndSignature(unittest.TestCase):
         and Friday funding sweep into LEAPs.
         """
         dates = pd.bdate_range("2023-01-02", periods=30)
-        df_spy = create_synthetic_bars(start_date="2023-01-02", n_days=30, start_price=400.0, seed=42)
+        df_spy = pd.DataFrame(
+            {"open": [400.0] * 30, "high": [400.0] * 30, "low": [400.0] * 30, "close": [400.0] * 30, "volume": [1000] * 30},
+            index=dates,
+        )
         iv_series = pd.Series(0.20, index=dates)
         regimes = pd.Series("bull", index=dates)
 
-        # Mock Strategy 7 raw trades
+        # Mock the structures produced after _generate_raw_trades splits iron_condor signals.
         raw_trades = [
             {
                 "signal_date": str(dates[0].date()),
@@ -659,11 +702,11 @@ class TestV3SpreadFinancingAndSignature(unittest.TestCase):
                 "short_strike": 395.0,
                 "long_strike": 390.0,
                 "width": 5.0,
-                "credit_received": 1.50,
-                "max_loss": 3.50,
-                "breakeven": 393.50,
+                "credit_received": 1.00,
+                "max_loss": 4.00,
+                "breakeven": 394.00,
                 "close_debit": 0.50,
-                "realized_pnl": 1.00,
+                "realized_pnl": 0.50,
                 "symbol": "SPY",
             },
             {
@@ -671,16 +714,16 @@ class TestV3SpreadFinancingAndSignature(unittest.TestCase):
                 "entry_date": str(dates[8].date()),
                 "exit_date": str(dates[13].date()),
                 "exit_reason": "profit_target",
-                "spread_type": "iron_condor",
+                "spread_type": "bear_call",
                 "entry_iv": 0.20,
                 "short_strike": 405.0,
                 "long_strike": 410.0,
                 "width": 5.0,
-                "credit_received": 2.00,
-                "max_loss": 3.00,
-                "breakeven": 407.0,
-                "close_debit": 0.80,
-                "realized_pnl": 1.20,
+                "credit_received": 1.00,
+                "max_loss": 4.00,
+                "breakeven": 406.0,
+                "close_debit": 0.50,
+                "realized_pnl": 0.50,
                 "symbol": "SPY",
             },
         ]
@@ -699,6 +742,40 @@ class TestV3SpreadFinancingAndSignature(unittest.TestCase):
         self.assertEqual(pd.Timestamp(first_short_cycle["entry_date"]), dates[1])
         # Invariant checks were executed at every step
         self.assertEqual(len(report.equity_series), len(dates))
+
+    def test_v3_spread_entry_rejects_impossible_credit_on_actual_path(self):
+        """The actual V3 replay path must reject raw credit that creates equity."""
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df_spy = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [100.0] * 3, "low": [100.0] * 3, "close": [100.0] * 3, "volume": [1000] * 3},
+            index=dates,
+        )
+        iv_series = pd.Series(0.20, index=dates)
+        regimes = pd.Series("neutral", index=dates)
+        impossible_raw = [
+            {
+                "entry_date": dates[0],
+                "exit_date": dates[2],
+                "spread_type": "bull_put",
+                "short_strike": 99.0,
+                "long_strike": 98.0,
+                "credit_received": 999.0,
+                "max_loss": 1.0,
+                "close_debit": 0.0,
+                "realized_pnl": 999.0,
+                "exit_reason": "probe",
+                "symbol": "SPY",
+            }
+        ]
+
+        with self.assertRaises(AssertionError):
+            run_v3_spread_financing(
+                bars_by_symbol={"SPY": df_spy},
+                iv_by_symbol={"SPY": iv_series},
+                regime_by_symbol={"SPY": regimes},
+                raw_trades=impossible_raw,
+                starting_cash=30_000.0,
+            )
 
 
 class TestAdapterAndReporting(unittest.TestCase):

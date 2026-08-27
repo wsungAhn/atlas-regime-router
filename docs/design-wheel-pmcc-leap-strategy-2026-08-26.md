@@ -391,6 +391,17 @@ bank 음수 진입을 막는다 (cash는 실제 지출 그대로 차감 — 항�
 경로는 루프 구조상 존재하지 않는다: 진입·스윕 판단은 `pending` 큐에 넣고 다음
 거래일 스텝 1에서 그날 종가로 체결한다.
 
+**IV 결측 처리 (2026-08-27 구현 리뷰 P1/P2 반영)**: MTM/equity 기록은 매 거래일
+남겨야 한다(§1 현금 보존식, §5.2 `equity_curve` 정의). 따라서 특정 거래일의
+IV가 비어 있으면 그 시점 **이전의 마지막 IV를 forward-fill**해 MTM·자산항등식·
+만기일 주변 continuity 검산에만 사용한다. 이는 과거값이라 미래정보 누출이 아니며,
+금지되는 것은 미래 IV(`iloc[-1]` 같은 시리즈 꼬리값)를 결측일에 끌어오는 것이다.
+반대로 신규 진입·스윕 판단, fresh 가격터치형 PT/SL trigger, V3 spread entry
+gate처럼 "그날 옵션가"가 필요한 판단은 **fresh IV가 있는 심볼에만** 수행한다.
+IV 결측은 심볼 단위로 격리한다: SPY IV 결측이 SLV/TLT의 만기 정산·MTM·fresh IV가
+있는 주문 실행을 밀어서는 안 된다. 결측 사실은 `iv_coverage_skip` 이벤트로 남기되
+그날 전체 루프를 중단하지 않는다.
+
 청산은 두 클래스로 나뉜다 (감사 2R #1):
 
 - **가격 터치형 (PT/SL)**: 당일 종가 판정·당일 종가 체결. vendor `simulate_trade`의
@@ -416,7 +427,7 @@ for d in trading_days:                        # SleeveBook 1개, 종목은 내�
                     (V2, 주식 담보) 콜어웨이: 주식 strike 매도 + 콜 소멸
                   CSP OTM → 소멸 / ITM → 배정: cash -= strike*100*qty,
                     shares += 100*qty, cost_basis = strike - premium
-    3. TRIGGER  — 가격 터치형 청산만 (그날 종가 MTM 기준, **당일 체결**):
+    3. TRIGGER  — 가격 터치형 청산만 (fresh IV가 있는 심볼의 그날 종가 MTM 기준, **당일 체결**):
                   숏 레그 50% PT / 2.0x SL
                   (vendor `simulate_trade`의 close-to-close 관례와 동일,
                   `credit_spread_simulator.py:309-331` — 판정·체결이 같은 종가)
@@ -427,6 +438,7 @@ for d in trading_days:                        # SleeveBook 1개, 종목은 내�
                   funding 스윕 판정 (V2 월말 / V3 금요일):
                   cost ≤ min(bank, available_cash) && 레짐 확인
     5. MTM      — equity = cash + Σ signed_leg_mtm + shares × close (§5.2.1)
+                  (IV 결측 심볼은 과거 IV forward-fill, 미래 IV 사용 금지)
                   equity_curve[d] 기록 + 자산 항등식 assert
 ```
 
@@ -549,7 +561,10 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
    (§5.2.1)가 전 구간 성립. 진입·청산·배정·롤·스윕 각 이벤트 직후 검증. 특히
    숏 매도 직후 equity 불변(현금 유입 = 부채 MTM), 스윕 직후
    `premium_bank ≤ cash` 불변식, 담보 예치·pending 적재·스윕 직후
-   `available_cash ≥ 0` 불변식(§5.2.1 원칙 4)도 함께 assert.
+   `available_cash ≥ 0` 불변식(§5.2.1 원칙 4)도 함께 assert. V3 spread entry도
+   실제 `decide_v3_spread_financing → _execute_spread_entry` 경로에서 같은 gate를
+   통과해야 하며, raw credit이 같은 날 theoretical close debit보다 큰 불가능한
+   입력은 assert로 거부한다(credit haircut 손실만 허용, 부의 창조 금지).
 2. **배정 사이클**: 가격을 행사가 아래로 보내는 합성 시나리오에서 CSP 배정 →
    shares 증가·cash 감소 → CC 매도 → 가격 회복 → 콜어웨이 → 현금 복귀. 각 단계의
    realized 이벤트 kind가 순서대로 기록됨.
@@ -560,6 +575,9 @@ def run_leap_family(variant: str, years: int = 3) -> StrategyResult:
 5. **롤 실현**: DTE<90 롤에서 realized 이벤트가 발생하고 equity가 연속 (롤 자체는
    P&L 중립 이벤트 + 실현/미실현 재분류).
 6. **미래정보 누출**: 백테스트 종료일 이후 봉을 추가해도 그 이전 equity_curve 불변.
+   IV 결측일 MTM은 그날 이전의 마지막 IV만 forward-fill하며, 미래 IV를 쓰지 않는
+   것을 별도 회귀 테스트로 고정한다. 결측일 realized 이벤트는 rolling 7일 실현
+   P&L 창에서 누락되면 안 된다.
 7. **기존 무영향**: 기존 테스트 스위트 전체 통과 (수정 0줄이므로 당연해야 하나
    임포트 부작용 확인 목적).
 
