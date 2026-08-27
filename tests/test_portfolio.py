@@ -98,6 +98,55 @@ def test_portfolio_drawdown_circuit_breaker_blocks_entries_within_45_minutes():
     assert dollar_trades[0].dollar_pnl < 0
 
 
+def test_portfolio_circuit_breaker_resumes_after_45min_even_without_recovery():
+    """2026-08-27 회귀 방지 — 원래 코드는 halt_until이 지나도 portfolio_dd가
+    여전히 20% 밑이면 곧바로 재발동해서 사실상 영구 정지였다. 신규진입이
+    막히면 이 시뮬레이터는 잔고가 움직일 방법이 없어(청산 대기 중인 거래가
+    없으면) 회복이 원천적으로 불가능한 폐쇄루프라, 실측으로 옵션 챔피언
+    6종목 합산 백테스트가 최초 -20% 시점(2024-12-18) 이후 20개월간 거래
+    0건으로 얼어붙는 걸 발견했다 — 3년 성과가 아니라 4.5개월 성과를 3년
+    성과로 잘못 보고한 것. 45분 뒤엔 잔고가 그대로여도 재개돼야 한다."""
+    # 손실이 반영돼 portfolio_dd가 실제로 20%를 넘는 건 "다음 거래 평가 시점"에야
+    # 드러난다(그 손실을 낸 거래 자체는 아직 미실현이라 자기 자신은 못 막는다 —
+    # 기존 test_portfolio_drawdown_circuit_breaker_blocks_entries_within_45_minutes
+    # 와 동일 전제). 그래서 순서는: day1 손실 → day2가 처음으로 -20%를 발견하고
+    # 자신이 그 발동 대상이 됨(막힘, 45분 정지 시작) → day3(정지 훨씬 지남)은
+    # 여전히 -20% 밑이어도 재개돼야 한다. 일일/주간 킬스위치와 분리하려고
+    # 서로 다른 날짜로 구성.
+    trades = [
+        _trade("2026-01-05 09:30", "2026-01-05 09:30", realized_pnl=-5.0, max_loss=1.0, weight=1.0),  # day1: -25% 손실 발생(체결)
+        _trade("2026-01-06 09:30", "2026-01-06 09:30", realized_pnl=10.0, max_loss=1.0, weight=1.0),  # day2: 손실이 이제 보임 → 발동, 이 거래가 막힘
+        _trade("2026-01-07 09:30", "2026-01-07 09:30", realized_pnl=10.0, max_loss=1.0, weight=1.0),  # day3: 정지기간 지남, 여전히 -20%대여도 재개
+    ]
+    dollar_trades, _ = scale_trades_to_dollars(trades, starting_equity=100_000, base_risk_pct=0.05)
+    # day1(손실)과 day3(45분+하루 지나 재개)는 체결, day2(발동 트리거)만 스킵.
+    assert len(dollar_trades) == 2
+    assert dollar_trades[-1].entry_date == pd.Timestamp("2026-01-07 09:30")
+
+
+def test_portfolio_circuit_breaker_re_arms_after_recovery():
+    """45분 뒤 재개된 상태에서 회복(<20%)을 한 번 찍으면, 그 다음 새로 20%
+    밑으로 떨어질 때 다시 서킷브레이커가 걸려야 한다(무장해제가 영구적이면
+    안 됨)."""
+    # day1 손실 → day2가 발견해 막힘(발동) → day3 재개, 큰 이익으로 실제 회복
+    # (<20%) → day4는 평시 거래로 정상 체결(무장해제 확인) → day5 새 손실 →
+    # day6이 그 손실을 발견해 다시 막혀야 함(재무장 확인).
+    trades = [
+        _trade("2026-01-05 09:30", "2026-01-05 09:30", realized_pnl=-5.0, max_loss=1.0, weight=1.0),  # day1 손실
+        _trade("2026-01-06 09:30", "2026-01-06 09:30", realized_pnl=10.0, max_loss=1.0, weight=1.0),  # day2 발동(막힘)
+        _trade("2026-01-07 09:30", "2026-01-07 09:30", realized_pnl=10.0, max_loss=1.0, weight=1.0),  # day3 재개+회복
+        _trade("2026-01-08 09:30", "2026-01-08 09:30", realized_pnl=1.0, max_loss=1.0, weight=1.0),   # day4 평시 체결
+        _trade("2026-01-09 09:30", "2026-01-09 09:30", realized_pnl=-5.0, max_loss=1.0, weight=1.0),  # day5 새 손실
+        _trade("2026-01-10 09:30", "2026-01-10 09:30", realized_pnl=1.0, max_loss=1.0, weight=1.0),   # day6 재발동(막힘)
+    ]
+    dollar_trades, _ = scale_trades_to_dollars(trades, starting_equity=100_000, base_risk_pct=0.05)
+    kept_days = {t.entry_date.date() for t in dollar_trades}
+    assert kept_days == {
+        pd.Timestamp("2026-01-05").date(), pd.Timestamp("2026-01-07").date(),
+        pd.Timestamp("2026-01-08").date(), pd.Timestamp("2026-01-09").date(),
+    }  # day2, day6만 막혀야 함(각각 첫/두번째 발동의 트리거)
+
+
 def test_portfolio_circuit_breaker_does_not_erase_realized_losses():
     """서킷브레이커 정지가 걸려도 이미 난 손실은 그대로 유지돼야 한다 — "정지=잔고
     리셋"이 아니라는 사용자의 명시적 요구사항 회귀 방지. 정지 중에도 최종 잔고는

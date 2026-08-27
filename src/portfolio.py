@@ -112,6 +112,7 @@ def scale_trades_to_dollars(
     week_start_equity: dict[pd.Timestamp, float] = {}
     high_water_mark = starting_equity
     halt_until: pd.Timestamp | None = None
+    portfolio_dd_breach_active = False  # 2026-08-27 버그 수정 — 아래 참고
 
     dollar_trades: list[DollarTrade] = []
     skipped_zero_contracts = 0
@@ -141,10 +142,25 @@ def scale_trades_to_dollars(
             # 별개 경로라 이 함수 스코프 밖, 이미 열린 포지션엔 영향 없음)
             skipped_kill_switch += 1
             continue
-        if portfolio_dd >= PORTFOLIO_DD_KILL_PCT:
+        if portfolio_dd < PORTFOLIO_DD_KILL_PCT:
+            portfolio_dd_breach_active = False  # 회복 확인 — 다음 하락은 새 서킷브레이커로 취급
+        elif not portfolio_dd_breach_active:
             # 계좌 HWM 대비 -20% 서킷브레이커 최초 발동 — 45분 정지 시작(잔고는
-            # 그대로 유지, HWM도 그대로 — "정지=리셋"이 아니다)
+            # 그대로 유지, HWM도 그대로 — "정지=리셋"이 아니다).
+            #
+            # **2026-08-27 버그 수정**: 원래 이 분기가 매 거래 후보마다 무조건
+            # 재평가돼서, 45분 정지가 풀린 뒤에도 portfolio_dd가 아직 20%
+            # 밑이면(신규진입이 막혀 잔고가 못 움직이니 당연히 그대로) 곧바로
+            # 또 20% 이상으로 판정돼 무한 재발동했다 — 백테스트가 3년치를 다
+            # 도는 게 아니라 최초 -20% 발생 시점에서 사실상 영구 동결됐다
+            # (실측: 옵션 챔피언 6종목 합산 백테스트가 2024-12-18 이후 20개월간
+            # 거래 0건, 그 시점 잔고를 "3년 성과"로 잘못 보고). 설계
+            # 문서·docstring이 명시한 의도("정지 후 재개, 이미 난 손실은 그대로
+            # 이어간다")대로 엣지트리거로 바꿈 — 서킷브레이커는 최초 하락 진입
+            # 시 1회만 발동하고, 45분 뒤엔(여전히 20% 밑이어도) 거래를
+            # 재개한다. 회복(<20%)을 한 번 찍어야 다음 하락에 다시 발동한다.
             halt_until = t["entry_date"] + pd.Timedelta(minutes=PORTFOLIO_DD_HALT_MINUTES)
+            portfolio_dd_breach_active = True
             skipped_kill_switch += 1
             continue
 

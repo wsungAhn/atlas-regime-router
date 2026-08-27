@@ -559,6 +559,7 @@ class RiskGateState:
     day_start_equity: float = 0.0
     week_key: date | None = None
     week_start_equity: float = 0.0
+    portfolio_dd_breach_active: bool = False  # 2026-08-27 버그 수정 — evaluate_risk_gates 참고
 
     def to_dict(self) -> dict:
         return {
@@ -568,6 +569,7 @@ class RiskGateState:
             "day_start_equity": self.day_start_equity,
             "week_key": self.week_key.isoformat() if self.week_key else None,
             "week_start_equity": self.week_start_equity,
+            "portfolio_dd_breach_active": self.portfolio_dd_breach_active,
         }
 
     @staticmethod
@@ -579,6 +581,7 @@ class RiskGateState:
             day_start_equity=float(d.get("day_start_equity", 0.0)),
             week_key=date.fromisoformat(d["week_key"]) if d.get("week_key") else None,
             week_start_equity=float(d.get("week_start_equity", 0.0)),
+            portfolio_dd_breach_active=bool(d.get("portfolio_dd_breach_active", False)),
         )
 
 
@@ -616,27 +619,40 @@ def evaluate_risk_gates(equity: float, state: RiskGateState, now: datetime | Non
 
     high_water_mark = max(state.high_water_mark, equity) if state.high_water_mark > 0 else equity
     halt_until = state.halt_until
+    breach_active = state.portfolio_dd_breach_active
 
     if halt_until is not None and now < halt_until:
-        new_state = RiskGateState(high_water_mark, halt_until, day_key, day_start_equity, week_key, week_start_equity)
+        new_state = RiskGateState(high_water_mark, halt_until, day_key, day_start_equity, week_key, week_start_equity, breach_active)
         return RiskGateDecision(True, "portfolio_dd_halt_active", new_state)
 
     daily_dd = 1.0 - equity / day_start_equity if day_start_equity > 0 else 0.0
     weekly_dd = 1.0 - equity / week_start_equity if week_start_equity > 0 else 0.0
     portfolio_dd = 1.0 - equity / high_water_mark if high_water_mark > 0 else 0.0
 
+    if portfolio_dd < PORTFOLIO_DD_KILL_PCT:
+        breach_active = False  # 회복 확인 — 다음 하락은 새 서킷브레이커로 취급
+
     if daily_dd >= DAILY_LOSS_KILL_PCT:
         reason = "daily_loss_kill"
     elif weekly_dd >= WEEKLY_LOSS_KILL_PCT:
         reason = "weekly_loss_kill"
-    elif portfolio_dd >= PORTFOLIO_DD_KILL_PCT:
+    elif portfolio_dd >= PORTFOLIO_DD_KILL_PCT and not breach_active:
+        # **2026-08-27 버그 수정**: 원래 halt_until이 지나도 portfolio_dd가
+        # 아직 20% 밑이면 곧바로 재발동해서 사실상 영구 정지가 될 수 있었다
+        # (백테스트 쪽 portfolio.py에서 실측으로 발견 — 옵션 챔피언 6종목
+        # 합산 백테스트가 최초 -20% 시점 이후 20개월간 전혀 거래를 못 해서
+        # 그 시점 잔고를 "3년 성과"로 잘못 보고했다). 라이브는 실제 브로커
+        # 잔고가 마크투마켓으로 계속 움직여서 이 폐쇄루프 문제는 없지만,
+        # "45분 정지 후 재개"라는 설계 의도 자체(docstring)는 여기도 동일하게
+        # 적용해야 한다 — 엣지트리거로 통일.
         halt_until = now + timedelta(minutes=PORTFOLIO_DD_HALT_MINUTES)
+        breach_active = True
         reason = "portfolio_dd_kill_triggered"
     else:
-        new_state = RiskGateState(high_water_mark, None, day_key, day_start_equity, week_key, week_start_equity)
+        new_state = RiskGateState(high_water_mark, None, day_key, day_start_equity, week_key, week_start_equity, breach_active)
         return RiskGateDecision(False, "ok", new_state)
 
-    new_state = RiskGateState(high_water_mark, halt_until, day_key, day_start_equity, week_key, week_start_equity)
+    new_state = RiskGateState(high_water_mark, halt_until, day_key, day_start_equity, week_key, week_start_equity, breach_active)
     return RiskGateDecision(True, reason, new_state)
 
 

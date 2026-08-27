@@ -331,6 +331,35 @@ def test_risk_gate_stays_halted_within_45_minutes_then_releases():
     assert recovered.reason == "ok"
 
 
+def test_risk_gate_resumes_after_45min_even_if_equity_has_not_recovered():
+    """2026-08-27 회귀 방지 — 45분 정지가 풀린 뒤 잔고가 여전히 -20% 밑이면
+    원래 코드는 곧바로 재발동해서 사실상 영구 정지였다(백테스트 쪽에서 실측
+    발견: 옵션 챔피언 6종목 합산 백테스트가 최초 -20% 이후 20개월간 거래
+    0건). 설계 의도(docstring)는 "정지 후 재개, 손실은 그대로 이어간다"이므로
+    45분 뒤엔 잔고가 그대로 -20%여도 신규진입이 재개돼야 한다."""
+    state = RiskGateState(high_water_mark=100_000.0)
+    breach_time = datetime(2026, 1, 5, 9, 30, tzinfo=timezone.utc)
+    after_breach = evaluate_risk_gates(79_000.0, state, now=breach_time)
+    assert after_breach.blocked is True
+
+    resumed = evaluate_risk_gates(79_000.0, after_breach.state, now=breach_time + timedelta(minutes=46))
+    assert resumed.blocked is False
+    assert resumed.reason == "ok"
+    assert resumed.state.high_water_mark == 100_000.0  # HWM은 여전히 안 낮아짐
+
+    # 여전히 20% 밑인 상태에서 새 후보 평가가 또 들어와도 breach_active가 True로
+    # 남아있어 재발동하지 않아야 한다(회복 전까지는 무장 해제 안 됨).
+    still_ok = evaluate_risk_gates(79_500.0, resumed.state, now=breach_time + timedelta(minutes=50))
+    assert still_ok.blocked is False
+
+    # 회복(<20%) 후 다시 새로 20% 밑으로 떨어지면 새 서킷브레이커가 발동해야 한다.
+    recovered = evaluate_risk_gates(85_000.0, still_ok.state, now=breach_time + timedelta(minutes=55))
+    assert recovered.blocked is False
+    re_breach = evaluate_risk_gates(79_000.0, recovered.state, now=breach_time + timedelta(minutes=60))
+    assert re_breach.blocked is True
+    assert re_breach.reason == "portfolio_dd_kill_triggered"
+
+
 # ── 크립토 슬리브 ──
 
 class _FakeCryptoDataClient:
