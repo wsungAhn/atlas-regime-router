@@ -405,11 +405,14 @@ class TestInvariantsAndTiming(unittest.TestCase):
             index=dates,
         )
         # Day 1 prints NaN, day 2 prints 0.0 — both must fall back to the day-0 IV.
-        iv_series = pd.Series([0.20, float("nan"), 0.0], index=dates)
+        # Day 0 IV is deliberately not the 0.20 engine default, so a fallback that
+        # quietly used the default instead of the prior print would fail below.
+        prior_iv = 0.35
+        iv_series = pd.Series([prior_iv, float("nan"), 0.0], index=dates)
         regimes = pd.Series("neutral", index=dates)
 
         engine = LeapEngine(starting_cash=30_000.0)
-        entry_price = black_scholes_price(100.0, 90.0, 1.0, engine.r, 0.20, "call")
+        entry_price = black_scholes_price(100.0, 90.0, 1.0, engine.r, prior_iv, "call")
         engine.book.cash -= entry_price * 100.0
         engine.book.legs["SPY"] = [
             OptionLeg("call", 90.0, dates[0] + pd.Timedelta(days=365), 1, entry_price, dates[0], "leap", "SPY")
@@ -422,15 +425,51 @@ class TestInvariantsAndTiming(unittest.TestCase):
             decide_fn=lambda eng, d, px, iv, reg: None,
         )
 
-        for d in dates:
+        for i, d in enumerate(dates):
             self.assertIn(d, book.equity_curve)
             self.assertTrue(math.isfinite(book.equity_curve[d]), f"equity not finite on {d}")
+            t_rem = ((dates[0] + pd.Timedelta(days=365)) - d).days / 365.0
+            expected = engine.book.cash + black_scholes_price(100.0, 90.0, t_rem, engine.r, prior_iv, "call") * 100.0
+            default_iv = engine.book.cash + black_scholes_price(100.0, 90.0, t_rem, engine.r, 0.20, "call") * 100.0
+            self.assertAlmostEqual(book.equity_curve[d], expected, places=4)
+            if i > 0:
+                self.assertNotAlmostEqual(book.equity_curve[d], default_iv, places=2)
         skipped = {
             pd.Timestamp(r["exit_date"])
             for r in book.realized
             if r["kind"] == "iv_coverage_skip"
         }
         self.assertEqual(skipped, {dates[1], dates[2]})
+
+    def test_unsorted_duplicate_iv_index_is_normalized(self):
+        """run_simulation must not depend on caller-side IV index ordering or uniqueness."""
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [100.0] * 3, "low": [100.0] * 3, "close": [100.0] * 3, "volume": [1000] * 3},
+            index=dates,
+        )
+        regimes = pd.Series("neutral", index=dates)
+
+        def run(iv_series):
+            engine = LeapEngine(starting_cash=30_000.0)
+            entry_price = black_scholes_price(100.0, 90.0, 1.0, engine.r, 0.30, "call")
+            engine.book.cash -= entry_price * 100.0
+            engine.book.legs["SPY"] = [
+                OptionLeg("call", 90.0, dates[0] + pd.Timedelta(days=365), 1, entry_price, dates[0], "leap", "SPY")
+            ]
+            return engine.run_simulation(
+                bars_by_symbol={"SPY": df},
+                iv_by_symbol={"SPY": iv_series},
+                regime_by_symbol={"SPY": regimes},
+                decide_fn=lambda eng, d, px, iv, reg: None,
+            )
+
+        clean = run(pd.Series([0.30, 0.30], index=[dates[0], dates[1]]))
+        # Reversed order, plus a stale duplicate of day 0 that must lose to the later print.
+        messy = run(pd.Series([0.30, 0.99, 0.30], index=[dates[1], dates[0], dates[0]]))
+
+        for d in dates:
+            self.assertAlmostEqual(messy.equity_curve[d], clean.equity_curve[d], places=4)
 
     def test_spread_settlement_pnl_must_match_cash_moved(self):
         """A vendor realized_pnl that disagrees with credit - close_debit must not reach metrics."""

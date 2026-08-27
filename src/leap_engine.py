@@ -464,6 +464,13 @@ class LeapEngine:
         4. DECIDE  (today's evaluation -> queue pending orders for tomorrow)
         5. MTM     (calculate sleeve equity, record curve, assert invariants)
         """
+        # Normalize the IV input contract: prior-IV forward fill picks by position,
+        # so an unsorted or duplicated index would silently pick the wrong prior.
+        iv_by_symbol = {
+            sym: series[~series.index.duplicated(keep="last")].sort_index()
+            for sym, series in iv_by_symbol.items()
+        }
+
         # Find shared trading days
         all_dates = sorted(
             list(
