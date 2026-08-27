@@ -26,6 +26,13 @@ def _is_valid_iv(value: float) -> bool:
     return math.isfinite(value) and value > 0.0
 
 
+def _normalize_time_index(obj: pd.DataFrame | pd.Series) -> pd.DataFrame | pd.Series:
+    """Normalize caller-supplied time series to one value per date, in chronological order."""
+    if obj.index.is_monotonic_increasing and obj.index.is_unique:
+        return obj
+    return obj[~obj.index.duplicated(keep="last")].sort_index()
+
+
 def round_to_increment(value: float, increment: float = 0.5) -> float:
     """Round strike to standard increment (default $0.50)."""
     return round(value / increment) * increment
@@ -464,11 +471,19 @@ class LeapEngine:
         4. DECIDE  (today's evaluation -> queue pending orders for tomorrow)
         5. MTM     (calculate sleeve equity, record curve, assert invariants)
         """
-        # Normalize the IV input contract: prior-IV forward fill picks by position,
-        # so an unsorted or duplicated index would silently pick the wrong prior.
+        # Normalize input contracts once per run. IV prior-fill picks by position,
+        # regime .get() must return scalars, and bar .loc[d] must not return rows.
+        bars_by_symbol = {
+            sym: _normalize_time_index(df)
+            for sym, df in bars_by_symbol.items()
+        }
         iv_by_symbol = {
-            sym: series[~series.index.duplicated(keep="last")].sort_index()
+            sym: _normalize_time_index(series)
             for sym, series in iv_by_symbol.items()
+        }
+        regime_by_symbol = {
+            sym: _normalize_time_index(series)
+            for sym, series in regime_by_symbol.items()
         }
 
         # Find shared trading days
@@ -679,8 +694,8 @@ class LeapEngine:
 
                 if order.is_sweep:
                     # Funding sweep LEAP purchase (V2 / V3)
-                    max_sweep_funds = min(self.book.premium_bank, self.book.available_cash)
-                    if cost_per_contract <= max_sweep_funds and max_sweep_funds > 0:
+                    available_cash = self.book.available_cash
+                    if cost_per_contract <= available_cash and self.book.premium_bank > 0:
                         self.book.cash -= cost_per_contract
                         # Clamped bank deduction (§5.2.1, 3R P3-1)
                         self.book.premium_bank = max(0.0, self.book.premium_bank - cost_per_contract)
@@ -708,6 +723,20 @@ class LeapEngine:
                         self._assert_event_equity_change(
                             before_equity, d, current_prices, current_ivs, "leap_sweep_buy"
                         )
+                    else:
+                        self.book.realized.append({
+                            "entry_date": d,
+                            "exit_date": d,
+                            "symbol": sym,
+                            "kind": "leap_sweep_skip",
+                            "dollar_pnl": 0.0,
+                            "detail": {
+                                "reason": "insufficient_execution_cash",
+                                "cost": cost_per_contract,
+                                "premium_bank": self.book.premium_bank,
+                                "available_cash": available_cash,
+                            },
+                        })
                 else:
                     # Standard LEAP entry (V1)
                     contracts = order.qty

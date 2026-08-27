@@ -52,6 +52,20 @@ import backtest
 from strategies import StrategySignal
 
 
+def event_projection(book: SleeveBook) -> List[tuple]:
+    """Stable realized-event comparison surface for contract-level regression tests."""
+    return [
+        (
+            r["kind"],
+            pd.Timestamp(r["entry_date"]),
+            pd.Timestamp(r["exit_date"]),
+            r["symbol"],
+            round(float(r["dollar_pnl"]), 8),
+        )
+        for r in book.realized
+    ]
+
+
 def create_synthetic_bars(
     start_date: str = "2023-01-01",
     n_days: int = 150,
@@ -470,6 +484,75 @@ class TestInvariantsAndTiming(unittest.TestCase):
 
         for d in dates:
             self.assertAlmostEqual(messy.equity_curve[d], clean.equity_curve[d], places=4)
+        self.assertEqual(event_projection(messy), event_projection(clean))
+        self.assertEqual(
+            [r for r in messy.realized if r["kind"] == "iv_coverage_skip"],
+            [r for r in clean.realized if r["kind"] == "iv_coverage_skip"],
+        )
+        self.assertEqual(
+            [r for r in messy.realized if r["kind"] == "iv_intrinsic_mtm_fallback"],
+            [r for r in clean.realized if r["kind"] == "iv_intrinsic_mtm_fallback"],
+        )
+
+    def test_unsorted_duplicate_regime_index_is_normalized(self):
+        """Duplicate regime dates must keep the last value and still drive strategy decisions."""
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        df = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [100.0] * 3, "low": [100.0] * 3, "close": [100.0] * 3, "volume": [1000] * 3},
+            index=dates,
+        )
+        iv_series = pd.Series(0.20, index=dates)
+        clean_regimes = pd.Series(["neutral", "bull", "bull"], index=dates)
+        messy_regimes = pd.Series(
+            ["neutral", "bear", "bull", "bull"],
+            index=[dates[0], dates[1], dates[1], dates[2]],
+        )
+
+        def run(regimes):
+            engine = LeapEngine(starting_cash=30_000.0)
+            return engine.run_simulation(
+                bars_by_symbol={"SPY": df},
+                iv_by_symbol={"SPY": iv_series},
+                regime_by_symbol={"SPY": regimes},
+                decide_fn=lambda eng, d, px, iv, reg: decide_v1_pmcc(eng, d, px, iv, reg),
+            )
+
+        clean = run(clean_regimes)
+        messy = run(messy_regimes)
+
+        self.assertEqual(event_projection(messy), event_projection(clean))
+        self.assertEqual([r["kind"] for r in messy.realized], ["leap_entry"])
+
+    def test_unsorted_duplicate_bar_index_is_normalized(self):
+        """Duplicate bar dates must keep the last close and provide scalar daily prices."""
+        dates = pd.bdate_range("2023-01-02", periods=3)
+        clean = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [100.0] * 3, "low": [100.0] * 3, "close": [100.0, 105.0, 105.0], "volume": [1000] * 3},
+            index=dates,
+        )
+        messy = pd.DataFrame(
+            {
+                "open": [100.0, 999.0, 105.0, 105.0],
+                "high": [100.0, 999.0, 105.0, 105.0],
+                "low": [100.0, 999.0, 105.0, 105.0],
+                "close": [100.0, 999.0, 105.0, 105.0],
+                "volume": [1000, 1000, 1000, 1000],
+            },
+            index=[dates[0], dates[1], dates[1], dates[2]],
+        )
+        iv_series = pd.Series(0.20, index=dates)
+        regimes = pd.Series(["neutral", "bull", "bull"], index=dates)
+
+        def run(df):
+            engine = LeapEngine(starting_cash=30_000.0)
+            return engine.run_simulation(
+                bars_by_symbol={"SPY": df},
+                iv_by_symbol={"SPY": iv_series},
+                regime_by_symbol={"SPY": regimes},
+                decide_fn=lambda eng, d, px, iv, reg: decide_v1_pmcc(eng, d, px, iv, reg),
+            )
+
+        self.assertEqual(event_projection(run(messy)), event_projection(run(clean)))
 
     def test_spread_settlement_pnl_must_match_cash_moved(self):
         """A vendor realized_pnl that disagrees with credit - close_debit must not reach metrics."""
@@ -1154,6 +1237,106 @@ class TestAdapterAndReporting(unittest.TestCase):
         self.assertEqual(engine.leap_roll_count, 1)
         roll_events = [r for r in book.realized if r["kind"] == "leap_roll"]
         self.assertEqual(len(roll_events), 1)
+
+    def _spy_sweep_cost(self, spot: float, iv: float = 0.20) -> float:
+        r = 0.045
+        strike = round_to_increment(strike_for_delta(spot, 1.0, r, iv, 0.70, "call"), 0.5)
+        return black_scholes_price(spot, strike, 1.0, r, iv, "call") * 100.0
+
+    def _run_v3_sweep_probe(self, premium_bank: float, regimes: pd.Series, prices: List[float] | None = None) -> tuple[LeapEngine, SleeveBook]:
+        dates = pd.to_datetime(["2023-01-05", "2023-01-06", "2023-01-09"])
+        prices = prices or [100.0, 100.0, 100.0]
+        df = pd.DataFrame(
+            {"open": prices, "high": prices, "low": prices, "close": prices, "volume": [1000] * 3},
+            index=dates,
+        )
+        iv_series = pd.Series(0.20, index=dates)
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.premium_bank = premium_bank
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: decide_v3_spread_financing(eng, d, px, iv, reg, raw_trades_by_entry_date={}),
+        )
+        return engine, book
+
+    def test_v3_funding_sweep_bank_below_cost_rolls_forward(self):
+        """A bank balance just below LEAP cost should not buy and should remain available for a later sweep."""
+        dates = pd.to_datetime(["2023-01-05", "2023-01-06", "2023-01-09"])
+        friday_cost = self._spy_sweep_cost(100.0)
+        regimes = pd.Series("bull", index=dates)
+
+        engine, book = self._run_v3_sweep_probe(friday_cost - 0.01, regimes)
+
+        self.assertEqual(engine.leap_sweep_count, 0)
+        self.assertEqual([r for r in book.realized if r["kind"] == "leap_sweep_buy"], [])
+        self.assertAlmostEqual(engine.book.premium_bank, friday_cost - 0.01)
+
+    def test_v3_funding_sweep_bank_above_cost_buys_next_day(self):
+        """A bank balance just above LEAP cost should queue on Friday and buy on the next trading day."""
+        dates = pd.to_datetime(["2023-01-05", "2023-01-06", "2023-01-09"])
+        friday_cost = self._spy_sweep_cost(100.0)
+        regimes = pd.Series("bull", index=dates)
+
+        engine, book = self._run_v3_sweep_probe(friday_cost + 0.01, regimes)
+
+        self.assertEqual(engine.leap_sweep_count, 1)
+        sweep_events = [r for r in book.realized if r["kind"] == "leap_sweep_buy"]
+        self.assertEqual(len(sweep_events), 1)
+        self.assertEqual(pd.Timestamp(sweep_events[0]["exit_date"]), dates[2])
+
+    def test_v3_funding_sweep_bear_regime_blocks_purchase(self):
+        """A fully funded Friday sweep must not buy when the target underlying is in bear regime."""
+        dates = pd.to_datetime(["2023-01-05", "2023-01-06", "2023-01-09"])
+        friday_cost = self._spy_sweep_cost(100.0)
+        regimes = pd.Series("bear", index=dates)
+
+        engine, book = self._run_v3_sweep_probe(friday_cost * 2.0, regimes)
+
+        self.assertEqual(engine.leap_sweep_count, 0)
+        self.assertEqual([r for r in book.realized if r["kind"] == "leap_sweep_buy"], [])
+
+    def test_v2_month_end_funding_sweep_buys_next_day(self):
+        """V2 month-end sweep uses the same bank/cash contract as V3 and buys SPY on the next trading day."""
+        dates = pd.to_datetime(["2023-01-30", "2023-01-31", "2023-02-01"])
+        df = pd.DataFrame(
+            {"open": [100.0] * 3, "high": [100.0] * 3, "low": [100.0] * 3, "close": [100.0] * 3, "volume": [1000] * 3},
+            index=dates,
+        )
+        iv_series = pd.Series(0.20, index=dates)
+        regimes = pd.Series("bull", index=dates)
+        engine = LeapEngine(starting_cash=30_000.0)
+        engine.book.premium_bank = self._spy_sweep_cost(100.0) + 1.0
+
+        book = engine.run_simulation(
+            bars_by_symbol={"SPY": df},
+            iv_by_symbol={"SPY": iv_series},
+            regime_by_symbol={"SPY": regimes},
+            decide_fn=lambda eng, d, px, iv, reg: decide_v2_wheel(eng, d, px, iv, reg, month_end_dates={dates[1]}),
+        )
+
+        self.assertEqual(engine.leap_sweep_count, 1)
+        sweep_events = [r for r in book.realized if r["kind"] == "leap_sweep_buy"]
+        self.assertEqual(len(sweep_events), 1)
+        self.assertEqual(pd.Timestamp(sweep_events[0]["exit_date"]), dates[2])
+
+    def test_funding_sweep_gap_up_clamps_bank_and_executes_when_cash_available(self):
+        """A Friday-approved sweep still executes after a Monday price gap; bank is floored at zero."""
+        dates = pd.to_datetime(["2023-01-05", "2023-01-06", "2023-01-09"])
+        friday_cost = self._spy_sweep_cost(100.0)
+        monday_cost = self._spy_sweep_cost(180.0)
+        regimes = pd.Series("bull", index=dates)
+
+        engine, book = self._run_v3_sweep_probe(friday_cost + 1.0, regimes, prices=[100.0, 100.0, 180.0])
+
+        self.assertGreater(monday_cost, friday_cost + 1.0)
+        self.assertEqual(engine.leap_sweep_count, 1)
+        sweep_events = [r for r in book.realized if r["kind"] == "leap_sweep_buy"]
+        self.assertEqual(len(sweep_events), 1)
+        self.assertAlmostEqual(sweep_events[0]["detail"]["cost"] * 100.0, monday_cost, places=4)
+        self.assertEqual(engine.book.premium_bank, 0.0)
+        self.assertGreater(engine.book.available_cash, 0.0)
 
     def test_v3_friday_funding_sweep(self):
         """Verify V3 Friday funding sweep buys SPY/QQQ LEAP using accumulated premium_bank."""

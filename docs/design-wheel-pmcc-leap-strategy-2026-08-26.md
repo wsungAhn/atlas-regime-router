@@ -378,7 +378,10 @@ bank를 깎지 않는다 — bank는 "스윕 자격 판정용 누계"이지 손�
 체결은 다음 거래일 종가라(§5.3) 갭 상승 시 `actual_cost > 판단일 cost`가 될 수
 있다. 체결 시 `premium_bank = max(0.0, premium_bank − actual_cost)`로 차감해
 bank 음수 진입을 막는다 (cash는 실제 지출 그대로 차감 — 항등식 불변, 바닥은
-하위 원장인 bank에만 적용).
+하위 원장인 bank에만 적용). 이 클램프는 **bank 부족만** 처리한다. 체결일
+`available_cash` 자체가 `actual_cost`보다 작아지는 경우는 `available_cash ≥ 0`
+불변식을 우선해 체결하지 않고 `leap_sweep_skip` 이벤트로 남긴 뒤 bank를 이월한다
+(조용한 주문 유실 금지).
 
 ### 5.3 이벤트 루프
 
