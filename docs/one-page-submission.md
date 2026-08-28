@@ -1,7 +1,7 @@
 # Atlas Options Engine
 ## Backtest-Selected, Defined-Risk Options Agent for Alpaca Paper Trading (with a Crypto Sleeve)
 
-**Competition account:** Dedicated Alpaca Paper account. **Starting balance:** $100,000. **Execution:** Options (6 underlyings) plus a crypto spot sleeve.
+**Competition account:** A new Alpaca Paper account created specifically for this hackathon on August 28, 2026 (account PA3Q19GCQ076), not reused from earlier development or testing. **Starting balance:** $100,000. **Execution:** Options (6 underlyings) plus a crypto spot sleeve.
 
 ## Overview
 
