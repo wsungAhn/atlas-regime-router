@@ -24,7 +24,12 @@ import pandas as pd
 from alpaca.data.historical.crypto import CryptoHistoricalDataClient
 from alpaca.data.historical.option import OptionHistoricalDataClient
 from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import CryptoBarsRequest, OptionChainRequest, StockBarsRequest
+from alpaca.data.requests import (
+    CryptoBarsRequest,
+    OptionChainRequest,
+    OptionLatestQuoteRequest,
+    StockBarsRequest,
+)
 from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.enums import ContractType
 
@@ -86,7 +91,12 @@ def load_macro_gate(db_path: Path = MACRO_DB_PATH) -> MacroGate:
     if not db_path.exists():
         return MacroGate(ok=True, reason="db_missing_fail_open", stage=None)
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        # mode=ro는 WAL 동반파일(-shm/-wal)이 이미 있어야 여는데, writer가 잠깐이라도
+        # 연결을 안 잡고 있으면(체크포인트 시 자동삭제) 그 파일들이 없어져 매번
+        # "unable to open database file"로 실패한다(2026-08-29 실측: 상시 fail-open
+        # 상태였음). 일반 연결은 필요시 그 파일을 스스로 만들 수 있어 이 문제가 없다 —
+        # 이 함수는 SELECT만 하므로 쓰기 권한이 있어도 안전.
+        conn = sqlite3.connect(str(db_path))
         row = conn.execute(
             """
             SELECT stage, status FROM macro_stage_verdicts
@@ -230,6 +240,12 @@ def _mid_price(snap) -> float | None:
     q = getattr(snap, "latest_quote", None)
     if q is None:
         return None
+    return _mid_from_quote(q)
+
+
+def _mid_from_quote(q) -> float | None:
+    """호가 객체(bid_price/ask_price 속성)에서 중간값 계산 — _mid_price와
+    close_limit_price(청산 limit 폴백)가 공유하는 핵심 로직."""
     bid, ask = getattr(q, "bid_price", None) or 0.0, getattr(q, "ask_price", None) or 0.0
     if bid <= 0 and ask <= 0:
         return None
@@ -510,11 +526,15 @@ def evaluate_exit(leg_positions: list[dict], today: date | None = None) -> ExitD
     return ExitDecision(False, "hold", profit_pct)
 
 
-def build_close_intent(leg_positions: list[dict], client_order_id: str) -> dict:
+def build_close_intent(leg_positions: list[dict], client_order_id: str, limit_price: float | None = None) -> dict:
     """열린 포지션의 반대 방향(숏→buy_to_close, 롱→sell_to_close)으로 청산 주문을
-    만든다. limit_price는 시장가에 가깝게(0.0 근처) — 청산은 방향성 베팅이 아니라
-    리스크 종료가 목적이므로 가격에 민감하게 굴 이유가 없다. 실제 체결 보장을
-    위해 market 타입을 쓴다(멀티레그도 Alpaca가 market order_class=mleg 지원).
+    만든다. 기본은 market(멀티레그도 Alpaca가 market order_class=mleg 지원) — 청산은
+    방향성 베팅이 아니라 리스크 종료가 목적이므로 가격에 민감하게 굴 이유가 없다.
+
+    **2026-08-29 실거래로 발견**: 유동성 낮은 종목(TLT 등)은 브로커가 market 청산을
+    "no available quote for symbol, please reenter with a limit"로 거부하는데,
+    거부 사유가 항상 동일해서 재시도해도 100% 다시 거부된다(TLT 하루 280회 실측) —
+    limit_price를 넘기면 limit 폴백으로 재시도할 수 있게 함(close_limit_price 참고).
 
     **2026-08-25 Codex 감사 지적**: qty를 leg_positions[0]에서만 가져와
     나머지 레그가 다른 수량이어도(부분체결·수동개입·잔여레그) 조용히 무시하고
@@ -534,7 +554,7 @@ def build_close_intent(leg_positions: list[dict], client_order_id: str) -> dict:
         legs.append({
             "symbol": p["symbol"], "ratio_qty": "1", "side": side, "position_intent": intent,
         })
-    return {
+    intent = {
         "qty": str(int(qtys.pop())),
         "type": "market",
         "time_in_force": "day",
@@ -542,6 +562,30 @@ def build_close_intent(leg_positions: list[dict], client_order_id: str) -> dict:
         "client_order_id": client_order_id,
         "legs": legs,
     }
+    if limit_price is not None:
+        intent["type"] = "limit"
+        intent["limit_price"] = str(round(limit_price, 2))
+    return intent
+
+
+def close_limit_price(leg_positions: list[dict], quotes: dict) -> float | None:
+    """market 청산이 견적없음으로 거부됐을 때 쓸 limit가 계산 — 각 레그 실호가
+    중간값 합(숏레그=지불/buy_to_close, 롱레그=수취/sell_to_close), 체결 가능성을
+    높이려 CREDIT_HAIRCUT_PCT만큼 우리 쪽에 불리하게(더 지불/덜 수취) 살짝 얹는다.
+    quotes는 {symbol: quote객체(bid_price/ask_price)} — get_option_latest_quote 응답.
+    부호 규약은 build_credit_spread_intent와 동일(양수=데빗, 음수=크레딧)."""
+    total = 0.0
+    for p in leg_positions:
+        q = quotes.get(p["symbol"])
+        if q is None:
+            return None
+        mid = _mid_from_quote(q)
+        if mid is None:
+            return None
+        side_held = str(p.get("side", "")).lower()
+        total += mid if side_held == "short" else -mid
+    haircut = abs(total) * CREDIT_HAIRCUT_PCT
+    return round(total + haircut, 2)
 
 
 # ── 계좌 레벨 리스크게이트 (일일/주간/HWM 서킷브레이커) — 2026-08-24 배선 ──

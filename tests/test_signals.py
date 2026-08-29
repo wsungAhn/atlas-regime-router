@@ -14,6 +14,7 @@ from signals import (  # noqa: E402
     _vertical_width,
     build_close_intent,
     build_credit_spread_intent,
+    close_limit_price,
     build_crypto_close_intent,
     build_crypto_order_intent,
     build_iron_condor_intent,
@@ -271,6 +272,45 @@ def test_build_close_intent_reverses_short_and_long_sides():
     assert by_symbol["SPY_SHORT"]["position_intent"] == "buy_to_close"
     assert by_symbol["SPY_LONG"]["side"] == "sell"
     assert by_symbol["SPY_LONG"]["position_intent"] == "sell_to_close"
+
+
+class _FakeQuote:
+    def __init__(self, bid_price, ask_price):
+        self.bid_price = bid_price
+        self.ask_price = ask_price
+
+
+def test_close_limit_price_sums_leg_mids_with_haircut_favoring_fill():
+    """2026-08-29: market 청산이 '견적없음, limit으로'로 거부될 때 쓰는 폴백가.
+    숏레그(buy_to_close)는 지불, 롱레그(sell_to_close)는 수취 — 실측 TLT 사례처럼
+    실호가로 계산해야 한다(하드코딩 가격은 GLD/TLT net_credit 버그와 같은 클래스)."""
+    legs = [
+        {"symbol": "SHORT_LEG", "side": "short", "qty": "1"},
+        {"symbol": "LONG_LEG", "side": "long", "qty": "1"},
+    ]
+    quotes = {
+        "SHORT_LEG": _FakeQuote(bid_price=1.0, ask_price=1.2),  # mid 1.1, buy_to_close 비용
+        "LONG_LEG": _FakeQuote(bid_price=0.3, ask_price=0.5),   # mid 0.4, sell_to_close 수취
+    }
+    price = close_limit_price(legs, quotes)
+    raw_mid_net = 1.1 - 0.4  # 순수 mid 기준 데빗(지불) 0.7
+    assert price > raw_mid_net  # 체결 가능성 높이려 우리 쪽에 불리하게(더 지불) 얹음
+    assert price == pytest.approx(raw_mid_net * 1.05, abs=0.01)
+
+
+def test_close_limit_price_none_when_quote_missing():
+    legs = [{"symbol": "NO_QUOTE_LEG", "side": "short", "qty": "1"}]
+    assert close_limit_price(legs, {}) is None
+
+
+def test_build_close_intent_with_limit_price_uses_limit_type():
+    legs = [
+        {"symbol": "SPY_SHORT", "side": "short", "qty": "1"},
+        {"symbol": "SPY_LONG", "side": "long", "qty": "1"},
+    ]
+    intent = build_close_intent(legs, client_order_id="close-lmt-1", limit_price=0.73)
+    assert intent["type"] == "limit"
+    assert intent["limit_price"] == "0.73"
 
 
 def test_build_close_intent_rejects_mismatched_leg_quantities():

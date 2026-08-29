@@ -44,6 +44,7 @@ from signals import (  # noqa: E402
     RiskGateState,
     build_close_intent,
     build_crypto_close_intent,
+    close_limit_price,
     decide_crypto_for_symbol,
     decide_for_symbol,
     evaluate_crypto_exit,
@@ -51,6 +52,7 @@ from signals import (  # noqa: E402
     evaluate_risk_gates,
     load_macro_gate,
 )
+from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: E402
 from alpaca.data.historical.crypto import CryptoHistoricalDataClient  # noqa: E402
 from alpaca.data.historical.option import OptionHistoricalDataClient  # noqa: E402
 from alpaca.data.historical.stock import StockHistoricalDataClient  # noqa: E402
@@ -380,6 +382,33 @@ async def run_cycle_once() -> None:
                     _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "close_order_error", "exit_reason": exit_decision.reason})
                     continue
                 broker_error = _order_error(close_result)
+                if broker_error and "reenter with a limit" in str(broker_error).lower():
+                    # 2026-08-29: market 청산이 "견적없음, limit으로" 거부되면 재시도해도
+                    # 매번 같은 이유로 100% 다시 거부된다(TLT 하루 280회 실측) — 실호가
+                    # 중간값 기반 limit으로 그 자리에서 즉시 재시도.
+                    try:
+                        quotes = option_client.get_option_latest_quote(
+                            OptionLatestQuoteRequest(symbol_or_symbols=[leg["symbol"] for leg in legs])
+                        )
+                        limit_price = close_limit_price(legs, quotes)
+                    except Exception:
+                        logger.exception("[ERROR] limit fallback quote fetch failed for %s — leaving open for next cycle", symbol)
+                        limit_price = None
+                    if limit_price is not None:
+                        limit_close_intent = build_close_intent(
+                            legs, client_order_id=f"atlas-close-lmt-{symbol}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}",
+                            limit_price=limit_price,
+                        )
+                        limit_result = _mcp_data(await session.call_tool("place_option_order", limit_close_intent))
+                        limit_error = _order_error(limit_result)
+                        if not limit_error:
+                            logger.info("[CLOSE] %s reason=%s limit_fallback=%.2f", symbol, exit_decision.reason, limit_price)
+                            _log_decision({
+                                "symbol": symbol, "submitted": True, "action": "close",
+                                "exit_reason": exit_decision.reason, "limit_fallback_price": limit_price,
+                            })
+                            continue
+                        broker_error = f"market rejected ({broker_error}); limit fallback also rejected: {limit_error}"
                 if broker_error:
                     logger.error("[ERROR] close order REJECTED by broker for %s (reason=%s): %s — position still open, will retry next cycle", symbol, exit_decision.reason, broker_error)
                     _log_decision({
