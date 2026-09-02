@@ -132,11 +132,19 @@ class RegimeSignal:
 ATR_PCT_LOOKBACK_DAYS = 252
 
 
-def atr_pct_percentile_bounds(df: pd.DataFrame, lookback: int = ATR_PCT_LOOKBACK_DAYS) -> tuple[float, float, float]:
+def atr_pct_percentile_bounds(
+    df: pd.DataFrame, lookback: int = ATR_PCT_LOOKBACK_DAYS, atr_period: int = 14,
+) -> tuple[float, float, float]:
     """(현재 ATR%, 25th pct, 75th pct) — risk_pct_for_atr_pct에 그대로 먹인다.
     데이터가 lookback보다 짧으면 있는 만큼으로 근사(콜드스타트, 상장 얼마 안 된
-    종목 대비 — SPY/QQQ엔 해당 없지만 함수 자체는 일반화해 둔다)."""
-    atr = ind.wilder_atr(df, 14)
+    종목 대비 — SPY/QQQ엔 해당 없지만 함수 자체는 일반화해 둔다).
+
+    atr_period 기본값 14는 **거래일(주5일)** 기준 자산을 가정한 값 — 24/7
+    거래되는 크립토에 그대로 쓰면 14봉이 캘린더 14일(주식의 14거래일=캘린더
+    약 20일)밖에 안 돼 실제로 보는 과거 기간이 짧아진다(2026-09-02 실측:
+    같은 함수를 크립토에 그대로 재사용하다 발견). 호출부(크립토)가 20을
+    넘겨 같은 캘린더 기간을 보도록 맞춘다."""
+    atr = ind.wilder_atr(df, atr_period)
     atr_pct = (atr / df["close"]).dropna()
     window = atr_pct.tail(lookback)
     if window.empty:
@@ -147,8 +155,15 @@ def atr_pct_percentile_bounds(df: pd.DataFrame, lookback: int = ATR_PCT_LOOKBACK
     return current, low_q, high_q
 
 
-def classify_regime_from_bars(df: pd.DataFrame, symbol: str) -> RegimeSignal:
+def classify_regime_from_bars(df: pd.DataFrame, symbol: str, atr_period: int = 14) -> RegimeSignal:
     """순수 함수 — 테스트에서 합성 DataFrame을 바로 넣을 수 있도록 데이터조회와 분리.
+
+    atr_period: ATR(변동성) 계산에 쓸 봉 개수. 기본 14는 **거래일 기준
+    자산**(옵션 underlying) 가정 — 주5일 거래라 14봉=캘린더 약 20일.
+    24/7 거래되는 크립토는 14봉=캘린더 14일이라 같은 실제 기간을 보려면
+    호출부에서 atr_period=20을 넘긴다(2026-09-02, 사용자 지적으로 발견 —
+    ADX/EMA는 레짐 트리거 자체의 정의라 자산군 무관하게 14/20/50 그대로 둔다,
+    변동성 측정(ATR)만 캘린더 기간 문제가 있었다).
 
     "range"/"trend" 트리거는 strategies.py의 전략7(Atlas MVP, ADX/EMA 2레짐)
     조건을 그대로 쓴다 — 2026-08-24 챔피언 교체: 리스크캡 상향(5%→10%)+4종목
@@ -164,13 +179,13 @@ def classify_regime_from_bars(df: pd.DataFrame, symbol: str) -> RegimeSignal:
     코드였다(항상 고정 min(2%,3%)=2%만 씀, 백테스트가 검증한 5%와 불일치).
     사용자가 "첫 진입이 최대사이징 아니냐"고 물어서 확인하다가 발견해서 배선."""
     regime_window = df.tail(80)
-    atr = float(ind.wilder_atr(regime_window, 14).iloc[-1])
+    atr = float(ind.wilder_atr(regime_window, atr_period).iloc[-1])
     adx = float(ind.adx(regime_window, 14).iloc[-1])
     ema20 = float(ind.ema(regime_window["close"], 20).iloc[-1])
     ema50 = float(ind.ema(regime_window["close"], 50).iloc[-1])
     close = float(regime_window["close"].iloc[-1])
 
-    current_atr_pct, low_q, high_q = atr_pct_percentile_bounds(df)
+    current_atr_pct, low_q, high_q = atr_pct_percentile_bounds(df, atr_period=atr_period)
     risk_pct = risk_pct_for_atr_pct(current_atr_pct, low_q, high_q)
 
     if adx < 18:
@@ -707,16 +722,31 @@ def evaluate_risk_gates(equity: float, state: RiskGateState, now: datetime | Non
 # 다른 파라미터로 돌면 검증한 숫자가 무의미해진다(TARGET_DTE_RANGE 주석의 옵션
 # 쪽 원칙과 동일).
 CRYPTO_SYMBOLS = ("BTC/USD", "ETH/USD")
-CRYPTO_STOP_ATR_MULT = 2.0
+# 2026-09-02: 라이브 실측 재보정 — 2.0x ATR 손절폭이 BTC/ETH 실제 주간 변동폭
+# (3~4%대)보다 훨씬 넓게(BTC 4%/8%, ETH 7.5%/14.9%) 잡혀 있어, 8/30에 BTC+ETH
+# 합산 미실현이익이 ~$2,150까지 났다가 익절선 근처도 못 가고 그대로 반납되는
+# 걸 실측했다. R_MULTIPLE(보상:리스크 2:1)은 그대로 두고 ATR 배수만 절반으로
+# 줄여 손절·익절 폭을 실측 변동성에 맞춘다. **주의**: 이 상수는 원래
+# docs/design-multi-asset-combined-backtest.md의 백테스트로 검증된 값과
+# 동일해야 한다는 원칙이 있었는데(위 주석), 이번 변경은 대회 마감 임박으로
+# 백테스트 재검증 없이 라이브 관측만으로 조정한 것 — 사후에 백테스트로
+# 재검증 필요.
+CRYPTO_STOP_ATR_MULT = 1.0
 CRYPTO_R_MULTIPLE = 2.0
 CRYPTO_MAX_HOLD_DAYS = 10
 CRYPTO_LOOKBACK_DAYS = ATR_PCT_LOOKBACK_DAYS + 30
 
 
+CRYPTO_ATR_PERIOD = 20  # 옵션쪽 14거래일(≈캘린더 20일)과 같은 실제 기간을 24/7
+# 캘린더 봉으로 보려면 20이 필요(14*7/5≈19.6) — 2026-09-02, atr_pct_percentile_bounds 참고.
+
+
 def fetch_and_classify_crypto_regime(client: CryptoHistoricalDataClient, symbol: str) -> RegimeSignal:
     """옵션의 fetch_and_classify_regime과 동일 패턴, 데이터소스만 크립토.
     레짐 판정 자체(classify_regime_from_bars)는 자산군 무관한 순수함수라
-    재사용한다 — 신규 레짐로직 0줄(백테스트 multi_asset.py와 같은 결정)."""
+    재사용한다 — 신규 레짐로직 0줄(백테스트 multi_asset.py와 같은 결정).
+    단 ATR 기간만 CRYPTO_ATR_PERIOD(20)로 넘겨 옵션쪽 14거래일과 같은
+    캘린더 기간을 보게 맞춘다."""
     req = CryptoBarsRequest(
         symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
         start=datetime.now(timezone.utc) - timedelta(days=CRYPTO_LOOKBACK_DAYS),
@@ -725,7 +755,7 @@ def fetch_and_classify_crypto_regime(client: CryptoHistoricalDataClient, symbol:
     df = bars.xs(symbol, level="symbol") if isinstance(bars.index, pd.MultiIndex) else bars
     df.index = pd.DatetimeIndex(df.index.date)
     df = df[~df.index.duplicated(keep="last")]
-    return classify_regime_from_bars(df, symbol)
+    return classify_regime_from_bars(df, symbol, atr_period=CRYPTO_ATR_PERIOD)
 
 
 @dataclass
