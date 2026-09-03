@@ -908,3 +908,22 @@ def build_crypto_close_intent(symbol: str, qty: str, client_order_id: str) -> di
         "symbol": symbol, "side": "sell", "qty": qty,
         "type": "market", "time_in_force": "gtc", "client_order_id": client_order_id,
     }
+
+
+def build_crypto_trim_intent(
+    symbol: str, current_qty: float, current_price: float, target_notional: float,
+    client_order_id: str, qty_increment: float = 0.0001,
+) -> dict | None:
+    """보유 수량을 target_notional(달러) 상당까지 부분매도 — 2026-09-03 오전
+    크립토 강제 축소용(수동 트리거, mcp_runner 자동 사이클에는 미연동). 이미
+    target_notional 이하면 None(매도 불필요). qty_increment로 내림해서 과다매도
+    (남는 가치가 target보다 작아지는 것) 방지 — 백테스트와 동일한 1e-4 근사."""
+    if current_price <= 0:
+        raise ValueError(f"invalid current_price for trim: {current_price}")
+    sell_qty = current_qty - target_notional / current_price
+    if sell_qty <= 0:
+        return None
+    sell_qty = math.floor(sell_qty / qty_increment) * qty_increment
+    if sell_qty <= 0:
+        return None
+    return build_crypto_close_intent(symbol, f"{sell_qty:.4f}", client_order_id)

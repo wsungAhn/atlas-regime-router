@@ -17,6 +17,7 @@ from signals import (  # noqa: E402
     close_limit_price,
     build_crypto_close_intent,
     build_crypto_order_intent,
+    build_crypto_trim_intent,
     build_iron_condor_intent,
     classify_regime_from_bars,
     contracts_for_max_loss,
@@ -551,3 +552,29 @@ def test_build_crypto_close_intent_sells_full_qty():
     assert intent["side"] == "sell"
     assert intent["qty"] == "0.0512"
     assert intent["symbol"] == "BTC/USD"
+
+
+def test_build_crypto_trim_intent_sells_down_to_target_notional():
+    # 0.1 BTC @ $100,000 = $10,000 보유, $5,000까지 축소 → 0.05 BTC 매도
+    intent = build_crypto_trim_intent("BTC/USD", 0.1, 100_000.0, 5_000.0, "cid-trim")
+    assert intent["side"] == "sell"
+    assert intent["symbol"] == "BTC/USD"
+    assert intent["qty"] == "0.0500"
+
+
+def test_build_crypto_trim_intent_rounds_down_to_qty_increment_never_oversells():
+    # 정확히 나눠떨어지지 않는 경우 내림 — 남는 가치가 target 밑으로 내려가면 안 됨
+    intent = build_crypto_trim_intent("ETH/USD", 3.33333, 3_000.0, 5_000.0, "cid-trim-2")
+    sell_qty = float(intent["qty"])
+    remaining_value = (3.33333 - sell_qty) * 3_000.0
+    assert remaining_value >= 5_000.0
+    assert sell_qty == pytest.approx(1.6666, abs=1e-4)
+
+
+def test_build_crypto_trim_intent_returns_none_when_already_at_or_below_target():
+    assert build_crypto_trim_intent("BTC/USD", 0.03, 100_000.0, 5_000.0, "cid-trim-3") is None
+
+
+def test_build_crypto_trim_intent_rejects_nonpositive_price():
+    with pytest.raises(ValueError):
+        build_crypto_trim_intent("BTC/USD", 0.1, 0.0, 5_000.0, "cid-trim-4")
