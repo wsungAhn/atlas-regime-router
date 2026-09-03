@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -71,7 +72,7 @@ ENV_FILE = REPO_ROOT / ".env.competition"
 
 
 @contextlib.contextmanager
-def _locked(lock_path: Path):
+def _locked(lock_path: Path, timeout_seconds: float = 60.0):
     """프로세스간 상호배제 — registry/*.json은 launchd로 뜨는 독립 프로세스
     여러 개(options-runner/crypto-runner/health-check)가 공유하는데, 지금까지는
     락이 전혀 없어서 "읽고 → 메모리에서 수정 → 통째로 덮어쓰기" 패턴이 그대로
@@ -88,14 +89,36 @@ def _locked(lock_path: Path):
     read-modify-write 전체를 그 안에서 수행해야 lost-update가 없어진다(락
     파일과 실제 데이터 파일을 분리한 이유: 데이터 파일은 os.replace로 계속
     교체되는데, 같은 파일 디스크립터를 잠가야 락이 유효하므로 교체되지 않는
-    전용 락 파일이 필요하다)."""
+    전용 락 파일이 필요하다).
+
+    **2026-09-02 라운드2 감사 지적**: 임계구역 안에 MCP 세션 호출·브로커
+    주문·시세조회 같은 네트워크 I/O가 들어있어서(크립토 포지션 락이 특히
+    그렇다), `LOCK_EX`를 타임아웃 없이 블로킹으로 걸면 한쪽 프로세스의 API
+    호출 하나가 멈추는 순간 다른 launchd 잡(크립토런너/헬스체크)까지 무기한
+    같이 멈출 수 있다 — 레이스를 없애려다 새 무한대기 위험을 만드는 셈이라
+    타임아웃을 둔다. 획득 실패시 TimeoutError를 던져 호출부가 "이번 사이클은
+    건너뛴다"로 처리하게 한다(무기한 대기보다 한 사이클 스킵이 훨씬 안전 —
+    15분 뒤 다음 사이클이 다시 시도한다)."""
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_seconds
     with open(lock_path, "w") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"could not acquire lock {lock_path} within {timeout_seconds}s "
+                        f"— another launchd job is holding it (hung API call?)"
+                    )
+                time.sleep(0.2)
         try:
             yield
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
 SYMBOLS = ("SPY", "QQQ", "GLD", "TLT", "SLV", "IWM", "XLE", "XLF", "DIA")  # 2026-08-25: 지수 2 +
 # 금(GLD)+장기채(TLT)+은(SLV)+소형주(IWM) 4개 추가 — SPY/QQQ만 있으면 "동일종목
 # 여러 개 보유"와 리스크 성격이 비슷해서(사용자 지적) 진짜 다른 자산군으로 분산.
@@ -391,15 +414,22 @@ async def run_cycle_once() -> None:
             # 사이클이 공유하는데, 장중엔 둘이 같은 분(:00/:15/:30/:45)에 동시
             # 실행된다 — 락 없이 load→evaluate→save를 하면 lost-update로 halt/
             # HWM 상태가 사라질 수 있다(킬스위치가 무력화되는 것과 같은 효과).
-            # 임계구역 전체를 프로세스간 락으로 감싼다.
-            with _locked(RISK_GATE_LOCK_PATH):
-                risk_gate_state, state_corrupt = _load_risk_gate_state(equity)
-                if state_corrupt:
-                    # 손상 파일은 그대로 둔다(덮어쓰면 사후분석 불가) — 사람이 고칠 때까지 매 사이클 차단.
-                    risk_gate = RiskGateDecision(True, "state_corrupt_fail_closed", RiskGateState(high_water_mark=equity))
-                else:
-                    risk_gate = evaluate_risk_gates(equity, risk_gate_state)
-                    _save_risk_gate_state(risk_gate.state)
+            # 임계구역 전체를 프로세스간 락으로 감싼다. 락 획득 자체가
+            # 타임아웃되면(다른 프로세스가 API 호출에 걸려 오래 물고 있는 등)
+            # fail-closed — 상태를 알 수 없으니 이번 사이클은 신규진입을 막는다
+            # (state_corrupt와 같은 취급, §_locked 독스트링 참고).
+            try:
+                with _locked(RISK_GATE_LOCK_PATH):
+                    risk_gate_state, state_corrupt = _load_risk_gate_state(equity)
+                    if state_corrupt:
+                        # 손상 파일은 그대로 둔다(덮어쓰면 사후분석 불가) — 사람이 고칠 때까지 매 사이클 차단.
+                        risk_gate = RiskGateDecision(True, "state_corrupt_fail_closed", RiskGateState(high_water_mark=equity))
+                    else:
+                        risk_gate = evaluate_risk_gates(equity, risk_gate_state)
+                        _save_risk_gate_state(risk_gate.state)
+            except TimeoutError:
+                logger.exception("[ERROR] risk_gate_state.json lock timed out — fail-closed this cycle")
+                risk_gate = RiskGateDecision(True, "lock_timeout_fail_closed", RiskGateState(high_water_mark=equity))
             if risk_gate.blocked:
                 logger.info(
                     "[RISK_GATE] reason=%s hwm=%.2f halt_until=%s — 신규진입 억제(청산감시는 계속)",
@@ -623,113 +653,120 @@ async def run_crypto_cycle_once() -> None:
             logger.info("[MACRO] ok=%s reason=%s stage=%s", macro.ok, macro.reason, macro.stage)
 
             # 옵션 사이클과 같은 락 — §위 run_cycle_once 주석 참고.
-            with _locked(RISK_GATE_LOCK_PATH):
-                risk_gate_state, state_corrupt = _load_risk_gate_state(equity)
-                if state_corrupt:
-                    risk_gate = RiskGateDecision(True, "state_corrupt_fail_closed", RiskGateState(high_water_mark=equity))
-                else:
-                    risk_gate = evaluate_risk_gates(equity, risk_gate_state)
-                    _save_risk_gate_state(risk_gate.state)
+            try:
+                with _locked(RISK_GATE_LOCK_PATH):
+                    risk_gate_state, state_corrupt = _load_risk_gate_state(equity)
+                    if state_corrupt:
+                        risk_gate = RiskGateDecision(True, "state_corrupt_fail_closed", RiskGateState(high_water_mark=equity))
+                    else:
+                        risk_gate = evaluate_risk_gates(equity, risk_gate_state)
+                        _save_risk_gate_state(risk_gate.state)
+            except TimeoutError:
+                logger.exception("[ERROR] risk_gate_state.json lock timed out — fail-closed this cycle")
+                risk_gate = RiskGateDecision(True, "lock_timeout_fail_closed", RiskGateState(high_water_mark=equity))
             if risk_gate.blocked:
                 logger.info(
                     "[RISK_GATE] reason=%s hwm=%.2f halt_until=%s — 크립토 신규진입 억제(청산감시는 계속)",
                     risk_gate.reason, risk_gate.state.high_water_mark, risk_gate.state.halt_until,
                 )
 
-            with _locked(CRYPTO_POSITIONS_LOCK_PATH):
-                crypto_positions = _load_crypto_positions()
-                crypto_open_positions = await _crypto_positions_by_symbol(session)
-                # 2026-09-02 실측: 이 함수는 15분마다 도는데, 아래 저장을 매 사이클
-                # 무조건 호출하면(변경 없는 순수 HOLD 사이클에도) health_check.py의
-                # 리컨실 결과(같은 파일, 독립 프로세스, 다른 주기)와 read-modify-write
-                # 경쟁이 생긴다: health_check가 ETH 상태를 복구해 쓴 직후, 이미 그 전에
-                # 파일을 읽어둔(=ETH 없이 읽은) 이 사이클이 뒤늦게 자기 스냅샷을 그대로
-                # 다시 써서 health_check의 복구를 덮어써버린다(8/28·8/29·9/2 세 차례
-                # 실측된 "ETH 상태 소실"의 원인 — health_check.py는 이미
-                # `if changed: _save(...)` 가드가 있는데 여기만 무조건 저장이었다).
-                # 아래에서 실제로 청산(pop)이 일어난 경우에만 저장해서 이 경쟁을 없앤다.
-                crypto_positions_changed = False
+            try:
+                with _locked(CRYPTO_POSITIONS_LOCK_PATH):
+                    crypto_positions = _load_crypto_positions()
+                    crypto_open_positions = await _crypto_positions_by_symbol(session)
+                    # 2026-09-02 실측: 이 함수는 15분마다 도는데, 아래 저장을 매 사이클
+                    # 무조건 호출하면(변경 없는 순수 HOLD 사이클에도) health_check.py의
+                    # 리컨실 결과(같은 파일, 독립 프로세스, 다른 주기)와 read-modify-write
+                    # 경쟁이 생긴다: health_check가 ETH 상태를 복구해 쓴 직후, 이미 그 전에
+                    # 파일을 읽어둔(=ETH 없이 읽은) 이 사이클이 뒤늦게 자기 스냅샷을 그대로
+                    # 다시 써서 health_check의 복구를 덮어써버린다(8/28·8/29·9/2 세 차례
+                    # 실측된 "ETH 상태 소실"의 원인 — health_check.py는 이미
+                    # `if changed: _save(...)` 가드가 있는데 여기만 무조건 저장이었다).
+                    # 아래에서 실제로 청산(pop)이 일어난 경우에만 저장해서 이 경쟁을 없앤다.
+                    crypto_positions_changed = False
 
-                for symbol in CRYPTO_SYMBOLS:
-                    position = crypto_open_positions.get(symbol)
-                    if not position:
-                        continue
-                    state = crypto_positions.get(symbol)
-                    if state is None:
-                        # 상태 파일이 없는데 실제 포지션이 있음(수동개입/상태유실) — fail-closed,
-                        # 사람이 볼 때까지 청산 판단을 못 하니 그대로 둔다(진입은 already_exposed로 막힘).
-                        logger.error("[ERROR] crypto position %s has no stored entry state — leaving open for manual review", symbol)
-                        continue
-                    exit_decision = evaluate_crypto_exit(position, state)
-                    if not exit_decision.should_close:
-                        logger.info("[HOLD] %s(crypto) pnl_pct=%.1f%%", symbol, exit_decision.profit_pct * 100)
-                        continue
-                    qty = str(position.get("qty", "0"))
-                    close_intent = build_crypto_close_intent(
-                        symbol, qty, client_order_id=f"atlas-crypto-close-{symbol.replace('/', '')}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}",
-                    )
-                    try:
-                        close_result = _mcp_data(await session.call_tool("place_crypto_order", close_intent))
-                    except Exception:
-                        logger.exception("[ERROR] crypto close order failed for %s (reason=%s) — will retry next cycle", symbol, exit_decision.reason)
-                        _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "close_order_error", "exit_reason": exit_decision.reason})
-                        continue
-                    broker_error = _order_error(close_result)
-                    if broker_error:
-                        logger.error("[ERROR] crypto close REJECTED for %s (reason=%s): %s — position still open", symbol, exit_decision.reason, broker_error)
-                        _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "close_order_rejected", "exit_reason": exit_decision.reason, "order_intent": close_intent, "order_result": close_result})
-                        continue
-                    logger.info("[CLOSE] %s(crypto) reason=%s pnl_pct=%.1f%%", symbol, exit_decision.reason, exit_decision.profit_pct * 100)
-                    _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": True, "action": "close", "exit_reason": exit_decision.reason, "profit_pct": exit_decision.profit_pct, "order_intent": close_intent, "order_result": close_result})
-                    crypto_positions.pop(symbol, None)
-                    crypto_positions_changed = True
-
-                if crypto_positions_changed:
-                    _save_crypto_positions(crypto_positions)
-
-                if risk_gate.blocked:
                     for symbol in CRYPTO_SYMBOLS:
-                        _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": f"risk_gate:{risk_gate.reason}"})
-                else:
-                    # ponytail: 미체결(아직 안 채워진) 크립토 주문 가드는 없음(옵션의
-                    # _symbols_with_open_orders는 OCC 심볼 전용이라 그대로 재사용 불가) —
-                    # 크립토 시장가 주문은 사실상 즉시체결이라 15분 사이클 간격에서
-                    # 중복진입 확률이 낮다고 판단. 실측으로 문제 되면 그때 추가.
-                    for symbol in CRYPTO_SYMBOLS:
-                        if symbol in crypto_open_positions:
-                            logger.info("[SKIP] %s(crypto) already has open position — no re-entry", symbol)
-                            _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "already_exposed"})
+                        position = crypto_open_positions.get(symbol)
+                        if not position:
                             continue
-                        try:
-                            decision = decide_crypto_for_symbol(crypto_client, symbol, equity, macro, available_cash)
-                        except Exception:
-                            logger.exception("[ERROR] decide_crypto_for_symbol failed for %s — skipping", symbol)
-                            _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "decision_error"})
+                        state = crypto_positions.get(symbol)
+                        if state is None:
+                            # 상태 파일이 없는데 실제 포지션이 있음(수동개입/상태유실) — fail-closed,
+                            # 사람이 볼 때까지 청산 판단을 못 하니 그대로 둔다(진입은 already_exposed로 막힘).
+                            logger.error("[ERROR] crypto position %s has no stored entry state — leaving open for manual review", symbol)
                             continue
-                        if decision.order_intent is None:
-                            logger.info("[SKIP] %s(crypto) regime=%s reason=%s", symbol, decision.regime, decision.skip_reason)
-                            _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "skip_reason": decision.skip_reason, "submitted": False})
+                        exit_decision = evaluate_crypto_exit(position, state)
+                        if not exit_decision.should_close:
+                            logger.info("[HOLD] %s(crypto) pnl_pct=%.1f%%", symbol, exit_decision.profit_pct * 100)
                             continue
-                        try:
-                            order_payload = _mcp_data(await session.call_tool("place_crypto_order", decision.order_intent))
-                        except Exception:
-                            logger.exception("[ERROR] place_crypto_order failed for %s", symbol)
-                            _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "submitted": False, "skip_reason": "order_submit_error"})
-                            continue
-                        broker_error = _order_error(order_payload)
-                        if broker_error:
-                            logger.error("[ERROR] crypto entry REJECTED for %s: %s", symbol, broker_error)
-                            _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "order_result": order_payload, "submitted": False, "skip_reason": "order_rejected"})
-                            continue
-                        logger.info("[SUBMIT] %s(crypto) regime=%s intent=%s", symbol, decision.regime, decision.order_intent)
-                        _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "order_result": order_payload, "submitted": True})
-                        # 체결 확인은 다음 사이클 포지션 조회로 이뤄지지만, stop/target은
-                        # 지금 계산한 값을 바로 저장해야 다음 사이클이 청산판정을 할 수 있다.
-                        crypto_positions[symbol] = CryptoPositionState(
-                            entry_date=datetime.now(timezone.utc).date(),
-                            stop_pct=decision.stop_pct, target_pct=decision.target_pct,
+                        qty = str(position.get("qty", "0"))
+                        close_intent = build_crypto_close_intent(
+                            symbol, qty, client_order_id=f"atlas-crypto-close-{symbol.replace('/', '')}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}",
                         )
+                        try:
+                            close_result = _mcp_data(await session.call_tool("place_crypto_order", close_intent))
+                        except Exception:
+                            logger.exception("[ERROR] crypto close order failed for %s (reason=%s) — will retry next cycle", symbol, exit_decision.reason)
+                            _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "close_order_error", "exit_reason": exit_decision.reason})
+                            continue
+                        broker_error = _order_error(close_result)
+                        if broker_error:
+                            logger.error("[ERROR] crypto close REJECTED for %s (reason=%s): %s — position still open", symbol, exit_decision.reason, broker_error)
+                            _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "close_order_rejected", "exit_reason": exit_decision.reason, "order_intent": close_intent, "order_result": close_result})
+                            continue
+                        logger.info("[CLOSE] %s(crypto) reason=%s pnl_pct=%.1f%%", symbol, exit_decision.reason, exit_decision.profit_pct * 100)
+                        _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": True, "action": "close", "exit_reason": exit_decision.reason, "profit_pct": exit_decision.profit_pct, "order_intent": close_intent, "order_result": close_result})
+                        crypto_positions.pop(symbol, None)
+                        crypto_positions_changed = True
+
+                    if crypto_positions_changed:
                         _save_crypto_positions(crypto_positions)
+
+                    if risk_gate.blocked:
+                        for symbol in CRYPTO_SYMBOLS:
+                            _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": f"risk_gate:{risk_gate.reason}"})
+                    else:
+                        # ponytail: 미체결(아직 안 채워진) 크립토 주문 가드는 없음(옵션의
+                        # _symbols_with_open_orders는 OCC 심볼 전용이라 그대로 재사용 불가) —
+                        # 크립토 시장가 주문은 사실상 즉시체결이라 15분 사이클 간격에서
+                        # 중복진입 확률이 낮다고 판단. 실측으로 문제 되면 그때 추가.
+                        for symbol in CRYPTO_SYMBOLS:
+                            if symbol in crypto_open_positions:
+                                logger.info("[SKIP] %s(crypto) already has open position — no re-entry", symbol)
+                                _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "already_exposed"})
+                                continue
+                            try:
+                                decision = decide_crypto_for_symbol(crypto_client, symbol, equity, macro, available_cash)
+                            except Exception:
+                                logger.exception("[ERROR] decide_crypto_for_symbol failed for %s — skipping", symbol)
+                                _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "decision_error"})
+                                continue
+                            if decision.order_intent is None:
+                                logger.info("[SKIP] %s(crypto) regime=%s reason=%s", symbol, decision.regime, decision.skip_reason)
+                                _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "skip_reason": decision.skip_reason, "submitted": False})
+                                continue
+                            try:
+                                order_payload = _mcp_data(await session.call_tool("place_crypto_order", decision.order_intent))
+                            except Exception:
+                                logger.exception("[ERROR] place_crypto_order failed for %s", symbol)
+                                _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "submitted": False, "skip_reason": "order_submit_error"})
+                                continue
+                            broker_error = _order_error(order_payload)
+                            if broker_error:
+                                logger.error("[ERROR] crypto entry REJECTED for %s: %s", symbol, broker_error)
+                                _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "order_result": order_payload, "submitted": False, "skip_reason": "order_rejected"})
+                                continue
+                            logger.info("[SUBMIT] %s(crypto) regime=%s intent=%s", symbol, decision.regime, decision.order_intent)
+                            _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "order_result": order_payload, "submitted": True})
+                            # 체결 확인은 다음 사이클 포지션 조회로 이뤄지지만, stop/target은
+                            # 지금 계산한 값을 바로 저장해야 다음 사이클이 청산판정을 할 수 있다.
+                            crypto_positions[symbol] = CryptoPositionState(
+                                entry_date=datetime.now(timezone.utc).date(),
+                                stop_pct=decision.stop_pct, target_pct=decision.target_pct,
+                            )
+                            _save_crypto_positions(crypto_positions)
+            except TimeoutError:
+                logger.exception("[ERROR] crypto_positions.json lock timed out — skipping crypto position handling this cycle")
 
 
 async def main() -> None:

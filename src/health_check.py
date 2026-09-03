@@ -201,12 +201,15 @@ def check_crypto_reconciliation(trading_client: TradingClient, crypto_client: Cr
     # health-check가 공유한다(서로 다른 스케줄, 캘린더 비정렬) — mcp_runner.py의
     # 같은 락을 여기서도 써야 "읽어서 missing 판단 → 리컨실해서 쓰기" 전체가
     # crypto-runner의 read-modify-write와 안 겹친다.
-    with _locked(CRYPTO_POSITIONS_LOCK_PATH):
-        stored = _load_crypto_positions()
-        missing = broker_crypto_symbols - set(stored)
-        if not missing:
-            return
-        reconcile_crypto_positions(broker_crypto_symbols, stored, crypto_client)
+    try:
+        with _locked(CRYPTO_POSITIONS_LOCK_PATH):
+            stored = _load_crypto_positions()
+            missing = broker_crypto_symbols - set(stored)
+            if not missing:
+                return
+            reconcile_crypto_positions(broker_crypto_symbols, stored, crypto_client)
+    except TimeoutError:
+        _alert("crypto_positions_lock_timeout", "could not acquire crypto_positions.json lock within timeout — skipping this reconciliation pass, will retry next health-check cycle")
 
 
 def run_health_check() -> None:
