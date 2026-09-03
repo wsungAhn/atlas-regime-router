@@ -582,6 +582,14 @@ def build_close_intent(leg_positions: list[dict], client_order_id: str, limit_pr
     qtys = {abs(float(p["qty"])) for p in leg_positions}
     if len(qtys) != 1:
         raise ValueError(f"leg quantities mismatch, refusing to build close intent: {qtys}")
+    qty_value = qtys.pop()
+    # 2026-09-02 라운드4 감사 지적: 그냥 int()로 캐스팅하면 qty="0"이 "0"짜리
+    # 무의미한 주문 intent가 되고, qty="1.5" 같은 소수는 조용히 1로 잘려나가
+    # 실제 보유수량과 다른 청산주문을 낸다. 옵션은 계약단위(정수)만 유효하므로
+    # 양의 정수가 아니면 예외.
+    if qty_value <= 0 or qty_value != int(qty_value):
+        raise ValueError(f"leg qty must be a positive whole number of contracts, got {qty_value}: refusing to build close intent")
+    qtys = {qty_value}
     legs = []
     for p in leg_positions:
         side_held = str(p["side"]).lower()

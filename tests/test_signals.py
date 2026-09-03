@@ -337,6 +337,19 @@ def test_build_close_intent_rejects_missing_qty():
         build_close_intent(legs, client_order_id="close-1")
 
 
+def test_build_close_intent_rejects_zero_or_fractional_qty():
+    """2026-09-02 라운드4 감사 지적: int()로 캐스팅만 하면 qty="0"이 무의미한
+    0주문이 되고, qty="1.5"는 조용히 1로 잘린다 — 계약은 정수단위만 유효하니
+    양의 정수가 아니면 예외."""
+    for bad_qty in ("0", "1.5"):
+        legs = [
+            {"symbol": "SPY_SHORT", "side": "short", "qty": bad_qty},
+            {"symbol": "SPY_LONG", "side": "long", "qty": bad_qty},
+        ]
+        with pytest.raises(ValueError):
+            build_close_intent(legs, client_order_id="close-1")
+
+
 def test_build_close_intent_rejects_unknown_side():
     """side가 "short"/"long" 둘 다 아니면 전부 long(매도청산) 취급하던 게
     fail-open이었다 — 예상 밖 값이면 예외를 던져 사람이 볼 때까지 막는다."""

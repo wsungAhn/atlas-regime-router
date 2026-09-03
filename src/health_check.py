@@ -30,6 +30,7 @@ import json
 import logging
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -41,6 +42,7 @@ from mcp_runner import (  # noqa: E402
     CRYPTO_POSITIONS_LOCK_PATH,
     CRYPTO_POSITIONS_PATH,
     ENV_FILE,
+    MCP_CALL_TIMEOUT_SECONDS,
     RISK_GATE_STATE_PATH,
     _load_env_file,
     _locked,
@@ -132,7 +134,19 @@ def reconcile_crypto_positions(
     changed = False
     for symbol in sorted(broker_symbols - set(stored)):
         try:
-            signal = fetch_and_classify_crypto_regime(crypto_client, symbol)
+            # 2026-09-02 라운드4 감사 지적: mcp_runner.py 쪽(asyncio)엔 락 안
+            # 네트워크호출에 타임아웃(MCP_CALL_TIMEOUT_SECONDS)을 걸었는데,
+            # health_check.py는 순수 동기 스크립트라 같은 클래스의 호출
+            # (fetch_and_classify_crypto_regime, alpaca-py 블로킹 REST)에
+            # 타임아웃이 없었다 — 이게 hang하면 이 프로세스가
+            # CRYPTO_POSITIONS_LOCK_PATH를 계속 쥐고 있어서 crypto-runner가
+            # 매번 락 타임아웃으로 skip된다(고친 줄 알았는데 파일 하나를
+            # 놓쳤던 경우). asyncio 없이 스레드+concurrent.futures 타임아웃으로
+            # 같은 효과를 낸다.
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                signal = pool.submit(fetch_and_classify_crypto_regime, crypto_client, symbol).result(
+                    timeout=MCP_CALL_TIMEOUT_SECONDS
+                )
             if signal.atr <= 0 or signal.close <= 0:
                 raise ValueError(f"invalid current atr/price for {symbol}")
             stop_pct = (CRYPTO_STOP_ATR_MULT * signal.atr) / signal.close
