@@ -569,12 +569,22 @@ def build_close_intent(leg_positions: list[dict], client_order_id: str, limit_pr
     있었다. 전량청산은 모든 레그가 같은 수량이어야 의미가 있으므로, 수량이
     안 맞으면 예외를 던져 청산 자체를 막는다(fail-closed — 잘못된 수량으로
     청산 주문을 내는 것보다 사람이 볼 때까지 포지션을 열어두는 게 낫다)."""
-    qtys = {abs(float(p.get("qty", 1))) for p in leg_positions}
+    # 2026-09-02 라운드3 감사 지적: qty 누락시 1로 기본값·side가 "short"가
+    # 아니면 전부 long 취급하던 게 fail-open이었다 — 브로커 응답 shape가
+    # 흔들리면(필드 누락, 오타, 예상 밖 값) 실제 수량과 다른 청산주문을
+    # 조용히 만들어낼 수 있었다. 위 qty-mismatch 검증과 같은 fail-closed
+    # 원칙을 qty 존재여부·side 값 자체에도 적용한다.
+    for p in leg_positions:
+        if "qty" not in p or p.get("qty") in (None, ""):
+            raise ValueError(f"leg missing qty, refusing to build close intent: {p.get('symbol')!r}")
+        if str(p.get("side", "")).lower() not in ("short", "long"):
+            raise ValueError(f"leg has unknown side {p.get('side')!r}, refusing to build close intent: {p.get('symbol')!r}")
+    qtys = {abs(float(p["qty"])) for p in leg_positions}
     if len(qtys) != 1:
         raise ValueError(f"leg quantities mismatch, refusing to build close intent: {qtys}")
     legs = []
     for p in leg_positions:
-        side_held = str(p.get("side", "")).lower()
+        side_held = str(p["side"]).lower()
         if side_held == "short":
             side, intent = "buy", "buy_to_close"
         else:

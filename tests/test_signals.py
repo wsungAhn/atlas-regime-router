@@ -325,6 +325,29 @@ def test_build_close_intent_rejects_mismatched_leg_quantities():
         build_close_intent(legs, client_order_id="close-1")
 
 
+def test_build_close_intent_rejects_missing_qty():
+    """2026-09-02 라운드3 감사 지적: qty 누락시 1로 기본값 처리하던 게
+    fail-open이었다 — 브로커 응답에서 필드가 빠지면 실제 수량과 다른 청산
+    주문을 조용히 낼 수 있었다. 없으면 예외."""
+    legs = [
+        {"symbol": "SPY_SHORT", "side": "short"},  # qty 없음
+        {"symbol": "SPY_LONG", "side": "long", "qty": "3"},
+    ]
+    with pytest.raises(ValueError):
+        build_close_intent(legs, client_order_id="close-1")
+
+
+def test_build_close_intent_rejects_unknown_side():
+    """side가 "short"/"long" 둘 다 아니면 전부 long(매도청산) 취급하던 게
+    fail-open이었다 — 예상 밖 값이면 예외를 던져 사람이 볼 때까지 막는다."""
+    legs = [
+        {"symbol": "SPY_WEIRD", "side": "flat", "qty": "3"},  # 알 수 없는 side
+        {"symbol": "SPY_LONG", "side": "long", "qty": "3"},
+    ]
+    with pytest.raises(ValueError):
+        build_close_intent(legs, client_order_id="close-1")
+
+
 # ── 계좌 레벨 리스크게이트 (2026-08-24 라이브 배선 — 내일 개장 전 마지막 안전장치) ──
 
 def test_risk_gate_ok_when_no_drawdown():

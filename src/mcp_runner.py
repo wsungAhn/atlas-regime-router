@@ -175,6 +175,19 @@ def _setup_logging() -> None:
     logger.addHandler(console_handler)
 
 
+MCP_CALL_TIMEOUT_SECONDS = 30.0  # 2026-09-02 라운드3 감사: crypto_positions.json
+# 락을 쥔 채 도는 MCP 호출이 hang하면 그 프로세스가 락을 영원히 들고 있게 되고,
+# 대기자 타임아웃(4213a31)은 대기자만 구제할 뿐 크립토 처리 자체는 계속 멈춰
+# 있는다. 락 안의 호출을 이 타임아웃으로 감싸서 홀더 쪽도 유한시간 안에
+# 실패하게 만든다 — 기존 개별 try/except Exception이 이미 각 호출을 감싸고
+# 있으므로, asyncio.TimeoutError(Exception 서브클래스)를 던지면 그 자리에서
+# "이번 사이클은 실패로 기록하고 다음 사이클 재시도"로 자연스럽게 흡수된다.
+
+
+async def _call_tool(session: ClientSession, name: str, payload: dict, timeout: float = MCP_CALL_TIMEOUT_SECONDS):
+    return await asyncio.wait_for(session.call_tool(name, payload), timeout=timeout)
+
+
 def _mcp_data(tool_result) -> dict:
     """alpaca-mcp-server는 모든 응답을 {"_alpaca_mcp_security": {...}, "data": {...}}로
     감싼다 — 이 헬퍼가 실제 페이로드만 벗겨낸다(실측 확인, 문서에 안 나와 있었음)."""
@@ -278,7 +291,7 @@ async def _crypto_positions_by_symbol(session: ClientSession) -> dict[str, dict]
     청산감시(evaluate_crypto_exit)가 둘 다 무력화된다. 슬래시를 지운 키로
     매칭하고, CryptoPositionState 조회용으로는 CRYPTO_SYMBOLS(슬래시 있는 정규
     표기)로 다시 매핑해서 반환한다."""
-    positions = _mcp_data(await session.call_tool("get_all_positions", {})).get("result", [])
+    positions = _mcp_data(await _call_tool(session, "get_all_positions", {})).get("result", [])
     by_stripped = {p["symbol"].replace("/", ""): p for p in positions if p.get("symbol")}
     return {
         symbol: by_stripped[symbol.replace("/", "")]
@@ -288,7 +301,7 @@ async def _crypto_positions_by_symbol(session: ClientSession) -> dict[str, dict]
 
 
 async def _positions_by_symbol(session: ClientSession) -> dict[str, list[dict]]:
-    positions = _mcp_data(await session.call_tool("get_all_positions", {})).get("result", [])
+    positions = _mcp_data(await _call_tool(session, "get_all_positions", {})).get("result", [])
     grouped: dict[str, list[dict]] = {}
     for p in positions:
         base = _underlying_of(p.get("symbol", ""))
@@ -704,7 +717,7 @@ async def run_crypto_cycle_once() -> None:
                             symbol, qty, client_order_id=f"atlas-crypto-close-{symbol.replace('/', '')}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}",
                         )
                         try:
-                            close_result = _mcp_data(await session.call_tool("place_crypto_order", close_intent))
+                            close_result = _mcp_data(await _call_tool(session, "place_crypto_order", close_intent))
                         except Exception:
                             logger.exception("[ERROR] crypto close order failed for %s (reason=%s) — will retry next cycle", symbol, exit_decision.reason)
                             _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "close_order_error", "exit_reason": exit_decision.reason})
@@ -736,7 +749,16 @@ async def run_crypto_cycle_once() -> None:
                                 _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "already_exposed"})
                                 continue
                             try:
-                                decision = decide_crypto_for_symbol(crypto_client, symbol, equity, macro, available_cash)
+                                # decide_crypto_for_symbol은 동기함수라 alpaca-py의
+                                # 블로킹 REST 호출을 그대로 물고 있다 — asyncio.wait_for를
+                                # 직접 걸 수 없어 to_thread로 스레드에 위임해야 타임아웃이
+                                # 먹는다(2026-09-02 라운드3: 락 안에서 이게 hang하면
+                                # 위 MCP_CALL_TIMEOUT_SECONDS 감싸기와 같은 이유로 락을
+                                # 영원히 물게 된다).
+                                decision = await asyncio.wait_for(
+                                    asyncio.to_thread(decide_crypto_for_symbol, crypto_client, symbol, equity, macro, available_cash),
+                                    timeout=MCP_CALL_TIMEOUT_SECONDS,
+                                )
                             except Exception:
                                 logger.exception("[ERROR] decide_crypto_for_symbol failed for %s — skipping", symbol)
                                 _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "decision_error"})
@@ -746,7 +768,7 @@ async def run_crypto_cycle_once() -> None:
                                 _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "skip_reason": decision.skip_reason, "submitted": False})
                                 continue
                             try:
-                                order_payload = _mcp_data(await session.call_tool("place_crypto_order", decision.order_intent))
+                                order_payload = _mcp_data(await _call_tool(session, "place_crypto_order", decision.order_intent))
                             except Exception:
                                 logger.exception("[ERROR] place_crypto_order failed for %s", symbol)
                                 _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "submitted": False, "skip_reason": "order_submit_error"})
