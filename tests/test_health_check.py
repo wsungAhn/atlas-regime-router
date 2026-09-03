@@ -86,6 +86,7 @@ def test_reconcile_writes_to_disk_atomically(monkeypatch, tmp_path):
     positions_path = tmp_path / "crypto_positions.json"
     monkeypatch.setattr(health_check, "CRYPTO_POSITIONS_PATH", positions_path)
     monkeypatch.setattr(health_check, "fetch_and_classify_crypto_regime", lambda client, symbol: _fake_signal(atr=3.0, close=50.0))
+    monkeypatch.setattr(health_check, "_notify", lambda title, message: None)  # 라운드7: 실제 알림 팝업 방지
 
     health_check.reconcile_crypto_positions(
         broker_symbols={"BTC/USD"},
@@ -96,7 +97,11 @@ def test_reconcile_writes_to_disk_atomically(monkeypatch, tmp_path):
 
     on_disk = json.loads(positions_path.read_text())
     assert "BTC/USD" in on_disk
-    assert not positions_path.with_suffix(".json.tmp").exists()
+    # 라운드7 감사 발견: 2026-09-02에 tmp 파일명을 pid-unique로 바꿨는데
+    # (crypto_positions.<pid>.json.tmp) 이 assertion은 옛 이름(".json.tmp")만
+    # 확인해서, 실제 tmp 파일이 안 지워져도 이 테스트는 항상 통과하는
+    # 무의미한 체크가 돼 있었다 — glob으로 실제 패턴을 확인.
+    assert not list(tmp_path.glob("crypto_positions.*.json.tmp"))
 
 
 def test_check_risk_gate_state_alerts_on_corrupt_json(monkeypatch, tmp_path):
