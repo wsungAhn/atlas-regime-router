@@ -594,6 +594,16 @@ async def run_crypto_cycle_once() -> None:
 
             crypto_positions = _load_crypto_positions()
             crypto_open_positions = await _crypto_positions_by_symbol(session)
+            # 2026-09-02 실측: 이 함수는 15분마다 도는데, 아래 저장을 매 사이클
+            # 무조건 호출하면(변경 없는 순수 HOLD 사이클에도) health_check.py의
+            # 리컨실 결과(같은 파일, 독립 프로세스, 다른 주기)와 read-modify-write
+            # 경쟁이 생긴다: health_check가 ETH 상태를 복구해 쓴 직후, 이미 그 전에
+            # 파일을 읽어둔(=ETH 없이 읽은) 이 사이클이 뒤늦게 자기 스냅샷을 그대로
+            # 다시 써서 health_check의 복구를 덮어써버린다(8/28·8/29·9/2 세 차례
+            # 실측된 "ETH 상태 소실"의 원인 — health_check.py는 이미
+            # `if changed: _save(...)` 가드가 있는데 여기만 무조건 저장이었다).
+            # 아래에서 실제로 청산(pop)이 일어난 경우에만 저장해서 이 경쟁을 없앤다.
+            crypto_positions_changed = False
 
             for symbol in CRYPTO_SYMBOLS:
                 position = crypto_open_positions.get(symbol)
@@ -627,8 +637,10 @@ async def run_crypto_cycle_once() -> None:
                 logger.info("[CLOSE] %s(crypto) reason=%s pnl_pct=%.1f%%", symbol, exit_decision.reason, exit_decision.profit_pct * 100)
                 _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": True, "action": "close", "exit_reason": exit_decision.reason, "profit_pct": exit_decision.profit_pct, "order_intent": close_intent, "order_result": close_result})
                 crypto_positions.pop(symbol, None)
+                crypto_positions_changed = True
 
-            _save_crypto_positions(crypto_positions)
+            if crypto_positions_changed:
+                _save_crypto_positions(crypto_positions)
 
             if risk_gate.blocked:
                 for symbol in CRYPTO_SYMBOLS:
