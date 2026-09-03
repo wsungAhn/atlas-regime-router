@@ -14,11 +14,21 @@ def _fake_signal(atr: float, close: float) -> SimpleNamespace:
     return SimpleNamespace(atr=atr, close=close, regime="trend_up")
 
 
-def test_reconcile_reconstructs_missing_state_for_open_broker_position(monkeypatch):
+def test_reconcile_reconstructs_missing_state_for_open_broker_position(monkeypatch, tmp_path):
     """The exact 2026-08-28 incident: broker has an open position, local state
     doesn't. The reconciler must fill it in (not just alert) so the next
-    mcp_runner cycle can evaluate_crypto_exit instead of holding forever."""
+    mcp_runner cycle can evaluate_crypto_exit instead of holding forever.
+
+    2026-09-02 라운드6 감사 발견: 이 테스트가 CRYPTO_POSITIONS_PATH를
+    monkeypatch 안 해서, changed=True가 되는 순간 _save_crypto_positions가
+    **진짜 라이브 registry/crypto_positions.json**을 이 테스트의 가짜 값으로
+    덮어쓰고 있었다 — 오늘 밤 이 파일을 대상으로 pytest를 반복 실행하는 동안
+    실제로 여러 차례 ETH/USD 상태가 통째로 사라지는 사고가 났다(그중 최소
+    한 번은 원인불명으로 남겨뒀던 21:39 미스터리 write가 바로 이거였을
+    가능성이 높다). tmp_path로 격리."""
+    monkeypatch.setattr(health_check, "CRYPTO_POSITIONS_PATH", tmp_path / "crypto_positions.json")
     monkeypatch.setattr(health_check, "fetch_and_classify_crypto_regime", lambda client, symbol: _fake_signal(atr=2.0, close=100.0))
+    monkeypatch.setattr(health_check, "_notify", lambda title, message: None)  # 실제 macOS 알림 팝업 방지
 
     repaired = health_check.reconcile_crypto_positions(
         broker_symbols={"BTC/USD"},
@@ -34,7 +44,11 @@ def test_reconcile_reconstructs_missing_state_for_open_broker_position(monkeypat
     assert state.target_pct == health_check.CRYPTO_R_MULTIPLE * state.stop_pct
 
 
-def test_reconcile_leaves_already_tracked_symbols_untouched(monkeypatch):
+def test_reconcile_leaves_already_tracked_symbols_untouched(monkeypatch, tmp_path):
+    # 이 테스트는 changed=False라 저장 자체가 안 되지만, 방어적으로 여기도
+    # 격리한다(§위 라운드6 감사 발견 — 앞으로 이 함수가 바뀌어도 실제
+    # registry를 건드릴 길이 아예 없게).
+    monkeypatch.setattr(health_check, "CRYPTO_POSITIONS_PATH", tmp_path / "crypto_positions.json")
     monkeypatch.setattr(
         health_check, "fetch_and_classify_crypto_regime",
         lambda client, symbol: (_ for _ in ()).throw(AssertionError("should not be called for a symbol that already has stored state")),
@@ -51,7 +65,8 @@ def test_reconcile_leaves_already_tracked_symbols_untouched(monkeypatch):
     assert repaired["BTC/USD"] is existing
 
 
-def test_reconcile_alerts_but_does_not_crash_when_reconstruction_fails(monkeypatch):
+def test_reconcile_alerts_but_does_not_crash_when_reconstruction_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(health_check, "CRYPTO_POSITIONS_PATH", tmp_path / "crypto_positions.json")  # 방어적 격리, 위와 동일 사유
     alerts = []
     monkeypatch.setattr(health_check, "_alert", lambda reason, detail: alerts.append(reason))
     monkeypatch.setattr(health_check, "fetch_and_classify_crypto_regime", lambda client, symbol: _fake_signal(atr=0.0, close=100.0))
