@@ -350,6 +350,18 @@ def test_build_close_intent_rejects_zero_or_fractional_qty():
             build_close_intent(legs, client_order_id="close-1")
 
 
+def test_build_close_intent_rejects_infinite_qty_as_valueerror_not_overflowerror():
+    """2026-09-02 라운드5 감사 지적: qty="inf"는 math.isfinite 체크 없이 int()를
+    부르면 ValueError가 아니라 OverflowError가 나서 호출부의 `except ValueError`를
+    뚫고 지나간다 — 항상 같은 예외 타입으로 fail-closed 되는지 확인."""
+    legs = [
+        {"symbol": "SPY_SHORT", "side": "short", "qty": "inf"},
+        {"symbol": "SPY_LONG", "side": "long", "qty": "inf"},
+    ]
+    with pytest.raises(ValueError):
+        build_close_intent(legs, client_order_id="close-1")
+
+
 def test_build_close_intent_rejects_unknown_side():
     """side가 "short"/"long" 둘 다 아니면 전부 long(매도청산) 취급하던 게
     fail-open이었다 — 예상 밖 값이면 예외를 던져 사람이 볼 때까지 막는다."""

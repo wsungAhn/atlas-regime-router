@@ -14,6 +14,7 @@ MCP서버/CLI 사용). 이 분리 덕분에:
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -587,7 +588,11 @@ def build_close_intent(leg_positions: list[dict], client_order_id: str, limit_pr
     # 무의미한 주문 intent가 되고, qty="1.5" 같은 소수는 조용히 1로 잘려나가
     # 실제 보유수량과 다른 청산주문을 낸다. 옵션은 계약단위(정수)만 유효하므로
     # 양의 정수가 아니면 예외.
-    if qty_value <= 0 or qty_value != int(qty_value):
+    # 2026-09-02 라운드5 감사 지적: qty="inf"는 math.isfinite 체크 없이 바로
+    # int()를 부르면 ValueError가 아니라 OverflowError가 나서(qty="nan"은
+    # 우연히 ValueError라 잡히지만 "inf"는 안 잡힘) 호출부의 `except ValueError`를
+    # 뚫고 나간다 — 유한값인지 먼저 확인해서 항상 같은 예외 타입으로 fail-closed.
+    if not math.isfinite(qty_value) or qty_value <= 0 or qty_value != int(qty_value):
         raise ValueError(f"leg qty must be a positive whole number of contracts, got {qty_value}: refusing to build close intent")
     qtys = {qty_value}
     legs = []

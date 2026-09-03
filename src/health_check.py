@@ -143,10 +143,22 @@ def reconcile_crypto_positions(
             # 매번 락 타임아웃으로 skip된다(고친 줄 알았는데 파일 하나를
             # 놓쳤던 경우). asyncio 없이 스레드+concurrent.futures 타임아웃으로
             # 같은 효과를 낸다.
-            with ThreadPoolExecutor(max_workers=1) as pool:
+            # 2026-09-02 라운드5 감사 지적: `with ThreadPoolExecutor(...) as pool`을
+            # 쓰면 __exit__가 shutdown(wait=True)를 불러서, .result(timeout=...)가
+            # TimeoutError를 던진 뒤에도 이 with 블록 자체는 워커 스레드가 실제로
+            # 끝날 때까지 계속 기다린다 — 타임아웃을 걸어놓고 그 위를 다시 블로킹
+            # 대기로 덮어버린 것(Codex가 timeout=0.1인데 실측 2초 걸리는 걸로
+            # 재현·증명). shutdown(wait=False)를 명시해서 타임아웃이 실제로
+            # 타임아웃이 되게 한다 — 워커 스레드 자체는 못 죽이니(스레드 강제종료
+            # 불가는 파이썬 구조적 한계) 계속 백그라운드에 남지만, 최소한 이
+            # 프로세스가 락을 계속 쥐고 있는 일은 없앤다.
+            pool = ThreadPoolExecutor(max_workers=1)
+            try:
                 signal = pool.submit(fetch_and_classify_crypto_regime, crypto_client, symbol).result(
                     timeout=MCP_CALL_TIMEOUT_SECONDS
                 )
+            finally:
+                pool.shutdown(wait=False)
             if signal.atr <= 0 or signal.close <= 0:
                 raise ValueError(f"invalid current atr/price for {symbol}")
             stop_pct = (CRYPTO_STOP_ATR_MULT * signal.atr) / signal.close
