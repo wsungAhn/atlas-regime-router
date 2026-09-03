@@ -402,13 +402,22 @@ def decide_for_symbol(
     symbol: str,
     equity: float,
     macro: MacroGate,
+    signal: RegimeSignal | None = None,
+    available_buying_power: float | None = None,
 ) -> CycleDecision:
     """한 종목에 대해 이번 사이클의 결정을 만든다 — 순수 결정 로직, 실제 주문 제출은 안 함.
-    이 함수는 MCP 미연결 상태에서도(시장데이터만 있으면) 전부 테스트 가능해야 한다."""
+    이 함수는 MCP 미연결 상태에서도(시장데이터만 있으면) 전부 테스트 가능해야 한다.
+
+    signal: 호출부가 우선순위 정렬을 위해 이미 조회해둔 RegimeSignal이 있으면 그대로
+    재사용(API 재호출 방지). available_buying_power: 실제 매수여력 상한 — 크립토
+    쪽(decide_crypto_for_symbol)엔 2026-08-26부터 있었는데 옵션 쪽엔 없어서, 계좌
+    매수여력이 부족한 날 신규진입이 전부 브로커 거부로 낭비되는 문제가 있었다
+    (2026-09-02, 사용자 지적으로 발견)."""
     if not macro.ok:
         return CycleDecision(symbol, "n/a", macro, None, f"macro_gate_blocked:{macro.reason}")
 
-    signal = fetch_and_classify_regime(stock_client, symbol)
+    if signal is None:
+        signal = fetch_and_classify_regime(stock_client, symbol)
     if signal.regime == "cash":
         return CycleDecision(symbol, signal.regime, macro, None, "regime_cash")
 
@@ -419,6 +428,10 @@ def decide_for_symbol(
     # 종목당 동시보유 1개(_symbols_with_open_exposure 가드)라 same-underlying
     # 상한은 이 시점에 이미 자동 충족된다.
     risk_budget = equity * signal.risk_pct
+    if available_buying_power is not None:
+        risk_budget = min(risk_budget, max(0.0, available_buying_power))
+        if risk_budget <= 0:
+            return CycleDecision(symbol, signal.regime, macro, None, "insufficient_buying_power")
     cid_base = f"atlas-{symbol}-{datetime.now(timezone.utc):%Y%m%d%H%M%S}"
 
     if signal.regime == "range":

@@ -50,6 +50,7 @@ from signals import (  # noqa: E402
     evaluate_crypto_exit,
     evaluate_exit,
     evaluate_risk_gates,
+    fetch_and_classify_regime,
     load_macro_gate,
 )
 from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: E402
@@ -326,8 +327,17 @@ async def run_cycle_once() -> None:
                 logger.info("[NOOP] market closed (next_open=%s) — skipping cycle", clock.get("next_open"))
                 return
 
-            equity = float(_mcp_data(await session.call_tool("get_account_info", {}))["equity"])
-            logger.info("[CYCLE] market open, equity=%.2f", equity)
+            account_info = _mcp_data(await session.call_tool("get_account_info", {}))
+            equity = float(account_info["equity"])
+            # 2026-09-02 실측: risk_budget = equity * risk_pct로 사이징하는데 실제
+            # 매수여력(options_buying_power)을 전혀 안 봐서, 크립토 슬리브가 계좌
+            # 대부분을 선점한 날엔 신규 옵션 진입이 전부(기존 6종목+신규 XLE/XLF/DIA
+            # 무관하게) "insufficient options buying power"로 매 사이클 거부됐다
+            # (하루 종일, 수십 건). 크립토 쪽은 이미 available_cash 캡이 있었는데
+            # (2026-08-26) 옵션 쪽엔 대응 로직 자체가 없었던 설계 결함 — 사용자 지적으로
+            # 발견. equity 기준 캡과 별개로 실제 매수여력 기준 캡을 추가로 씌운다.
+            options_buying_power = float(account_info.get("options_buying_power", equity))
+            logger.info("[CYCLE] market open, equity=%.2f options_buying_power=%.2f", equity, options_buying_power)
 
             stock_client = StockHistoricalDataClient(
                 os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"]
@@ -441,6 +451,7 @@ async def run_cycle_once() -> None:
             if symbols_with_exposure:
                 logger.info("[EXPOSURE] already open/pending: %s", sorted(symbols_with_exposure))
 
+            eligible_symbols = []
             for symbol in SYMBOLS:
                 if symbol in symbols_with_exposure:
                     # 15분마다 도는데 레짐이 몇 시간 지속되면 매 사이클 새 포지션을
@@ -451,12 +462,53 @@ async def run_cycle_once() -> None:
                     logger.info("[SKIP] %s already has open position/order — no re-entry", symbol)
                     _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "already_exposed"})
                     continue
+                eligible_symbols.append(symbol)
+
+            # 2026-09-02: 여러 종목이 같은 사이클에 동시에 신호를 내면 매수여력을
+            # 놓고 서로 경쟁한다(예산경쟁) — 예전엔 SYMBOLS 튜플 순서(=사실상
+            # 임의 순서)대로 먼저 온 놈이 임자였다. 신호가 먼저 레짐부터 조회해서
+            # ADX가 18~20 "판단불가 구간"에서 얼마나 멀리 떨어져 있는지(=신호
+            # 확신도)로 강한 신호부터 처리하도록 우선순위를 매긴다 — 매수여력이
+            # 부족한 날엔 강한 신호가 먼저 예산을 가져가고, 약한 신호는 남는 게
+            # 없으면 자연스럽게 밀려난다(사용자 지적으로 도입).
+            ranked: list[tuple[float, str, object]] = []
+            if macro.ok:
+                for symbol in eligible_symbols:
+                    try:
+                        sig = fetch_and_classify_regime(stock_client, symbol)
+                    except Exception:
+                        logger.exception("[ERROR] regime fetch failed for %s — skipping this symbol", symbol)
+                        _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "decision_error"})
+                        continue
+                    if sig.regime == "cash":
+                        logger.info("[SKIP] %s regime=cash reason=regime_cash", symbol)
+                        _log_decision({"symbol": symbol, "regime": sig.regime, "skip_reason": "regime_cash", "submitted": False})
+                        continue
+                    strength = (sig.adx - 20.0) if sig.adx > 20 else (18.0 - sig.adx)
+                    ranked.append((strength, symbol, sig))
+                ranked.sort(key=lambda t: t[0], reverse=True)
+                if ranked:
+                    logger.info("[PRIORITY] %s", [f"{s}(strength={st:.1f})" for st, s, _ in ranked])
+            else:
+                # 매크로게이트가 막힌 사이클은 전부 macro_gate_blocked로 끝날 걸
+                # 알고 있으니 우선순위 조회(API 호출)를 아낀다 — decide_for_symbol이
+                # 알아서 macro.ok부터 체크하고 즉시 반환한다.
+                ranked = [(0.0, symbol, None) for symbol in eligible_symbols]
+
+            remaining_buying_power = options_buying_power
+            for _strength, symbol, cached_signal in ranked:
                 try:
-                    decision = decide_for_symbol(stock_client, option_client, symbol, equity, macro)
+                    decision = decide_for_symbol(
+                        stock_client, option_client, symbol, equity, macro,
+                        signal=cached_signal, available_buying_power=remaining_buying_power,
+                    )
                 except Exception:
                     logger.exception("[ERROR] decide_for_symbol failed for %s — skipping this symbol", symbol)
                     _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "decision_error"})
                     continue
+
+                if decision.order_intent is not None and cached_signal is not None:
+                    remaining_buying_power = max(0.0, remaining_buying_power - equity * cached_signal.risk_pct)
 
                 if decision.order_intent is None:
                     logger.info("[SKIP] %s regime=%s reason=%s", symbol, decision.regime, decision.skip_reason)
