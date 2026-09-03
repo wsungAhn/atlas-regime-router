@@ -38,10 +38,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from mcp_runner import (  # noqa: E402
+    CRYPTO_POSITIONS_LOCK_PATH,
     CRYPTO_POSITIONS_PATH,
     ENV_FILE,
     RISK_GATE_STATE_PATH,
     _load_env_file,
+    _locked,
 )
 from signals import (  # noqa: E402
     CRYPTO_R_MULTIPLE,
@@ -109,7 +111,7 @@ def _load_crypto_positions() -> dict[str, CryptoPositionState]:
 def _save_crypto_positions(positions: dict[str, CryptoPositionState]) -> None:
     """mcp_runner._save_crypto_positions와 동일한 원자적 치환 패턴(임시파일 쓰고
     os.replace) — 리컨실 도중 죽어도 절반만 쓰인 손상 파일을 안 남긴다."""
-    tmp_path = CRYPTO_POSITIONS_PATH.with_suffix(".json.tmp")
+    tmp_path = CRYPTO_POSITIONS_PATH.with_suffix(f".{os.getpid()}.json.tmp")
     tmp_path.write_text(json.dumps({s: p.to_dict() for s, p in positions.items()}))
     os.replace(tmp_path, CRYPTO_POSITIONS_PATH)
 
@@ -195,11 +197,16 @@ def check_crypto_reconciliation(trading_client: TradingClient, crypto_client: Cr
         for symbol in CRYPTO_SYMBOLS
         if symbol.replace("/", "") in {p.symbol for p in positions}
     }
-    stored = _load_crypto_positions()
-    missing = broker_crypto_symbols - set(stored)
-    if not missing:
-        return
-    reconcile_crypto_positions(broker_crypto_symbols, stored, crypto_client)
+    # 2026-09-02 전체감사 §4: crypto_positions.json은 crypto-runner와 이
+    # health-check가 공유한다(서로 다른 스케줄, 캘린더 비정렬) — mcp_runner.py의
+    # 같은 락을 여기서도 써야 "읽어서 missing 판단 → 리컨실해서 쓰기" 전체가
+    # crypto-runner의 read-modify-write와 안 겹친다.
+    with _locked(CRYPTO_POSITIONS_LOCK_PATH):
+        stored = _load_crypto_positions()
+        missing = broker_crypto_symbols - set(stored)
+        if not missing:
+            return
+        reconcile_crypto_positions(broker_crypto_symbols, stored, crypto_client)
 
 
 def run_health_check() -> None:
