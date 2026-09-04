@@ -19,6 +19,7 @@ atr_grid_options_trading_competition_paper.md)의 5개 전략.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 
 import pandas as pd
 
@@ -166,6 +167,30 @@ def strategy7_atlas_mvp_signals(df: pd.DataFrame, min_history: int = 60) -> list
     return out
 
 
+# ── 전략 7b: Atlas MVP + 히스테리시스 (2026-09-04, 크립토 재진입 휩쏘 지적
+#    이후 공통 레짐 판별계층 재검증 — docs/design-crypto-strategy-refinement-
+#    2026-09-04.md §7) — ADX 18/20 경계 근처에서 하루짜리 노이즈로 레짐이
+#    뒤집혔다 돌아오는 걸 줄이려고, confirm_days 연속 같은 판정일 때만 신호를
+#    낸다. 전략7과 신호 종류(iron_condor/bull_put/bear_call)는 완전히 동일 —
+#    "언제 신호를 믿을지"만 다르다. `ALL_STRATEGIES[name](df)`가 인자 하나만
+#    넘기므로 confirm_days별 변형은 functools.partial로 등록한다. ──
+def strategy7b_atlas_hysteresis_signals(df: pd.DataFrame, min_history: int = 60, confirm_days: int = 2) -> list[StrategySignal]:
+    d = _common_indicators(df)
+    regime = pd.Series(index=d.index, dtype=object)
+    regime[d["adx"] < 18] = "iron_condor"
+    regime[(d["adx"] > 20) & (d["ema20"] > d["ema50"])] = "bull_put"
+    regime[(d["adx"] > 20) & (d["ema20"] < d["ema50"])] = "bear_call"
+    out = []
+    for i in range(min_history, len(d)):
+        if pd.isna(d["adx"].iloc[i]):
+            continue
+        window = regime.iloc[i - confirm_days + 1 : i + 1]
+        if len(window) < confirm_days or window.isna().any() or window.nunique() != 1:
+            continue
+        out.append(StrategySignal(d.index[i], window.iloc[-1]))
+    return out
+
+
 # ── 전략 8: 일목균형표 구름 돌파 + RSI50 (사용자 제공 PDF "일목균형표+RSI
 #    6개 전략" 문서의 전략1을 방향성 크레딧 스프레드로 매핑 — 롱 셋업(원문
 #    그대로)은 bull_put, 숏 셋업(원문엔 없음, 이 엔진이 양방향 크레딧을
@@ -248,6 +273,8 @@ ALL_STRATEGIES = {
     "5_mean_reversion_condor": strategy5_mean_reversion_condor_signals,
     "6_alphabot_pullback": strategy6_alphabot_pullback_signals,
     "7_atlas_mvp": strategy7_atlas_mvp_signals,
+    "7b_hysteresis_2d": partial(strategy7b_atlas_hysteresis_signals, confirm_days=2),
+    "7c_hysteresis_3d": partial(strategy7b_atlas_hysteresis_signals, confirm_days=3),
     "8_ichimoku_cloud": strategy8_ichimoku_cloud_signals,
     "9_golden_cross": strategy9_golden_cross_signals,
     "10_ema_macd_momentum": strategy10_ema_macd_momentum_signals,
