@@ -22,6 +22,7 @@ from alpaca.trading.client import TradingClient
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DECISION_LOG = REPO_ROOT / "registry" / "decisions.jsonl"
 REPORTS_DIR = REPO_ROOT / "reports"
+EQUITY_HISTORY_PATH = REPO_ROOT / "registry" / "equity_history.jsonl"
 ENV_FILE = REPO_ROOT / ".env.competition"
 MARKET_TZ = ZoneInfo("America/New_York")  # 거래일 경계는 항상 미 동부시간 기준
 # (PT 늦은밤엔 UTC 날짜가 이미 다음날로 넘어가 있어서 UTC 기준으로 자르면
@@ -93,6 +94,23 @@ def _actually_filled(client: TradingClient, record: dict) -> bool:
     return str(order.status.value if hasattr(order.status, "value") else order.status).lower() in _FILLED_STATUSES
 
 
+def _record_equity_history(target_date: date, equity: float) -> None:
+    """마일스톤 트래커(3주/6주/3개월 목표)용 일별 에쿼티 로그. 같은 날짜로
+    재실행돼도(수동 재실행 등) 중복 라인 없이 덮어쓰도록 날짜 키로 dedupe."""
+    entries: dict[str, float] = {}
+    if EQUITY_HISTORY_PATH.exists():
+        for line in EQUITY_HISTORY_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            entries[row["date"]] = row["equity"]
+    entries[target_date.isoformat()] = equity
+    EQUITY_HISTORY_PATH.write_text(
+        "\n".join(json.dumps({"date": d, "equity": e}) for d, e in sorted(entries.items())) + "\n"
+    )
+
+
 def build_report(target_date: date) -> str:
     decisions = _load_decisions_for_date(target_date)
     client = TradingClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"], paper=True)
@@ -114,6 +132,7 @@ def build_report(target_date: date) -> str:
     day_pnl = equity - last_equity
     day_pnl_pct = (day_pnl / last_equity * 100) if last_equity else 0.0
     positions = client.get_all_positions()
+    _record_equity_history(target_date, equity)
 
     lines = [
         f"# Atlas Options — Daily Report ({target_date.isoformat()})",
