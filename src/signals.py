@@ -757,7 +757,18 @@ def evaluate_risk_gates(equity: float, state: RiskGateState, now: datetime | Non
 # 상수(STOP_ATR_MULT/R_MULTIPLE/MAX_HOLD_DAYS)를 그대로 쓴다 — 라이브가 백테스트와
 # 다른 파라미터로 돌면 검증한 숫자가 무의미해진다(TARGET_DTE_RANGE 주석의 옵션
 # 쪽 원칙과 동일).
-CRYPTO_SYMBOLS = ("BTC/USD", "ETH/USD")
+CRYPTO_SYMBOLS = ("BTC/USD", "ETH/USD", "PAXG/USD")
+# 2026-09-04 docs/design-crypto-strategy-refinement-2026-09-04.md — Alpaca
+# 크립토 73페어 전수 조회 결과 전부 비마진 현물(shortable=false)이라 진짜
+# 반대포지션형 헤지는 불가능. 205일 일간수익률 상관계수 실측: BTC-ETH 0.90,
+# BTC-PAXG/ETH-PAXG 각 0.45 — PAXG(금 연동 토큰)이 유일하게 상관이 낮은
+# 자산이라 "헤지"가 아니라 "분산효과 있는 셋째 자산"으로 추가한다.
+CRYPTO_CORRELATION_PAIRS = {
+    frozenset({"BTC/USD", "ETH/USD"}): 0.90,
+    frozenset({"BTC/USD", "PAXG/USD"}): 0.45,
+    frozenset({"ETH/USD", "PAXG/USD"}): 0.45,
+}
+CRYPTO_CORRELATION_CLUSTER_THRESHOLD = 0.70  # 이 이상이면 "사실상 같은 베팅"으로 취급
 # 2026-09-02: 라이브 실측 재보정 — 2.0x ATR 손절폭이 BTC/ETH 실제 주간 변동폭
 # (3~4%대)보다 훨씬 넓게(BTC 4%/8%, ETH 7.5%/14.9%) 잡혀 있어, 8/30에 BTC+ETH
 # 합산 미실현이익이 ~$2,150까지 났다가 익절선 근처도 못 가고 그대로 반납되는
@@ -815,9 +826,35 @@ def build_crypto_order_intent(symbol: str, notional: float, client_order_id: str
     }
 
 
+def is_in_crypto_cooldown(symbol: str, last_exit_by_symbol: dict[str, date], today: date) -> bool:
+    """레짐 판정이 일봉 기준이라(classify_regime_from_bars), 청산 후 재진입
+    금지도 "날짜가 바뀌기 전까지"로 맞춘다 — 같은 날 재진입해봐야 어차피 같은
+    일봉을 다시 확인하는 거라 정보량이 없다(임의의 시간 상수를 새로 만들지
+    않고 기존 신호 주기에 맞춤). 2026-09-03 실측: BTC가 08:30 profit_target
+    청산 후 08:45에 바로 재진입 — 상승장이라 무사했지만 구조적으로 휩쏘 가능."""
+    return last_exit_by_symbol.get(symbol) == today
+
+
+def cluster_capped_notional(
+    symbol: str, candidate_notional: float, open_notional_by_symbol: dict[str, float],
+    correlation_pairs: dict[frozenset, float], threshold: float, slot_budget: float,
+) -> float:
+    """상관계수가 threshold 이상인 심볼들을 "한 슬롯"으로 묶어 클러스터 전체
+    미결제 명목가 합이 slot_budget을 넘지 못하게 한다. BTC/ETH(0.90)는
+    묶이고 PAXG(0.45, 둘 다 threshold 미만)는 독립 슬롯을 유지한다 —
+    개별 심볼당 상한(max_notional_per_symbol)은 이미 있으니 이건 그 위에
+    "실질적으로 같은 베팅"에 대한 추가 캡이다."""
+    clustered_open = sum(
+        v for s, v in open_notional_by_symbol.items()
+        if s != symbol and correlation_pairs.get(frozenset({symbol, s}), 0.0) >= threshold
+    )
+    room = max(0.0, slot_budget - clustered_open)
+    return min(candidate_notional, room)
+
+
 def decide_crypto_for_symbol(
     client: CryptoHistoricalDataClient, symbol: str, equity: float, macro: MacroGate,
-    available_cash: float | None = None,
+    available_cash: float | None = None, open_notional_by_symbol: dict[str, float] | None = None,
 ) -> CryptoCycleDecision:
     """현물 롱/플랫 전용 — bear_call(하락) 신호는 숏이 불가능해 진입하지 않는다
     (Alpaca 크립토는 비마진 현물, §6.4 백테스트 설계와 동일 결정). range/cash
@@ -859,6 +896,11 @@ def decide_crypto_for_symbol(
     if available_cash is not None:
         max_notional_per_symbol = min(max_notional_per_symbol, available_cash / len(CRYPTO_SYMBOLS))
     notional = min(risk_budget / stop_pct, max_notional_per_symbol)
+    if open_notional_by_symbol is not None:
+        notional = cluster_capped_notional(
+            symbol, notional, open_notional_by_symbol,
+            CRYPTO_CORRELATION_PAIRS, CRYPTO_CORRELATION_CLUSTER_THRESHOLD, max_notional_per_symbol,
+        )
     if notional < 10.0:  # Alpaca 크립토 시장가 최소주문 근사치 — 그 이하는 의미없는 먼지주문
         return CryptoCycleDecision(symbol, signal.regime, macro, None, "notional_below_minimum")
 

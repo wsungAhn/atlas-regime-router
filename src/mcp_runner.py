@@ -31,7 +31,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -54,6 +54,7 @@ from signals import (  # noqa: E402
     evaluate_exit,
     evaluate_risk_gates,
     fetch_and_classify_regime,
+    is_in_crypto_cooldown,
     load_macro_gate,
 )
 from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: E402
@@ -68,6 +69,7 @@ RISK_GATE_STATE_PATH = REPO_ROOT / "registry" / "risk_gate_state.json"
 RISK_GATE_LOCK_PATH = REPO_ROOT / "registry" / "risk_gate_state.json.lock"
 CRYPTO_POSITIONS_PATH = REPO_ROOT / "registry" / "crypto_positions.json"
 CRYPTO_POSITIONS_LOCK_PATH = REPO_ROOT / "registry" / "crypto_positions.json.lock"
+CRYPTO_COOLDOWN_PATH = REPO_ROOT / "registry" / "crypto_cooldown.json"
 ENV_FILE = REPO_ROOT / ".env.competition"
 
 
@@ -262,6 +264,27 @@ def _load_crypto_positions() -> dict[str, CryptoPositionState]:
     except (json.JSONDecodeError, KeyError, ValueError):
         logger.exception("[ERROR] crypto_positions.json corrupt — treating as empty (신규진입 시 새로 기록됨)")
         return {}
+
+
+def _load_crypto_cooldown() -> dict[str, date]:
+    """docs/design-crypto-strategy-refinement-2026-09-04.md §3 — 심볼별
+    마지막 청산 날짜. crypto_positions.json은 청산되면 그 심볼 엔트리가
+    지워지므로(오픈 포지션 상태만 추적) 쿨다운은 별도 파일이 필요하다."""
+    if not CRYPTO_COOLDOWN_PATH.exists():
+        return {}
+    try:
+        raw = json.loads(CRYPTO_COOLDOWN_PATH.read_text())
+        return {symbol: date.fromisoformat(d) for symbol, d in raw.items()}
+    except (json.JSONDecodeError, KeyError, ValueError):
+        logger.exception("[ERROR] crypto_cooldown.json corrupt — treating as empty (쿨다운 없이 진행)")
+        return {}
+
+
+def _save_crypto_cooldown(cooldown: dict[str, date]) -> None:
+    CRYPTO_COOLDOWN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CRYPTO_COOLDOWN_PATH.with_suffix(f".{os.getpid()}.json.tmp")
+    tmp_path.write_text(json.dumps({symbol: d.isoformat() for symbol, d in cooldown.items()}))
+    os.replace(tmp_path, CRYPTO_COOLDOWN_PATH)
 
 
 def _save_crypto_positions(positions: dict[str, CryptoPositionState]) -> None:
@@ -686,7 +709,12 @@ async def run_crypto_cycle_once() -> None:
             try:
                 with _locked(CRYPTO_POSITIONS_LOCK_PATH):
                     crypto_positions = _load_crypto_positions()
+                    crypto_cooldown = _load_crypto_cooldown()
+                    crypto_cooldown_changed = False
                     crypto_open_positions = await _crypto_positions_by_symbol(session)
+                    open_notional_by_symbol = {
+                        symbol: float(p.get("market_value", 0.0)) for symbol, p in crypto_open_positions.items()
+                    }
                     # 2026-09-02 실측: 이 함수는 15분마다 도는데, 아래 저장을 매 사이클
                     # 무조건 호출하면(변경 없는 순수 HOLD 사이클에도) health_check.py의
                     # 리컨실 결과(같은 파일, 독립 프로세스, 다른 주기)와 read-modify-write
@@ -731,9 +759,13 @@ async def run_crypto_cycle_once() -> None:
                         _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": True, "action": "close", "exit_reason": exit_decision.reason, "profit_pct": exit_decision.profit_pct, "order_intent": close_intent, "order_result": close_result})
                         crypto_positions.pop(symbol, None)
                         crypto_positions_changed = True
+                        crypto_cooldown[symbol] = datetime.now(timezone.utc).date()
+                        crypto_cooldown_changed = True
 
                     if crypto_positions_changed:
                         _save_crypto_positions(crypto_positions)
+                    if crypto_cooldown_changed:
+                        _save_crypto_cooldown(crypto_cooldown)
 
                     if risk_gate.blocked:
                         for symbol in CRYPTO_SYMBOLS:
@@ -748,6 +780,10 @@ async def run_crypto_cycle_once() -> None:
                                 logger.info("[SKIP] %s(crypto) already has open position — no re-entry", symbol)
                                 _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "already_exposed"})
                                 continue
+                            if is_in_crypto_cooldown(symbol, crypto_cooldown, datetime.now(timezone.utc).date()):
+                                logger.info("[SKIP] %s(crypto) closed earlier today — cooldown until next day", symbol)
+                                _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "cooldown"})
+                                continue
                             try:
                                 # decide_crypto_for_symbol은 동기함수라 alpaca-py의
                                 # 블로킹 REST 호출을 그대로 물고 있다 — asyncio.wait_for를
@@ -756,7 +792,10 @@ async def run_crypto_cycle_once() -> None:
                                 # 위 MCP_CALL_TIMEOUT_SECONDS 감싸기와 같은 이유로 락을
                                 # 영원히 물게 된다).
                                 decision = await asyncio.wait_for(
-                                    asyncio.to_thread(decide_crypto_for_symbol, crypto_client, symbol, equity, macro, available_cash),
+                                    asyncio.to_thread(
+                                        decide_crypto_for_symbol, crypto_client, symbol, equity, macro,
+                                        available_cash, open_notional_by_symbol,
+                                    ),
                                     timeout=MCP_CALL_TIMEOUT_SECONDS,
                                 )
                             except Exception:
@@ -780,6 +819,11 @@ async def run_crypto_cycle_once() -> None:
                                 continue
                             logger.info("[SUBMIT] %s(crypto) regime=%s intent=%s", symbol, decision.regime, decision.order_intent)
                             _log_decision({"symbol": symbol, "sleeve": "crypto", "regime": decision.regime, "order_intent": decision.order_intent, "order_result": order_payload, "submitted": True})
+                            # 같은 사이클에서 뒤이어 처리되는 심볼의 클러스터 사이징(cluster_capped_notional)이
+                            # 방금 낸 이 주문을 보게 갱신 — 안 그러면 BTC/ETH가 같은 사이클에
+                            # 동시신호를 내면 둘 다 "상대방 아직 0"으로 보고 각자 풀 슬롯예산을
+                            # 그대로 받아가 클러스터 캡의 의미가 없어진다.
+                            open_notional_by_symbol[symbol] = float(decision.order_intent["notional"])
                             # 체결 확인은 다음 사이클 포지션 조회로 이뤄지지만, stop/target은
                             # 지금 계산한 값을 바로 저장해야 다음 사이클이 청산판정을 할 수 있다.
                             crypto_positions[symbol] = CryptoPositionState(

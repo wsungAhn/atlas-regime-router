@@ -20,11 +20,13 @@ from signals import (  # noqa: E402
     build_crypto_trim_intent,
     build_iron_condor_intent,
     classify_regime_from_bars,
+    cluster_capped_notional,
     contracts_for_max_loss,
     decide_for_symbol,
     evaluate_crypto_exit,
     evaluate_exit,
     evaluate_risk_gates,
+    is_in_crypto_cooldown,
     pick_by_delta,
     risk_pct_for_atr_pct,
 )
@@ -494,7 +496,41 @@ def test_decide_crypto_notional_capped_by_available_cash():
     client = _FakeCryptoDataClient(_trending_up_bars(), "BTC/USD")
     decision = decide_crypto_for_symbol(client, "BTC/USD", equity=100_000, macro=macro, available_cash=1000.0)
     assert decision.order_intent is not None
-    assert float(decision.order_intent["notional"]) <= 500.0  # available_cash/len(CRYPTO_SYMBOLS)=500
+    assert float(decision.order_intent["notional"]) <= 1000.0 / 3  # available_cash/len(CRYPTO_SYMBOLS)
+
+
+def test_decide_crypto_applies_cluster_cap_for_correlated_symbol():
+    """BTC/ETH는 CRYPTO_CORRELATION_PAIRS에서 0.90(threshold 0.70 이상)이라
+    같은 클러스터 — ETH가 이미 슬롯 예산만큼 물려있으면 BTC는 새로 들어갈
+    여유가 없어야 한다(open_notional_by_symbol을 안 넘기면 이 캡이 아예
+    적용 안 되는 걸 회귀 방지하는 테스트이기도 함)."""
+    from signals import decide_crypto_for_symbol
+    macro = MacroGate(ok=True, reason="clear", stage="stage2_advancing")
+    client = _FakeCryptoDataClient(_trending_up_bars(), "BTC/USD")
+    slot_budget_approx = 100_000 * 0.9 / 3  # (1-CASH_RESERVE_PCT)/len(CRYPTO_SYMBOLS)
+    decision = decide_crypto_for_symbol(
+        client, "BTC/USD", equity=100_000, macro=macro,
+        open_notional_by_symbol={"ETH/USD": slot_budget_approx},
+    )
+    assert decision.order_intent is None
+    assert decision.skip_reason == "notional_below_minimum"
+
+
+def test_cluster_capped_notional_shares_budget_for_correlated_symbols():
+    pairs = {frozenset({"BTC/USD", "ETH/USD"}): 0.90, frozenset({"BTC/USD", "PAXG/USD"}): 0.45}
+    # ETH already holds the whole slot — BTC (correlated) gets no room left
+    assert cluster_capped_notional("BTC/USD", 5000.0, {"ETH/USD": 10_000.0}, pairs, 0.70, slot_budget=10_000.0) == 0.0
+    # PAXG is below threshold with BTC — untouched by BTC/ETH's cluster exposure
+    assert cluster_capped_notional("PAXG/USD", 5000.0, {"BTC/USD": 10_000.0, "ETH/USD": 10_000.0}, pairs, 0.70, slot_budget=10_000.0) == 5000.0
+    # partial room left in the cluster
+    assert cluster_capped_notional("BTC/USD", 5000.0, {"ETH/USD": 7000.0}, pairs, 0.70, slot_budget=10_000.0) == 3000.0
+
+
+def test_is_in_crypto_cooldown_blocks_same_day_reentry_only():
+    last_exit = {"BTC/USD": date(2026, 9, 3)}
+    assert is_in_crypto_cooldown("BTC/USD", last_exit, today=date(2026, 9, 3)) is True
+    assert is_in_crypto_cooldown("BTC/USD", last_exit, today=date(2026, 9, 4)) is False
+    assert is_in_crypto_cooldown("ETH/USD", last_exit, today=date(2026, 9, 3)) is False
 
 
 def test_decide_crypto_skips_non_trend_up_regime():
