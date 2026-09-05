@@ -41,6 +41,7 @@ from mcp.client.stdio import stdio_client
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from signals import (  # noqa: E402
     CRYPTO_SYMBOLS,
+    OPTION_SYMBOLS,
     CryptoPositionState,
     MacroGate,
     RiskGateDecision,
@@ -121,21 +122,7 @@ def _locked(lock_path: Path, timeout_seconds: float = 60.0):
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
-SYMBOLS = ("SPY", "QQQ", "GLD", "TLT", "SLV", "IWM", "XLE", "XLF", "DIA")  # 2026-08-25: 지수 2 +
-# 금(GLD)+장기채(TLT)+은(SLV)+소형주(IWM) 4개 추가 — SPY/QQQ만 있으면 "동일종목
-# 여러 개 보유"와 리스크 성격이 비슷해서(사용자 지적) 진짜 다른 자산군으로 분산.
-# 6종목 모두 일봉 백테스트(P&L 실측) + 라이브 옵션체인 유동성 드라이런 둘 다
-# 통과. 당시(2026-08-25) **XLE/XLF/EEM은 이 챔피언 전략으로 손실이 나서 제외**
-# (각각 -$17k/-$21k/-$20k, 3yr), DIA는 손익이 사실상 0(+$1.6k/3yr)이라 제외 —
-# 그런데 그 판단이 쓴 백테스트 코드엔 서킷브레이커 영구동결 버그(2026-08-27
-# 수정, 0ea1b98)가 있었다. 버그있는 코드로 첫 하락 이후 사실상 멈춘 3년치를
-# "3년 성과"로 잘못 본 것 — 같은 6종목 챔피언 조합도 이 버그로 -20.6%가
-# +93.5%로 뒤집혔던 바로 그 문제. **2026-09-02 고쳐진 코드로 재실행**하니
-# XLE +$46,716/Sharpe 2.28, XLF +$42,262/Sharpe 2.60, DIA +$30,771/Sharpe 2.19
-# (전부 3yr) — 채택된 6종목보다 오히려 우수해 재검증 후 편입. EEM은 재실행해도
-# 사실상 손익 0(+$63)이라 계속 제외. VNQ/HYG는 백테스트는 좋지만(+$57k/+$41k)
-# 실제 옵션체인이 5~9일 위클리 만기를 못 채워서(chain_insufficient, 라이브
-# 드라이런으로만 잡히는 문제) 계속 제외.
+SYMBOLS = OPTION_SYMBOLS  # 정본은 signals.py — 유래·제외종목 사유는 그쪽 주석 참고
 
 
 def _load_env_file(path: Path) -> None:

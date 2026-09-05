@@ -35,6 +35,7 @@ from backtest import (
 )
 from backtest import StrategyResult  # noqa: F401 (재노출 — 호출부가 타입힌트로 쓸 수 있게)
 from portfolio import scale_trades_to_dollars
+from signals import CRYPTO_SYMBOLS, OPTION_SYMBOLS  # noqa: F401 (정본, 라이브와 동기화 유지 — 로컬 중복정의 금지)
 from vendor.signal_alloc import signal_to_weights
 
 DIRECTION = {"bull_put": 1, "bear_call": -1, "iron_condor": 1}  # §5.2 — iron_condor는
@@ -42,11 +43,8 @@ DIRECTION = {"bull_put": 1, "bear_call": -1, "iron_condor": 1}  # §5.2 — iron
 # 쓰지 않고(아래 signal_activity가 부호 대신 활성여부만 씀), 주식/크립토
 # 슬리브만 이 부호로 롱/숏을 정한다.
 
-OPTION_SYMBOLS = ("SPY", "QQQ", "GLD", "TLT", "SLV", "IWM", "XLE", "XLF", "DIA")  # mcp_runner.SYMBOLS와 동기화(2026-09-05)
 EQUITY_SYMBOLS = ("SPY", "QQQ", "IWM")  # SPY/QQQ/IWM은 대차 가능(shortable) 가정 —
 # §6.4: 실배선 전 페이퍼계좌 실제 shortable 플래그로 재검증 필요, 백테스트 단계 가정.
-CRYPTO_SYMBOLS = ("BTC/USD", "ETH/USD")  # Alpaca 크립토 API는 슬래시 포맷 필수
-# (BTCUSD는 400 invalid symbol — 실측 2026-08-26)
 CRYPTO_QTY_INCREMENT = 1e-4
 
 STOP_ATR_MULT = 2.0
