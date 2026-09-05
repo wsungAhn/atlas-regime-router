@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.atlas.crypto-rebalance-2026-09-08</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python</string>
+        <string>/Users/Mung/dev/atlas-options-hackathon/src/rebalance_crypto_once.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/Mung/dev/atlas-options-hackathon</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
+
+    <!-- 일회성 — 2026-09-08(화) 06:45 PDT 딱 한 번만. launchd는 이 시각이 지나면
+         다시 안 돈다(StartCalendarInterval에 Year/Month/Day까지 명시했으므로). -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Year</key><integer>2026</integer>
+        <key>Month</key><integer>9</integer>
+        <key>Day</key><integer>8</integer>
+        <key>Hour</key><integer>6</integer>
+        <key>Minute</key><integer>45</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/Mung/dev/atlas-options-hackathon/logs/crypto-rebalance-2026-09-08.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/Mung/dev/atlas-options-hackathon/logs/crypto-rebalance-2026-09-08.err.log</string>
+</dict>
+</plist>

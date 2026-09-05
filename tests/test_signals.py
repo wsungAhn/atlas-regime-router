@@ -21,6 +21,7 @@ from signals import (  # noqa: E402
     build_iron_condor_intent,
     classify_regime_from_bars,
     cluster_capped_notional,
+    rebalance_targets_for_cluster_cap,
     contracts_for_max_loss,
     decide_for_symbol,
     evaluate_crypto_exit,
@@ -482,7 +483,10 @@ def test_decide_crypto_trend_up_builds_market_buy():
     assert decision.order_intent is not None
     assert decision.order_intent["side"] == "buy"
     assert decision.order_intent["symbol"] == "BTC/USD"
-    assert float(decision.order_intent["notional"]) > 0
+    # 2026-09-05: 크립토 슬리브 전체예산이 CRYPTO_SLEEVE_BUDGET_PCT_OF_MAX(10%)로
+    # 한 번 더 캡되면서, 이 fixture(risk_budget이 큰 trend_up 신호)는 그 캡에 걸린다
+    # — "크립토가 또다시 메인종목" 재발 방지 회귀 테스트.
+    assert float(decision.order_intent["notional"]) == pytest.approx(100_000 * 0.9 * 0.10 / 3)
     assert decision.stop_pct is not None and decision.stop_pct > 0
     assert decision.target_pct == pytest.approx(decision.stop_pct * 2.0)  # CRYPTO_R_MULTIPLE=2.0
 
@@ -507,7 +511,7 @@ def test_decide_crypto_applies_cluster_cap_for_correlated_symbol():
     from signals import decide_crypto_for_symbol
     macro = MacroGate(ok=True, reason="clear", stage="stage2_advancing")
     client = _FakeCryptoDataClient(_trending_up_bars(), "BTC/USD")
-    slot_budget_approx = 100_000 * 0.9 / 3  # (1-CASH_RESERVE_PCT)/len(CRYPTO_SYMBOLS)
+    slot_budget_approx = 100_000 * 0.9 * 0.10 / 3  # (1-CASH_RESERVE_PCT)*CRYPTO_SLEEVE_BUDGET_PCT_OF_MAX/len(CRYPTO_SYMBOLS)
     decision = decide_crypto_for_symbol(
         client, "BTC/USD", equity=100_000, macro=macro,
         open_notional_by_symbol={"ETH/USD": slot_budget_approx},
@@ -524,6 +528,24 @@ def test_cluster_capped_notional_shares_budget_for_correlated_symbols():
     assert cluster_capped_notional("PAXG/USD", 5000.0, {"BTC/USD": 10_000.0, "ETH/USD": 10_000.0}, pairs, 0.70, slot_budget=10_000.0) == 5000.0
     # partial room left in the cluster
     assert cluster_capped_notional("BTC/USD", 5000.0, {"ETH/USD": 7000.0}, pairs, 0.70, slot_budget=10_000.0) == 3000.0
+
+
+def test_rebalance_scales_correlated_cluster_proportionally():
+    pairs = {frozenset({"BTC/USD", "ETH/USD"}): 0.90, frozenset({"BTC/USD", "PAXG/USD"}): 0.45, frozenset({"ETH/USD", "PAXG/USD"}): 0.45}
+    # BTC $9,297.80 + ETH $5,001.70 = $14,299.50 combined, over a $2,867 slot —
+    # both should shrink by the same ratio, not one zeroed out and the other left alone.
+    positions = {"BTC/USD": 9297.80, "ETH/USD": 5001.70, "PAXG/USD": 7543.95}
+    targets = rebalance_targets_for_cluster_cap(positions, pairs, 0.70, slot_budget=2867.09)
+    assert targets["BTC/USD"] + targets["ETH/USD"] == pytest.approx(2867.09)
+    assert targets["BTC/USD"] / targets["ETH/USD"] == pytest.approx(9297.80 / 5001.70)
+    assert targets["PAXG/USD"] == pytest.approx(2867.09)  # independent slot, also over
+
+
+def test_rebalance_leaves_symbols_already_within_budget_untouched():
+    pairs = {frozenset({"BTC/USD", "ETH/USD"}): 0.90}
+    positions = {"BTC/USD": 1000.0, "ETH/USD": 500.0}
+    targets = rebalance_targets_for_cluster_cap(positions, pairs, 0.70, slot_budget=10_000.0)
+    assert targets == positions
 
 
 def test_is_in_crypto_cooldown_blocks_same_day_reentry_only():

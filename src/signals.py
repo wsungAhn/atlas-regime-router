@@ -57,7 +57,15 @@ TARGET_DTE_RANGE = (5, 9)  # 2026-08-24: 30~45일(월간)→5~9일(주간)로 �
 # 백테스트가 검증한 챔피언(전략7)이 DTE_DAYS=7(주간옵션)로 회전율을 올려서
 # 나온 결과라, 라이브도 그대로 맞춰야 백테스트=라이브가 유지된다(안 맞추면
 # 오늘 검증한 숫자와 무관한 다른 전략이 라이브에서 돎).
-SHORT_DELTA_TARGET = 0.15
+SHORT_DELTA_TARGET = 0.20  # 2026-09-05: backtest.py의 DELTA_SHORT_LEG(챔피언 전략7을
+# 뽑을 때 실제로 검증한 값)과 처음부터 동기화가 안 돼 있었다(git log 확인 — 둘 다
+# 최초 커밋부터 각자 다른 값, 한 번도 안 맞았음) — 라이브가 검증 안 된 파라미터로
+# 돌고 있었던 셈. 9종목 재백테스트로 0.15/0.20/0.25 비교(raw $ P&L, 이 문서 §8
+# 기준과 동일): 0.15=$250,292 / 0.20=$310,468 / 0.25=$384,289. 0.20으로 동기화 —
+# 0.25는 델타가 오를수록 승률까지 같이 오르는 비정상 패턴이 나와(현실은 반대가
+# 정상) 이 백테스트의 이론가 체결 가정이 ATM 근접시 실제 호가스프레드·슬리피지·
+# 조기배정 리스크를 못 잡는다고 판단, 검증 없이 채택 안 함
+# (docs/design-crypto-strategy-refinement-2026-09-04.md §9 참고).
 PROTECTIVE_DELTA_TARGET = 0.06  # 보호레그는 숏레그보다 델타가 훨씬 낮은(더 바깥) 쪽
 
 # ── 청산 규칙(백테스트 backtest.py와 동일 상수 — 실행에도 반드시 배선할 것.
@@ -769,6 +777,11 @@ CRYPTO_CORRELATION_PAIRS = {
     frozenset({"ETH/USD", "PAXG/USD"}): 0.45,
 }
 CRYPTO_CORRELATION_CLUSTER_THRESHOLD = 0.70  # 이 이상이면 "사실상 같은 베팅"으로 취급
+# 2026-09-05: PAXG 추가 이후에도 세 심볼 다 신호가 겹치면 크립토 슬리브가 계좌
+# 대부분(최대 equity*0.9)을 잡아먹을 수 있어("크립토가 또다시 메인종목" — 사용자
+# 지적), 크립토 슬리브 전체 예산을 기존 풀(equity*(1-CASH_RESERVE_PCT))의 10%로
+# 다시 한번 캡한다 — 옵션이 원래 메인, 크립토는 위성 배분이라는 원칙을 상수로 명시.
+CRYPTO_SLEEVE_BUDGET_PCT_OF_MAX = 0.10
 # 2026-09-02: 라이브 실측 재보정 — 2.0x ATR 손절폭이 BTC/ETH 실제 주간 변동폭
 # (3~4%대)보다 훨씬 넓게(BTC 4%/8%, ETH 7.5%/14.9%) 잡혀 있어, 8/30에 BTC+ETH
 # 합산 미실현이익이 ~$2,150까지 났다가 익절선 근처도 못 가고 그대로 반납되는
@@ -852,6 +865,36 @@ def cluster_capped_notional(
     return min(candidate_notional, room)
 
 
+def rebalance_targets_for_cluster_cap(
+    open_notional_by_symbol: dict[str, float], correlation_pairs: dict[frozenset, float],
+    threshold: float, slot_budget: float,
+) -> dict[str, float]:
+    """cluster_capped_notional은 "새 진입"만 캡한다 — 2026-09-05, 사용자가 라이브에서
+    "크립토가 또다시 메인종목이 됐다"고 지적한 시점엔 이미 CRYPTO_SLEEVE_BUDGET_PCT_OF_MAX
+    축소 전 예산으로 들어간 기존 포지션들이 새 캡을 넘어선 상태였다 — 이미 초과보유
+    중인 걸 목표치로 되돌리려면 클러스터 안에서 비례배분해야 한다(한쪽만 전부 팔고
+    한쪽은 그대로 두면 자의적). 클러스터(상관계수 ≥ threshold로 묶인 심볼들, 예:
+    BTC+ETH) 합산이 slot_budget을 넘으면 전원을 같은 비율로 줄여 정확히 slot_budget에
+    맞춘다 — 상관 없는 심볼(예: PAXG)은 자기 슬롯만 넘었는지 독립적으로 본다."""
+    targets = dict(open_notional_by_symbol)
+    seen: set[str] = set()
+    for symbol in open_notional_by_symbol:
+        if symbol in seen:
+            continue
+        cluster = {symbol} | {
+            other for other in open_notional_by_symbol
+            if other != symbol and correlation_pairs.get(frozenset({symbol, other}), 0.0) >= threshold
+        }
+        seen |= cluster
+        cluster_total = sum(open_notional_by_symbol[c] for c in cluster)
+        if cluster_total <= slot_budget:
+            continue
+        scale = slot_budget / cluster_total
+        for c in cluster:
+            targets[c] = open_notional_by_symbol[c] * scale
+    return targets
+
+
 def decide_crypto_for_symbol(
     client: CryptoHistoricalDataClient, symbol: str, equity: float, macro: MacroGate,
     available_cash: float | None = None, open_notional_by_symbol: dict[str, float] | None = None,
@@ -892,7 +935,7 @@ def decide_crypto_for_symbol(
     # available $9,991"로 브로커에 거부됨. available_cash(호출부가 계좌의
     # non_marginable_buying_power를 넘겨준다 — 크립토 현물 매수에 실제 쓸 수
     # 있는 현금)가 있으면 그것도 상한에 같이 반영한다.
-    max_notional_per_symbol = equity * (1.0 - CASH_RESERVE_PCT) / len(CRYPTO_SYMBOLS)
+    max_notional_per_symbol = equity * (1.0 - CASH_RESERVE_PCT) * CRYPTO_SLEEVE_BUDGET_PCT_OF_MAX / len(CRYPTO_SYMBOLS)
     if available_cash is not None:
         max_notional_per_symbol = min(max_notional_per_symbol, available_cash / len(CRYPTO_SYMBOLS))
     notional = min(risk_budget / stop_pct, max_notional_per_symbol)

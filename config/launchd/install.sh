@@ -20,6 +20,7 @@ install_job "com.atlas.options-runner"
 install_job "com.atlas.report-generator"
 install_job "com.atlas.crypto-runner"
 install_job "com.atlas.health-check"
+install_job "com.atlas.crypto-rebalance-2026-09-08"
 
 echo "options-runner: 9:30~16:00 ET 15분 간격, 장 열려있을 때만 실제 동작"
 echo "report-generator: 13:10 PT(장마감 직후) 1회, reports/YYYY-MM-DD.md 생성"
