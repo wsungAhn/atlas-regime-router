@@ -42,7 +42,7 @@ DIRECTION = {"bull_put": 1, "bear_call": -1, "iron_condor": 1}  # §5.2 — iron
 # 쓰지 않고(아래 signal_activity가 부호 대신 활성여부만 씀), 주식/크립토
 # 슬리브만 이 부호로 롱/숏을 정한다.
 
-OPTION_SYMBOLS = ("SPY", "QQQ", "GLD", "TLT", "SLV", "IWM")
+OPTION_SYMBOLS = ("SPY", "QQQ", "GLD", "TLT", "SLV", "IWM", "XLE", "XLF", "DIA")  # mcp_runner.SYMBOLS와 동기화(2026-09-05)
 EQUITY_SYMBOLS = ("SPY", "QQQ", "IWM")  # SPY/QQQ/IWM은 대차 가능(shortable) 가정 —
 # §6.4: 실배선 전 페이퍼계좌 실제 shortable 플래그로 재검증 필요, 백테스트 단계 가정.
 CRYPTO_SYMBOLS = ("BTC/USD", "ETH/USD")  # Alpaca 크립토 API는 슬래시 포맷 필수
