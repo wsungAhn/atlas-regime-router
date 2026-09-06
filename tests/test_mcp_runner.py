@@ -64,7 +64,7 @@ def test_order_error_none_when_no_error_key():
 def test_underlying_of_matches_occ_prefix():
     assert _underlying_of("SPY260321P00600000") == "SPY"
     assert _underlying_of("QQQ260321C00500000") == "QQQ"
-    assert _underlying_of("AAPL260321C00150000") is None  # 관리 대상 심볼 아님
+    assert _underlying_of("KO260321C00150000") is None  # 관리 대상 심볼 아님
 
 
 @pytest.mark.asyncio
