@@ -76,13 +76,14 @@ OPTION_SYMBOLS = (
     # 2026-09-06: 개별종목 확장 — regime-signals 110종목 유니버스 ∩ 위클리(5~9DTE)
     # 콘트랙트 존재(66개) 중 챔피언 전략7 3yr $100k 단독계좌 백테스트 상위 15개
     # (위클리가 월간/분기보다 전 종목에서 압도적 우위 재확인 — 이전 ETF 판단과 동일 패턴).
-    # 사용자 지시로 상위 15개 전량 편입, 마이너스 4종목(URI/LULU/KO/SCCO)과 스프레드
+    # 사용자 지시로 상위 15개 전량 편입 시도, 마이너스 4종목(URI/LULU/KO/SCCO)과 스프레드
     # 방향성 검증 에러 6종목(AAOI/CNC/HIMS/OWL/SNAP/WBD, 극단적 가격대 처리 버그로 추정
-    # — 원인 미조사)은 제외. **주의**: 위 6종목과 달리 이 15개는 라이브 옵션체인 유동성
-    # 드라이런(bid/ask 스프레드·체결 가능성)은 아직 안 거쳤다 — 위 XLE/XLF/DIA 편입 때와
-    # 달리 콘트랙트 존재 여부만 확인. 라이브 개시 후 chain_insufficient류 거부가 뜨는지
-    # 지켜볼 것.
-    "NVDA", "MSTR", "PLTR", "NFLX", "META", "TSLA", "EXPE", "FUTU",
+    # — 원인 미조사)은 애초에 제외. 실 프로덕션 함수(decide_for_symbol)로 라이브 체인
+    # 드라이런(주문 미제출) 실시 — 14/15는 정상 mleg intent 생성 확인. **EXPE는
+    # chain_insufficient급 문제로 제외**: 위클리 만기 스트라이크 간격이 넓어 숏레그
+    # (델타0.20)·보호레그(델타0.06) 후보가 같은 스트라이크로 수렴해 malformed_spread —
+    # VNQ/HYG 제외 사유와 동일 클래스.
+    "NVDA", "MSTR", "PLTR", "NFLX", "META", "TSLA", "FUTU",
     "PFE", "JPM", "BX", "FSLR", "NKE", "AAPL", "DAL",
 )  # 2026-08-25: 지수 2 +
 # 금(GLD)+장기채(TLT)+은(SLV)+소형주(IWM) 4개 추가 — SPY/QQQ만 있으면 "동일종목
