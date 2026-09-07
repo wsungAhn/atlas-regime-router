@@ -27,7 +27,7 @@ from signals import (  # noqa: E402
     evaluate_crypto_exit,
     evaluate_exit,
     evaluate_risk_gates,
-    is_in_crypto_cooldown,
+    is_in_same_day_cooldown,
     pick_by_delta,
     pick_by_width,
     risk_pct_for_atr_pct,
@@ -574,11 +574,11 @@ def test_rebalance_leaves_symbols_already_within_budget_untouched():
     assert targets == positions
 
 
-def test_is_in_crypto_cooldown_blocks_same_day_reentry_only():
+def test_is_in_same_day_cooldown_blocks_same_day_reentry_only():
     last_exit = {"BTC/USD": date(2026, 9, 3)}
-    assert is_in_crypto_cooldown("BTC/USD", last_exit, today=date(2026, 9, 3)) is True
-    assert is_in_crypto_cooldown("BTC/USD", last_exit, today=date(2026, 9, 4)) is False
-    assert is_in_crypto_cooldown("ETH/USD", last_exit, today=date(2026, 9, 3)) is False
+    assert is_in_same_day_cooldown("BTC/USD", last_exit, today=date(2026, 9, 3)) is True
+    assert is_in_same_day_cooldown("BTC/USD", last_exit, today=date(2026, 9, 4)) is False
+    assert is_in_same_day_cooldown("ETH/USD", last_exit, today=date(2026, 9, 3)) is False
 
 
 def test_decide_crypto_skips_non_trend_up_regime():

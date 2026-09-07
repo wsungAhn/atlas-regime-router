@@ -55,7 +55,7 @@ from signals import (  # noqa: E402
     evaluate_exit,
     evaluate_risk_gates,
     fetch_and_classify_regime,
-    is_in_crypto_cooldown,
+    is_in_same_day_cooldown,
     load_macro_gate,
 )
 from alpaca.data.requests import OptionLatestQuoteRequest  # noqa: E402
@@ -71,6 +71,7 @@ RISK_GATE_LOCK_PATH = REPO_ROOT / "registry" / "risk_gate_state.json.lock"
 CRYPTO_POSITIONS_PATH = REPO_ROOT / "registry" / "crypto_positions.json"
 CRYPTO_POSITIONS_LOCK_PATH = REPO_ROOT / "registry" / "crypto_positions.json.lock"
 CRYPTO_COOLDOWN_PATH = REPO_ROOT / "registry" / "crypto_cooldown.json"
+OPTION_COOLDOWN_PATH = REPO_ROOT / "registry" / "option_cooldown.json"
 ENV_FILE = REPO_ROOT / ".env.competition"
 
 
@@ -253,25 +254,27 @@ def _load_crypto_positions() -> dict[str, CryptoPositionState]:
         return {}
 
 
-def _load_crypto_cooldown() -> dict[str, date]:
-    """docs/design-crypto-strategy-refinement-2026-09-04.md §3 — 심볼별
-    마지막 청산 날짜. crypto_positions.json은 청산되면 그 심볼 엔트리가
-    지워지므로(오픈 포지션 상태만 추적) 쿨다운은 별도 파일이 필요하다."""
-    if not CRYPTO_COOLDOWN_PATH.exists():
+def _load_cooldown(path: Path) -> dict[str, date]:
+    """심볼별 마지막 청산 날짜(자산군 무관, 크립토/옵션 공용) —
+    docs/design-crypto-strategy-refinement-2026-09-04.md §3 원안. 포지션
+    상태파일은 청산되면 그 심볼 엔트리가 지워지므로(오픈 포지션만 추적)
+    쿨다운은 별도 파일이 필요하다. 2026-09-07: 옵션 사이드도 같은 패턴의
+    당일 재손절 후 즉시재진입이 실거래로 확인돼 공용화(OPTION_COOLDOWN_PATH)."""
+    if not path.exists():
         return {}
     try:
-        raw = json.loads(CRYPTO_COOLDOWN_PATH.read_text())
+        raw = json.loads(path.read_text())
         return {symbol: date.fromisoformat(d) for symbol, d in raw.items()}
     except (json.JSONDecodeError, KeyError, ValueError):
-        logger.exception("[ERROR] crypto_cooldown.json corrupt — treating as empty (쿨다운 없이 진행)")
+        logger.exception("[ERROR] %s corrupt — treating as empty (쿨다운 없이 진행)", path.name)
         return {}
 
 
-def _save_crypto_cooldown(cooldown: dict[str, date]) -> None:
-    CRYPTO_COOLDOWN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = CRYPTO_COOLDOWN_PATH.with_suffix(f".{os.getpid()}.json.tmp")
+def _save_cooldown(path: Path, cooldown: dict[str, date]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(f".{os.getpid()}.json.tmp")
     tmp_path.write_text(json.dumps({symbol: d.isoformat() for symbol, d in cooldown.items()}))
-    os.replace(tmp_path, CRYPTO_COOLDOWN_PATH)
+    os.replace(tmp_path, path)
 
 
 def _save_crypto_positions(positions: dict[str, CryptoPositionState]) -> None:
@@ -466,6 +469,8 @@ async def run_cycle_once() -> None:
             #    실제 걸릴 가능성은 낮지만 공짜로 막을 수 있는 방어선). ──
             symbols_with_pending_orders = await _symbols_with_open_orders(session)
             positions_by_symbol = await _positions_by_symbol(session)
+            option_cooldown = _load_cooldown(OPTION_COOLDOWN_PATH)
+            option_cooldown_changed = False
             for symbol, legs in positions_by_symbol.items():
                 if symbol in symbols_with_pending_orders:
                     logger.info("[SKIP] %s already has a pending order — no duplicate close/entry this cycle", symbol)
@@ -516,6 +521,8 @@ async def run_cycle_once() -> None:
                                 "symbol": symbol, "submitted": True, "action": "close",
                                 "exit_reason": exit_decision.reason, "limit_fallback_price": limit_price,
                             })
+                            option_cooldown[symbol] = datetime.now(timezone.utc).date()
+                            option_cooldown_changed = True
                             continue
                         broker_error = f"market rejected ({broker_error}); limit fallback also rejected: {limit_error}"
                 if broker_error:
@@ -531,6 +538,11 @@ async def run_cycle_once() -> None:
                     "exit_reason": exit_decision.reason, "profit_pct": exit_decision.profit_pct,
                     "order_intent": close_intent, "order_result": close_result,
                 })
+                option_cooldown[symbol] = datetime.now(timezone.utc).date()
+                option_cooldown_changed = True
+
+            if option_cooldown_changed:
+                _save_cooldown(OPTION_COOLDOWN_PATH, option_cooldown)
 
             # ── 2) 신규진입 — 리스크게이트 정지 중이면 전체 스킵, 아니면 이미
             #    포지션/미체결주문 있는 심볼만 건너뛴다 ──
@@ -556,6 +568,13 @@ async def run_cycle_once() -> None:
                     # — 대회 8일 스코프에서는 이 정도가 "과다 진입 방지"의 최소선.
                     logger.info("[SKIP] %s already has open position/order — no re-entry", symbol)
                     _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "already_exposed"})
+                    continue
+                if is_in_same_day_cooldown(symbol, option_cooldown, datetime.now(timezone.utc).date()):
+                    # 2026-09-07 실측: XLF가 2026-09-04 하루에 stop_loss로 두 번 종료되고
+                    # 두 번 다 15분 안에 즉시 재진입 — 크립토와 같은 당일 휩쏘 패턴이
+                    # 옵션 사이드에도 실제로 있었다(is_in_same_day_cooldown 참고).
+                    logger.info("[SKIP] %s closed earlier today — cooldown until next day", symbol)
+                    _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "cooldown"})
                     continue
                 eligible_symbols.append(symbol)
 
@@ -696,7 +715,7 @@ async def run_crypto_cycle_once() -> None:
             try:
                 with _locked(CRYPTO_POSITIONS_LOCK_PATH):
                     crypto_positions = _load_crypto_positions()
-                    crypto_cooldown = _load_crypto_cooldown()
+                    crypto_cooldown = _load_cooldown(CRYPTO_COOLDOWN_PATH)
                     crypto_cooldown_changed = False
                     crypto_open_positions = await _crypto_positions_by_symbol(session)
                     open_notional_by_symbol = {
@@ -752,7 +771,7 @@ async def run_crypto_cycle_once() -> None:
                     if crypto_positions_changed:
                         _save_crypto_positions(crypto_positions)
                     if crypto_cooldown_changed:
-                        _save_crypto_cooldown(crypto_cooldown)
+                        _save_cooldown(CRYPTO_COOLDOWN_PATH, crypto_cooldown)
 
                     if risk_gate.blocked:
                         for symbol in CRYPTO_SYMBOLS:
@@ -767,7 +786,7 @@ async def run_crypto_cycle_once() -> None:
                                 logger.info("[SKIP] %s(crypto) already has open position — no re-entry", symbol)
                                 _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "already_exposed"})
                                 continue
-                            if is_in_crypto_cooldown(symbol, crypto_cooldown, datetime.now(timezone.utc).date()):
+                            if is_in_same_day_cooldown(symbol, crypto_cooldown, datetime.now(timezone.utc).date()):
                                 logger.info("[SKIP] %s(crypto) closed earlier today — cooldown until next day", symbol)
                                 _log_decision({"symbol": symbol, "sleeve": "crypto", "submitted": False, "skip_reason": "cooldown"})
                                 continue

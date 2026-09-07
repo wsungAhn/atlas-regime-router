@@ -912,12 +912,16 @@ def build_crypto_order_intent(symbol: str, notional: float, client_order_id: str
     }
 
 
-def is_in_crypto_cooldown(symbol: str, last_exit_by_symbol: dict[str, date], today: date) -> bool:
+def is_in_same_day_cooldown(symbol: str, last_exit_by_symbol: dict[str, date], today: date) -> bool:
     """레짐 판정이 일봉 기준이라(classify_regime_from_bars), 청산 후 재진입
     금지도 "날짜가 바뀌기 전까지"로 맞춘다 — 같은 날 재진입해봐야 어차피 같은
     일봉을 다시 확인하는 거라 정보량이 없다(임의의 시간 상수를 새로 만들지
-    않고 기존 신호 주기에 맞춤). 2026-09-03 실측: BTC가 08:30 profit_target
-    청산 후 08:45에 바로 재진입 — 상승장이라 무사했지만 구조적으로 휩쏘 가능."""
+    않고 기존 신호 주기에 맞춤). 원래 크립토 전용이었다(2026-09-03 실측: BTC가
+    08:30 profit_target 청산 후 08:45에 바로 재진입 — 상승장이라 무사했지만
+    구조적으로 휩쏘 가능). 2026-09-07: 옵션 사이드에서도 실제로 같은 패턴이
+    실거래로 확인돼(XLF가 2026-09-04 하루에 stop_loss로 두 번 종료되고 두 번 다
+    15분 안에 즉시 재진입) 자산군 무관 공용 함수로 승격 — 크립토·옵션 둘 다
+    이 함수를 쓰고 상태파일(마지막 청산일)만 각자 따로 관리한다."""
     return last_exit_by_symbol.get(symbol) == today
 
 
