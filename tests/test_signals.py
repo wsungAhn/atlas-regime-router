@@ -29,6 +29,7 @@ from signals import (  # noqa: E402
     evaluate_risk_gates,
     is_in_crypto_cooldown,
     pick_by_delta,
+    pick_by_width,
     risk_pct_for_atr_pct,
 )
 from alpaca.trading.enums import ContractType  # noqa: E402
@@ -171,6 +172,38 @@ def test_pick_by_delta_expiration_filter_excludes_other_expirations():
     assert picked == "SPY260902C00784000"
 
 
+def test_pick_by_width_targets_underlying_pct_distance_from_short_strike():
+    """2026-09-07: 보호레그를 델타타깃 대신 backtest.py와 동일한 SPREAD_WIDTH_PCT(1.5%)
+    방식으로 고른다. 기초자산 $700이면 목표폭=$10.5 — bull_put은 숏행사가보다 낮게,
+    bear_call은 숏행사가보다 높게."""
+    put_chain = {
+        "SPY260902P00739000": _FakeSnapshot(delta=-0.05),  # 목표($739.5)에 더 가까움
+        "SPY260902P00730000": _FakeSnapshot(delta=-0.10),
+    }
+    picked = pick_by_width(put_chain, ContractType.PUT, short_strike=750.0, underlying_price=700.0,
+                            spread_type="bull_put", expiration=date(2026, 9, 2))
+    assert picked == "SPY260902P00739000"
+
+    call_chain = {
+        "SPY260902C00790500": _FakeSnapshot(delta=0.05),  # 목표($790.5)에 정확히 일치
+        "SPY260902C00800000": _FakeSnapshot(delta=0.02),
+    }
+    picked = pick_by_width(call_chain, ContractType.CALL, short_strike=780.0, underlying_price=700.0,
+                            spread_type="bear_call", expiration=date(2026, 9, 2))
+    assert picked == "SPY260902C00790500"
+
+
+def test_pick_by_width_expiration_filter_excludes_other_expirations():
+    """pick_by_delta와 동일한 회귀 방지 — 만기가 다르면 폭이 더 가까워도 제외."""
+    chain = {
+        "SPY260902P00739000": _FakeSnapshot(delta=-0.05),   # 9/2, 목표와 거리 0.5
+        "SPY260903P00739500": _FakeSnapshot(delta=-0.051),  # 9/3, 목표와 거리 0(더 가까움)이지만 만기 다름
+    }
+    picked = pick_by_width(chain, ContractType.PUT, short_strike=750.0, underlying_price=700.0,
+                            spread_type="bull_put", expiration=date(2026, 9, 2))
+    assert picked == "SPY260902P00739000"
+
+
 def test_decide_for_symbol_macro_gate_blocks_regardless_of_regime():
     macro = MacroGate(ok=False, reason="stage4_declining", stage="stage4_declining")
     decision = decide_for_symbol(
@@ -254,13 +287,6 @@ def test_evaluate_exit_closes_at_stop_loss():
     assert decision.reason == "stop_loss"
 
 
-def test_evaluate_exit_forces_close_near_expiry_regardless_of_pnl():
-    """DTE가 FORCE_CLOSE_DTE(2, 주간옵션 기준 감마리스크 회피용) 이하면 손익이
-    좋아도 강제청산."""
-    legs = [{"symbol": _far_expiry_symbol(days_out=1), "cost_basis": -100.0, "unrealized_pl": 5.0, "side": "short", "qty": "1"}]
-    decision = evaluate_exit(legs)
-    assert decision.should_close is True
-    assert decision.reason == "dte_forced"
 
 
 def test_build_close_intent_reverses_short_and_long_sides():

@@ -66,7 +66,13 @@ SHORT_DELTA_TARGET = 0.20  # 2026-09-05: backtest.py의 DELTA_SHORT_LEG(챔피�
 # 정상) 이 백테스트의 이론가 체결 가정이 ATM 근접시 실제 호가스프레드·슬리피지·
 # 조기배정 리스크를 못 잡는다고 판단, 검증 없이 채택 안 함
 # (docs/design-crypto-strategy-refinement-2026-09-04.md §9 참고).
-PROTECTIVE_DELTA_TARGET = 0.06  # 보호레그는 숏레그보다 델타가 훨씬 낮은(더 바깥) 쪽
+SPREAD_WIDTH_PCT = 0.015  # 2026-09-07: 보호레그를 델타타깃(구 PROTECTIVE_DELTA_TARGET=0.06)
+# 대신 backtest.py의 SPREAD_WIDTH_PCT(기초자산가의 1.5%) 방식으로 교체 — 최초 커밋부터
+# 챔피언 백테스트와 라이브가 보호레그를 완전히 다른 방식으로 골라왔다는 걸 발견(사용자
+# 지적으로 실데이터 A/B/C/D 비교 실행). 9종목 3yr $100k 단독계좌 재검증: 델타타깃 방식은
+# 챔피언 백테스트 대비 손익 42%(A $308,878 vs B $128,874) — 격차의 ~79%가 이 보호레그
+# 방식 차이 하나에서 나옴(나머지 21%는 아래 FORCE_CLOSE_DTE 제거와 겹쳐 있었음, 그쪽은
+# 별도 분해검증 후 제거). %폭고정으로 전환.
 
 # ── 옵션 유니버스 (정본 — mcp_runner.py/multi_asset.py 둘 다 여기서 import,
 #    각자 따로 들고 있다가 어긋난 전례 있음: multi_asset.py가 2026-08-25 6종목
@@ -105,11 +111,6 @@ OPTION_SYMBOLS = (
 #    2026-08-24 발견: 이전엔 진입만 있고 청산 감시가 아예 없었다) ──
 PROFIT_TARGET_PCT = 0.5   # 수취 크레딧의 50% 이익 실현 시 청산
 STOP_LOSS_MULTIPLE = 2.0  # 청산비용이 수취크레딧의 2배 도달 시 손절
-FORCE_CLOSE_DTE = 2  # 2026-08-24: MIN_DTE(14, 월간 시절 값)에서 분리 — 이 DTE
-# 이하로 내려가면 손익 무관 강제청산. 주간옵션(목표 진입 DTE 5~9)에서 14는
-# 진입 직후 항상 강제청산되는 값이라 쓸 수 없었다 — 만기 임박 감마리스크만
-# 피하면 되므로 2일로 재설정(백테스트는 이 강제청산 자체를 시뮬레이션 안 해서
-# 참고할 검증값이 없다 — 감마리스크 회피라는 목적에 맞춘 판단값).
 
 MACRO_DB_PATH = Path.home() / ".local/share/regime-signals/verdicts.db"
 MACRO_BLOCK_STAGES = {"stage4_declining"}
@@ -359,6 +360,37 @@ def pick_by_delta(
     return candidates[0][0]
 
 
+def pick_by_width(
+    chain: dict, contract_type: ContractType, short_strike: float, underlying_price: float,
+    spread_type: str, expiration: date | None = None,
+) -> str | None:
+    """보호레그를 델타가 아니라 backtest.py의 SPREAD_WIDTH_PCT(기초자산가의 1.5%)
+    방식으로 고른다(2026-09-07, A/B/C/D 실데이터 검증으로 델타타깃 방식이 챔피언
+    백테스트 대비 실측 저조 확인 — 위 SPREAD_WIDTH_PCT 주석 참고). 숏레그 행사가
+    기준으로 폭만큼 떨어진 목표행사가에 가장 가까운 실제 상장 콘트랙트를 고른다
+    (pick_by_delta와 마찬가지로 만기 제한 가능 — 숏레그와 다른 만기로 갈라지는
+    사고를 그대로 재발 방지)."""
+    target_distance = underlying_price * SPREAD_WIDTH_PCT
+    target_strike = short_strike - target_distance if spread_type == "bull_put" else short_strike + target_distance
+    candidates = []
+    for sym, snap in chain.items():
+        is_call = "C" in sym[-9:]
+        if contract_type == ContractType.CALL and not is_call:
+            continue
+        if contract_type == ContractType.PUT and is_call:
+            continue
+        if expiration is not None and _occ_expiration(sym) != expiration:
+            continue
+        strike = _occ_strike(sym)
+        if strike is None or strike == short_strike:  # 숏레그 자신(또는 같은 행사가)은 보호레그 후보 아님
+            continue
+        candidates.append((sym, abs(strike - target_strike)))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[1])
+    return candidates[0][0]
+
+
 def fetch_chain(
     data_client: OptionHistoricalDataClient, symbol: str, contract_type: ContractType,
     dte_min: int = TARGET_DTE_RANGE[0], dte_max: int = TARGET_DTE_RANGE[1],
@@ -483,8 +515,18 @@ def decide_for_symbol(
         short_call = pick_by_delta(calls, ContractType.CALL, SHORT_DELTA_TARGET)
         # 보호레그는 반드시 그 숏레그와 같은 만기로만 고른다 — 아니면 보호레그가
         # 숏레그보다 먼저 만기돼 그 사이 네이키드가 되는 사고가 재발한다(2026-08-25 실측).
-        long_put = pick_by_delta(puts, ContractType.PUT, PROTECTIVE_DELTA_TARGET, expiration=_occ_expiration(short_put) if short_put else None)
-        long_call = pick_by_delta(calls, ContractType.CALL, PROTECTIVE_DELTA_TARGET, expiration=_occ_expiration(short_call) if short_call else None)
+        short_put_strike = _occ_strike(short_put) if short_put else None
+        short_call_strike = _occ_strike(short_call) if short_call else None
+        long_put = (
+            pick_by_width(puts, ContractType.PUT, short_put_strike, signal.close, "bull_put",
+                          expiration=_occ_expiration(short_put))
+            if short_put_strike is not None else None
+        )
+        long_call = (
+            pick_by_width(calls, ContractType.CALL, short_call_strike, signal.close, "bear_call",
+                          expiration=_occ_expiration(short_call))
+            if short_call_strike is not None else None
+        )
         if not all([short_put, long_put, short_call, long_call]):
             return CycleDecision(symbol, signal.regime, macro, None, "chain_insufficient")
         put_width = _vertical_width(short_put, long_put, ContractType.PUT)
@@ -511,7 +553,13 @@ def decide_for_symbol(
     ctype = ContractType.PUT if put_side else ContractType.CALL
     chain = fetch_chain(option_client, symbol, ctype)
     short_leg = pick_by_delta(chain, ctype, SHORT_DELTA_TARGET)
-    long_leg = pick_by_delta(chain, ctype, PROTECTIVE_DELTA_TARGET, expiration=_occ_expiration(short_leg) if short_leg else None)
+    short_leg_strike = _occ_strike(short_leg) if short_leg else None
+    spread_type = "bull_put" if put_side else "bear_call"
+    long_leg = (
+        pick_by_width(chain, ctype, short_leg_strike, signal.close, spread_type,
+                      expiration=_occ_expiration(short_leg))
+        if short_leg_strike is not None else None
+    )
     if not short_leg or not long_leg:
         return CycleDecision(symbol, signal.regime, macro, None, "chain_insufficient")
     width = _vertical_width(short_leg, long_leg, ctype)
@@ -556,11 +604,11 @@ def _occ_expiration(symbol: str) -> date | None:
 @dataclass
 class ExitDecision:
     should_close: bool
-    reason: str  # "profit_target" | "stop_loss" | "dte_forced" | "hold"
+    reason: str  # "profit_target" | "stop_loss" | "hold"
     profit_pct: float
 
 
-def evaluate_exit(leg_positions: list[dict], today: date | None = None) -> ExitDecision:
+def evaluate_exit(leg_positions: list[dict]) -> ExitDecision:
     """한 스프레드를 구성하는 레그들(Alpaca position dict, 필드: symbol, cost_basis,
     unrealized_pl)을 받아 청산해야 하는지 판단한다. 순수 함수 — 실제 포지션
     리스트만 있으면 브로커 연결 없이 테스트 가능.
@@ -573,20 +621,12 @@ def evaluate_exit(leg_positions: list[dict], today: date | None = None) -> ExitD
     if not leg_positions:
         return ExitDecision(False, "hold", 0.0)
 
-    today = today or datetime.now(timezone.utc).date()
     total_cost_basis = sum(float(p.get("cost_basis", 0.0)) for p in leg_positions)
     total_unrealized_pl = sum(float(p.get("unrealized_pl", 0.0)) for p in leg_positions)
     credit_received = abs(total_cost_basis)
 
-    expirations = [_occ_expiration(p.get("symbol", "")) for p in leg_positions]
-    valid_expirations = [e for e in expirations if e is not None]
-    if valid_expirations:
-        min_dte = min((e - today).days for e in valid_expirations)
-        if min_dte <= FORCE_CLOSE_DTE:
-            return ExitDecision(True, "dte_forced", total_unrealized_pl / credit_received if credit_received else 0.0)
-
     if credit_received <= 0:
-        return ExitDecision(False, "hold", 0.0)  # 정보 부족 — 손익 판단 불가, 강제청산(DTE)만 유효
+        return ExitDecision(False, "hold", 0.0)  # 정보 부족 — 손익 판단 불가
 
     profit_pct = total_unrealized_pl / credit_received
     if profit_pct >= PROFIT_TARGET_PCT:
