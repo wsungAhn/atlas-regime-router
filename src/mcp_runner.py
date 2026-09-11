@@ -520,6 +520,7 @@ async def run_cycle_once() -> None:
                             _log_decision({
                                 "symbol": symbol, "submitted": True, "action": "close",
                                 "exit_reason": exit_decision.reason, "limit_fallback_price": limit_price,
+                                "order_intent": limit_close_intent, "order_result": limit_result,
                             })
                             option_cooldown[symbol] = datetime.now(timezone.utc).date()
                             option_cooldown_changed = True
