@@ -72,6 +72,9 @@ CRYPTO_POSITIONS_PATH = REPO_ROOT / "registry" / "crypto_positions.json"
 CRYPTO_POSITIONS_LOCK_PATH = REPO_ROOT / "registry" / "crypto_positions.json.lock"
 CRYPTO_COOLDOWN_PATH = REPO_ROOT / "registry" / "crypto_cooldown.json"
 OPTION_COOLDOWN_PATH = REPO_ROOT / "registry" / "option_cooldown.json"
+# 이 파일이 있으면 옵션 신규진입만 막고 청산감시는 그대로 돈다(2026-09-30 -50% 사후분석 후 close-only).
+# 해제: 파일 삭제. 커밋 대상 아님(.gitignore 불필요 — registry/*는 이미 untracked 운용 파일).
+CLOSE_ONLY_PATH = REPO_ROOT / "registry" / "OPTIONS_CLOSE_ONLY"
 ENV_FILE = REPO_ROOT / ".env.competition"
 
 
@@ -587,6 +590,11 @@ async def run_cycle_once() -> None:
             # 부족한 날엔 강한 신호가 먼저 예산을 가져가고, 약한 신호는 남는 게
             # 없으면 자연스럽게 밀려난다(사용자 지적으로 도입).
             ranked: list[tuple[float, str, object]] = []
+            if CLOSE_ONLY_PATH.exists():
+                for symbol in eligible_symbols:
+                    _log_decision({"symbol": symbol, "submitted": False, "skip_reason": "close_only"})
+                logger.info("[CLOSE_ONLY] %s exists — skipping %d new entries", CLOSE_ONLY_PATH.name, len(eligible_symbols))
+                eligible_symbols = []
             if macro.ok:
                 for symbol in eligible_symbols:
                     try:
