@@ -5,3 +5,4 @@ __pycache__/
 registry/
 logs/
 data/cache/
+data/quote_panel/

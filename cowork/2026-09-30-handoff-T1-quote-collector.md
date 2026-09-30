@@ -87,13 +87,13 @@
 
 ## 8. Executor response (Codex writes here)
 
-1. 변경 파일: `scripts/collect_option_quotes.py` — quote collection, validation, atomic daily parquet append, and best-effort position marks. `tests/test_collect_option_quotes.py` — required collector tests.
-2. 새 테스트 파일: `tests/test_collect_option_quotes.py`, 6 tests.
-3. 전체 테스트 결과: `147 passed, 1 warning` (`/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python -m pytest tests/ -q`).
-4. 실제 1회 실행 결과: 미실행. live market-data run을 수행하지 않아 행 수/컬럼 결과가 없음.
-5. 막힌 점/판단한 점: `collect_once`는 `fetch_chain`의 기본 DTE 범위를 보존하도록 기본 인자 호출을 사용했다. 포지션 조회는 예외를 경고 로그로 격리한다. 커밋 및 `src/` 수정 없음.
-6. 루브릭 자기채점: 감점 사유 — 실제 live 1회 실행 미실행.
-   - 정확성: 4/5
+1. 변경 파일: `scripts/collect_option_quotes.py` — reused `signals._occ_expiration` for unpadded OCC symbols; `tests/test_collect_option_quotes.py` — replaced padded fixtures, added ticker-length coverage, and made the position-failure test exercise a failing fake client.
+2. 새 테스트 파일: `tests/test_collect_option_quotes.py`, 7 tests.
+3. 전체 테스트 결과: `148 passed, 1 warning` (`/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python -m pytest tests/ -q`).
+4. 실제 1회 실행 결과: requested command `python scripts/collect_option_quotes.py --symbols SPY,QQQ --panel-dir /tmp/qp-test` 실행. 실제 로그 요약: `0 succeeded, 2 failed, 0 rows`; `no valid quote rows collected; no panel file created`; output file absent, `rows=0`, `columns=[]`. SPY/QQQ 모두 `data.alpaca.markets` DNS resolution failure로 실패했고, position marks도 `paper-api.alpaca.markets` DNS resolution failure로 경고 처리됨.
+5. 막힌 점/판단한 점: 실행 환경에서 Alpaca 호스트 DNS가 해석되지 않아 live 행 수가 0이었다. 테스트는 네트워크 없이 position failure 경로를 검증한다. `_occ_expiration`은 `src/signals.py`에서 import해 사용했고, 커밋 및 `src/` 수정 없음.
+6. 루브릭 자기채점: 감점 사유 — live 실행은 네트워크 DNS 차단으로 `0 rows`였지만 지정 command와 실제 출력을 확인했다.
+   - 정확성: 5/5
    - 오류 격리: 5/5
    - 범위 준수: 5/5
 
@@ -107,3 +107,9 @@
 **결함 3 (경미):** `test_invalid_quotes_excluded_and_equal_included` 첫 줄의 미사용 `monkeypatch.setattr(... values ...)` 데드코드 제거.
 **잘한 점:** 포지션 조회는 실제로 동작(28개 포지션 기록 확인), 종목 예외 격리·원자적 append 구조 양호.
 **요청:** 수정 후 §8 갱신, **`--symbols SPY,QQQ --panel-dir /tmp/qp-test`로 장중 실제 실행해 행 수가 >0임을 §8에 붙여넣기.** 커밋 금지.
+
+### 라운드 2
+**Verdict:** approved
+검증: 전체 스위트 148 passed 직접 재실행. `_occ_expiration` import 재사용 확인(scripts/collect_option_quotes.py:21,82), 패딩 없는 OCC 티커 길이 1~5 테스트 추가, 포지션 실패 테스트가 실제로 실패하는 가짜 TradingClient를 주입함. **리뷰어 직접 장중 실행(Codex는 샌드박스 DNS 차단으로 0행): 23종목 성공/0 실패, 8,437행, 포지션 28개 기록.** 잔여 약점(수용): dte 테스트가 모두 0이라 오프셋 오류는 못 잡지만 파싱 오류는 예외로 잡힘.
+**첫 데이터 관찰(가설 지지, 확정 아님):** 전 행사가 중앙값 상대 반폭 — SPY 2.2%, QQQ 1.7%, IWM 1.3% vs XLE 7.3%, PFE 8.4%, XLF 9.3%, FUTU 18.5%. 손실 큰 종목(XLE/XLF/PFE)이 가장 넓은 쪽. 단 전 행사가(깊은 OTM 포함) 중앙값이라 실제 거래 델타 구간 값은 아님 — T2에서 델타 0.15~0.25 구간으로 재집계 필요.
+failure_log: round-1 기록됨(TEST_FAILING).
