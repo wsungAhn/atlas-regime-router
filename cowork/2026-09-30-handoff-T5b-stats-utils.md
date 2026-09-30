@@ -1,9 +1,9 @@
 # Codex Handoff — T5b statistics utilities — 2026-09-30
 
-> **상태(Status):** `대기중 / pending`
+> **상태(Status):** `검토대기 / review-pending`
 > _(Executor: `진행중` on start, `검토대기` when done. Only the reviewer sets `완료`.)_
 >
-> **시작 기록(Started by):** _(비워둠 — 착수 주체가 `session=<id> machine=<tag> started=<ISO8601>` 기록)_
+> **시작 기록(Started by):** `session=codex machine=friction-backtest started=2026-09-30T00:00:00-07:00`
 >
 > **작성자:** Claude Sonnet 5.5 (reviewer) → **수행자:** Codex gpt-reserve (effort low)
 > **작업명:** 마찰 백테스트용 통계 유틸 `src/friction_stats.py` (설계문서 태스크 T5b)
@@ -85,7 +85,19 @@ def holm(pvalues, alpha=0.10) -> list[bool]
 1. 변경 파일 2. 새 테스트 수 3. 전체 테스트 결과 4. 판단한 점/막힌 점 5. 루브릭 자기채점(감점 사유 먼저)
 
 ## 8. Executor response (Codex writes here)
-_(write here)_
+1. 변경 파일: `src/friction_stats.py`, `tests/test_friction_stats.py`
+2. 새 테스트 수: 5개
+3. 전체 테스트 결과: `/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python -m pytest tests/ -q` → `164 passed, 1 warning`
+4. 판단한 점/막힌 점: 공통 private helper로 동일 seed의 bootstrap resampling을 재현한다. scipy·추가 의존성은 사용하지 않았다. 막힌 점 없음.
+5. 루브릭 자기채점(감점 사유 먼저): 감점 사유 없음. 정확성 5/5, 재현성 5/5, 범위 준수 5/5.
 
 ## 9. Reviewer log (reviewer writes here)
-_(reviewer writes here)_
+
+### 라운드 1
+**Verdict:** changes requested
+검증: 전체 164 passed 직접 재실행, 코드 전문 읽음 — **구현은 명세·해석값과 일치**(Holm 케이스 6종, 정규근사 CI/SE, 재현성 모두 직접 확인). scratch 회귀 주입 9종 중 6종은 테스트가 포착(비복원, Holm 보정 제거, 중단 규칙 제거, p값 +1 제거, None을 0으로 안 침, CI 상한 오류). **3종은 테스트가 잡지 못함(테스트 약점):**
+1. `bootstrap_p_one_sided`의 `statistics <= 0`을 `< 0`으로 바꿔도 통과 → **평균이 정확히 0인 경우**를 검증하는 테스트 추가: 전부 0인 입력 `[0.0]*50`에서 p가 정확히 `1.0`이어야 한다(모든 리샘플 평균이 0 → `<=`라서 전부 카운트).
+2. `bootstrap_se`의 `ddof=1`→`0` 변경을 못 잡음 → 작은 입력에서 구분되는 테스트 추가: `values=[0.0, 1.0]`, `n_resamples`를 크게(예: 20000)로 두고 `bootstrap_se`가 이론값 `0.3536`(= sqrt(0.25/2)) 근처(±0.01)인지는 ddof로 구분이 안 되므로, **대신** 같은 입력을 직접 재현해 계산: 테스트 안에서 `np.random.default_rng(seed).choice(..., replace=True)`로 동일 리샘플 행렬을 만들어 `np.std(means, ddof=1)`과 `bootstrap_se` 결과가 **정확히 같음**(`==` 또는 `rel=1e-12`)을 단언한다.
+3. 전역 난수 상태 사용(`np.random.seed`)을 못 잡음 → 테스트 추가: `np.random.seed(123); before = np.random.get_state()[1].copy()`; `bootstrap_ci`/`bootstrap_se`/`bootstrap_p_one_sided`를 호출; 호출 후 `np.random.get_state()[1]`이 `before`와 **같음**(전역 상태 불변)을 단언한다.
+**잘한 점:** 공통 private 헬퍼로 CI/SE가 같은 분포를 공유, 빈 입력 예외, 새 의존성 없음.
+**요청:** 위 3개 테스트를 `tests/test_friction_stats.py`에 추가(기존 테스트는 유지). 구현 변경 불필요(구현 변경이 필요해 보이면 §8에 이유를 적고 멈춰라). 전체 스위트 실행 결과를 §8에 갱신. 커밋 금지.
