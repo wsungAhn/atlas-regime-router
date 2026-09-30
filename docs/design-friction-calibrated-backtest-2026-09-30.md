@@ -140,7 +140,7 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
 4. 에피소드 분류는 셋이다. `clean`은 청산 1회이고 `profit_pct`가 있는 경우이다. `single_limit`은 청산 1회인 limit 폴백이다. `retry`는 청산이 2회 이상인 경우이고, 사유가 뒤바뀌면 `reason_flip`도 붙인다.
 5. 에피소드의 청산 이벤트는 **첫 청산 레코드**로 정한다. 사유, 시각, `minutes_held`가 여기서 나온다. `trigger_profit_pct`는 첫 레코드에 있을 때만 채운다. `live_close_path`는 첫 레코드가 limit 폴백이면 `limit_fallback`, 아니면 `market`이다.
 6. **보정 표본은 `clean`만**이다. 목표 T-a와 T-c는 전체 112개 에피소드(첫 레코드 기준)로도 따로 계산해 민감도로 보고한다. 이 민감도는 보정 합격 여부를 가르지 않고, 등급을 `PASS`와 `PASS_CONDITIONAL`로 나누는 데만 쓴다(설계 4-6).
-7. 제외된 16개는 TLT, XLE, DIA, GLD, SPY처럼 호가 공백이 난 종목에 몰려 있다. 그래서 clean 표본은 **최악의 마찰을 과소대표**한다. 결과 해석 시 함께 인용한다.
+7. 제외된 16개의 종목 분포는 TLT 4, IWM 2, XLE 2, DIA 2, 그리고 QQQ, SPY, GLD, SLV, XLF, NKE가 각 1이다. limit 폴백은 호가 공백 때문에 생기므로 이들은 호가 공백이 있었던 포지션이다. 그래서 clean 표본은 **최악의 마찰을 과소대표**한다. 결과 해석 시 함께 인용한다.
 
 ### 2. 마찰 모델 (관측 가능한 입력 + 자유 파라미터 1개)
 
@@ -162,6 +162,13 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
      - β는 진입 직후 마크 손익에 결정적 오프셋 `−β·Σh/credit`을 만든다. 그래서 조기 SL만 늘고 조기 PT는 만들지 않는다. 라이브의 조기 SL 23/65 대 조기 PT 0/31이라는 비대칭이 β를 식별한다.
      - 오프셋은 크레딧/폭이 얇을수록 커지므로 T-b(SL 과슈팅 크기)가 같은 β로 맞아야 한다. 이것이 구조 검증이다.
      - 평균 0 대칭 노이즈 k는 조기 PT도 함께 만들기 때문에 라이브 비대칭과 충돌한다. 그래서 적합하지 않는다. k=0.5 한 값은 **민감도 표로만** 보고하고, 판별 대조군 C(설계 4-5)에서 쓴다.
+     - **대칭 노이즈의 정의(확정)**: 레그 ℓ, 폴링 t마다 독립으로 `ε_{ℓ,t} ~ Normal(0, (k·h_ℓ)²)`를 뽑아 β 오프셋 뒤의 레그 마크에 더한다. 곧 `mark_ℓ,t = mid_ℓ,t ± β·h_ℓ + ε_ℓ,t`이다.
+       - 단위는 h의 배수이다. k 격자는 {0, 0.25, …, 3.0}(13개)이다.
+       - 레그 간, 폴링 간에 상관은 없다.
+       - 체결가(2-4)에는 노이즈를 넣지 않는다.
+       - 난수는 `numpy.random.default_rng(seed)`를 쓰고, seed는 에피소드 인덱스와 전역 seed 20260930으로 결정한다.
+       - k=0이면 난수를 뽑지 않는다(결정적 경로).
+       - 구현 위치는 T4a의 `mark_pnl_pct(position, beta, table, k=0.0, rng=None)`이다. 테스트는 #31이다.
      - **식별되는 것은 β가 아니라 곱 β·h이다.** 마크 오프셋이 β·h로만 들어가기 때문이다. 따라서 β 자체에는 물리적 의미를 부여하지 않는다. h를 바꾸는 시나리오(비관 h×1.5)에서는 β를 다시 적합해 곱을 보존한다.
      - **스큐와 IV 앵커의 한계**: IV 앵커(2-3)는 포지션당 `iv_scale` 하나를 쓴다. 실제로는 풋 스큐 때문에 숏 레그와 롱 레그의 IV가 다르다. 그래서 레그 mid 오차, 특히 롱 레그 쪽 오차가 β에 섞여 들어간다. 적합된 β는 "마크 편향 + 스큐 오차"의 합성값으로 해석한다.
    - **시장가 교차 비용**은 호가 정의상 h로 고정되며 적합하지 않는다. 로그에 체결가가 없으므로 이 비용은 로그로 식별할 수 없다. 따라서 달러 손익(realized)은 **미보정 모델 출력**으로 표시한다.
@@ -182,7 +189,11 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
 
 **출력**: `{exit_ts, exit_reason, trigger_mark_pnl_pct, realized_pnl, n_polls, n_limit_retries}`. `end_at`까지 트리거가 없으면 `None`을 반환한다(레거시 패리티 모드 전용).
 
-폴링 격자는 15분봉(`fetch_intraday_bars`, `src/backtest.py:87-107`)이다. replay는 진입 시각 이후 첫 봉부터 시작한다.
+폴링 격자는 15분봉(`fetch_intraday_bars`, `src/backtest.py:87-107`)이다. 시작과 끝은 모드마다 다음과 같이 정한다.
+- **replay**: `start_after`는 라이브 진입 시각이고, 폴링은 그 뒤 첫 봉부터 시작한다. `end_at`은 만기일의 마지막 봉이다.
+- **generative**: 진입가는 기존 장초반 진입 경로로 정한다. `_early_intraday_close_series`와 `_substitute_close_with_intraday`(`src/backtest.py:291-309`)로 만든 `sim_df`를 `_generate_raw_trades(..., sim_df=...)`(`:312-322`)에 넘기면, 진입가는 진입일 첫 15분봉 종가가 된다. `start_after`는 **진입일 첫 15분봉의 타임스탬프**이고, 폴링은 **같은 날 두 번째 봉부터** 시작한다. `end_at`은 만기일의 마지막 봉이다.
+  - **조기 SL 재현에 미치는 영향**: 진입을 일봉 종가로 두면 첫 폴링이 다음날 개장 이후가 된다. 그러면 모든 폴링이 진입 후 60분을 넘어서 generative의 조기 SL이 구조적으로 0이 되고, V2(60분 보류)도 아무 효과가 없다. 장초반 진입을 쓰면 라이브처럼 진입 당일 장중 폴링이 생긴다. 그래서 β 오프셋이 만드는 첫 시간 SL과 V2의 효과가 generative에서도 나타난다.
+  - 남는 차이: 라이브 진입은 장중 아무 15분 사이클에서나 일어나지만, generative 진입은 항상 개장 직후다. 그래서 generative의 첫 시간은 개장 직후 변동성 구간에 몰려 있다. 결과 해석 시 함께 인용한다.
 
 **콘도르**: 4레그 포지션은 put 수직과 call 수직의 `price_spread_to_close` 두 번 호출과 레그 mid 합으로 가격을 낸다. 트리거는 **4레그 합산** 마크 손익률로 판정하며, 이는 `src/signals.py:624-635`와 같다. 한쪽 수직 단독으로는 판정하지 않는다.
 
@@ -193,7 +204,10 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
   - 마크 손익률이 +0.5 이상이면 PT, −1.0 이하이면 SL이다.
   - 청산은 **라이브 경로를 재현**한다. 기본은 market(s=1)이다.
   - replay에서 `live_close_path=="limit_fallback"`인 에피소드는 limit으로 청산한다. L = mid 순 데빗 + 5%·|mid 순 데빗|(`src/signals.py:703-720`)이다. 미체결이면 다음 폴링에서 PT/SL을 재평가하고 L을 새로 계산해 재제출한다. 라이브에서 관찰된 재시도를 재현한 것이다.
-  - generative에서는 종목별 limit 폴백 확률(T3가 산출하는 에피소드 경험 비율)로 폴백 여부를 정한다. 시드를 고정한다.
+  - generative에서는 종목별 limit 폴백 확률로 폴백 여부를 정한다. 시드를 고정한다.
+    - 해당 종목의 에피소드가 5개 이상이면 그 종목의 경험 비율(첫 청산이 limit 폴백인 에피소드 수 / 에피소드 수)을 쓴다.
+    - 5개 미만이거나 없으면 **전체 풀링 비율 16/112**를 기본값으로 쓴다.
+    - T3가 두 비율을 모두 산출한다.
 - `V1 limit_then_market`
   - 트리거는 V0과 같다.
   - 트리거 폴링 t0에 L = mid 순 데빗으로 limit을 낸다.
@@ -208,7 +222,11 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
 ### 4. 보정 절차 (과적합 통제)
 
 1. **분할.** clean 에피소드를 진입 시각 순으로 정렬한다. 앞 floor(0.6·N)개(N=96이면 57개)를 train, 나머지(39개)를 validation으로 둔다. 경계는 2026-09-18T14:00Z이고 출력에 기록한다. 두 구간의 레짐 구성이 다르다는 점(배경의 표)을 그대로 안고 간다. 분할을 조정해서 레짐 구성을 맞추지는 않는다. 그렇게 하면 결과를 보고 분할을 고르는 셈이 되기 때문이다.
-2. **적합.** β만 격자에서 고른다(2-2). 기준은 **train만으로** 계산한 손실, 즉 T-a, T-b, T-c(i), T-c(ii)의 정규화 오차 합이 최소인 값이다. 적합 함수는 경계 이후 행을 받으면 `ValueError`를 던진다. h, s, k, IV 앵커는 적합하지 않는다. 적합 결과는 regime별 train 잔차와 함께 보고한다.
+2. **적합.** β만 격자에서 고른다(2-2). 기준은 **train만으로** 계산한 손실 `L(β) = Σ_j ((sim_j(β) − live_j) / SE_j)²`가 최소인 값이다.
+   - j는 {T-a, T-b, T-c(i), T-c(ii)}이다. `live_j`는 train 라이브 통계이다.
+   - `SE_j`는 같은 train 에피소드를 2000회 부트스트랩(시드 고정)해 얻은 통계의 표준편차이다. 하한을 둔다: 비율 통계(T-a, T-c)는 0.01, T-b는 0.05(profit_pct 단위). 분모가 0이 되는 것을 막기 위해서다.
+   - 이 정규화를 고른 근거: 서로 단위가 다른 목표를 "표본오차 몇 개만큼 벗어났나"로 같은 척도에 올린다. 정밀하게 측정된 목표에 더 큰 가중이 간다. 판정(4-4)과 같은 부트스트랩 기법을 써서 적합 기준과 판정 기준이 어긋나지 않는다.
+   - 동점이면 작은 β를 고른다. 적합 함수는 경계 이후 행을 받으면 `ValueError`를 던진다. h, s, k, IV 앵커는 적합하지 않는다. 적합 결과는 regime별 train 잔차와 함께 보고한다.
 3. **목표 지표 4종.** 모두 로그와 같은 정의를 쓴다. 트리거 시점 마크 기준이며, 청산 정책은 V0이다.
    - T-a 승률: 첫 청산 사유가 `profit_target`인 비율. clean 전체는 31/96.
    - T-b SL 에피소드의 `trigger_profit_pct` 중앙값. clean 전체는 −1.40.
@@ -219,13 +237,17 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
 4. **판정(validation에서).**
    - T-a, T-b, T-c(i), T-c(ii)의 시뮬 값이 **validation 라이브 통계의 90% 부트스트랩 CI**(에피소드 단위 리샘플 2000회, 시드 고정) 안에 있어야 한다. Δ는 SL과 PT를 따로 리샘플한 뒤 차이를 계산한다.
    - T-d는 두 가지를 모두 만족해야 한다. 시뮬의 trend_up 승률이 validation trend_up 승률(3/21)의 90% CI 안에 있어야 하고, 시뮬에서도 trend_up 승률이 세 regime 중 가장 낮아야 한다.
+   - **분모 0 규칙**: 시뮬에서 SL이나 PT가 0건이면 해당 비율은 0으로 기록하고 `undefined` 플래그를 붙인다.
+     - T-c(i)가 0/0이면 0으로 보고 CI와 비교한다. 라이브 CI 하한이 0보다 크면 실패다.
+     - Δ에서 PT 쪽이 0/0이면 PT 비율을 0으로 둔다.
+     - T-b가 SL 0건으로 정의되지 않으면 **실패**로 본다.
    - validation n=39라 CI가 넓다(검정력 약함). 이 한계는 결과표에 적는다.
    - train과 validation의 레짐 차이 때문에 validation 실패가 날 수 있다. 그래도 FAIL은 FAIL이다. 레짐 탓으로 돌려 재적합하거나 판정을 구제하지 않는다. 대신 regime별 잔차를 보고서에 첨부한다.
 5. **대조군(필수 게이트).**
    - (A) 무마찰(β=0, h=0): 반드시 T-a 또는 T-c(i)에서 CI를 벗어나야 한다.
    - (C) 대칭 노이즈(β=0, h 측정값, k를 train에서 T-c(i)에 맞춤, k 격자는 0~3을 0.25 간격): 반드시 **T-c(ii) Δ에서 CI를 벗어나야** 한다. 대칭 노이즈는 조기 PT도 만들어 Δ를 낮추기 때문이다. 이 대조군이 "노이즈가 아니라 편향"이라는 해석을 판별한다.
    - A나 C 중 하나라도 CI 안에 들어오면 목표 지표가 마크 편향을 판별하지 못한다는 뜻이다. 이 경우 결론은 "귀속 불가"이고 설계 6으로 넘어가지 않는다.
-   - 이전 판의 대조군 B(β=0에 교차 비용만 있음)는 **삭제**한다. β=0이면 트리거 시각이 무마찰과 항상 같아서(테스트 #1b가 보장) A와 판별력이 같다.
+   - 이전 판의 대조군 B(β=0에 교차 비용만 있음)는 **삭제**한다. β=0이면 트리거 시각이 무마찰과 항상 같아서(테스트 #30이 보장) A와 판별력이 같다.
 6. **보정 결과 등급** (설계 6 조건 1이 이 등급을 사용한다).
    - `PASS`: 4-4와 4-5를 모두 통과했고, 전체 112개 에피소드로 계산한 민감도(T-a, T-c(i))도 validation CI 안에 있다.
    - `PASS_CONDITIONAL`: 4-4와 4-5는 통과했지만, 112개 민감도 중 하나 이상이 CI 밖이다. 조건 1은 **통과로 친다**. 대신 설계 6의 페이퍼 보호관찰 중단 임계를 강화한다.
@@ -239,7 +261,7 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
   - 그다음 2레그 수직으로 `run_exit_path`를 돌려 `exit_date/exit_reason/close_debit/realized_pnl`을 덮어쓴다.
   - `run_portfolio_simulation`은 `simulate_trade`를 모듈 전역 이름으로 호출한다(`:435`). 그래서 워밍업, 스킵, 동시보유 로직(`:388-426`)은 원본 그대로 유지되고, 동시보유 판정(`:421`)은 덮어쓴 `exit_date`를 따른다.
   - 15분봉과 IV는 클로저로 주입하며, 종료 시(예외가 나도) 원본을 복원한다. 이 경로에서는 `reprice_exits_intraday`를 호출하지 않는다.
-- **generative 평가 창**: 설계 6 조건 3은 **2023-08-24~2026-08-24 3년**(첫 라이브 진입 2026-08-25 이전)만 쓴다. 이 기간은 사후분석과 가설 도출에 한 번도 쓰이지 않은 데이터다. `fetch_daily_bars`는 현재 시각 기준 N년을 받으므로(`src/backtest.py:76`), T7a가 IV 워밍업 252일을 포함하도록 4년을 받은 뒤 이 창으로 잘라낸다.
+- **generative 평가 창**: 설계 6 조건 3은 **2023-08-24~2026-08-24 3년**(첫 라이브 진입 2026-08-25 이전)만 쓴다. 이 기간은 **수정 레버(V2, E2, P1 등)의 도출에는 쓰이지 않았다.** 하지만 **기준 전략 자체(전략7, 숏 델타 0.20, 2x 손절, 1.5% 폭)는 같은 3년 BS 백테스트에서 선택됐으므로 이 창에서 in-sample이다**(`src/signals.py:60-68`, 커밋 b18dc84의 3년 재백테스트 비교 참조). 설계 6의 누수 항목도 참조한다. `fetch_daily_bars`는 현재 시각 기준 N년을 받으므로(`src/backtest.py:76`), T7a가 IV 워밍업 252일을 포함하도록 4년을 받은 뒤 이 창으로 잘라낸다.
 - **콘도르 후처리**: 전략 신호 목록(`StrategySignal.spread_type`, `src/strategies.py:35-39`)에서 `iron_condor` 날짜 집합을 구한다.
   - 같은 (심볼, signal_date)인 `bull_put`과 `bear_call` 거래를 짝지어 4레그 포지션으로 `run_exit_path`를 다시 돌린다. 두 거래의 exit 필드는 **합산 판정 결과로 덮어쓴다**. `realized_pnl`은 각 수직의 청산 비용으로 나눈다.
   - 한 날짜가 콘도르와 방향성 신호에 동시에 나타나면 `ValueError`를 던진다(미검증 가정을 강제하는 장치).
@@ -259,7 +281,7 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
 
 ### 6. 비교 절차와 결정 규칙
 
-**사전등록 조합(동결).** 기준 1개와 후보 12개이며, 결과를 본 뒤 추가하거나 변경하지 않는다. T7b는 아래 표를 그대로 `config/friction_variants.json`에 옮긴다.
+**사전등록 조합(동결).** 기준 1개, 후보 12개, 게이트키핑 대체 주가설 1개(C13)이다. 결과를 본 뒤 추가하거나 변경하지 않는다. T7b1은 아래 표를 그대로 `config/friction_variants.json`에 옮긴다.
 
 | ID | 청산 | 진입 | 유니버스 | 구조 | 포트폴리오 | replay 평가 |
 |---|---|---|---|---|---|---|
@@ -276,19 +298,25 @@ R2 문구 정정 기록(2차 채점 후): 처음 문구는 "몽키패치 한 지
 | C10 | V0 | E0 | U0 | D1 | P0 | 가능(replay에서는 regime=range 부분집합) |
 | C11 | V0 | E0 | U0 | D0 | P1 | 불가(generative만) |
 | **C12 주가설 H1** | V2 | E2 ≥0.20 | U0 | D0 | P1 | V2+E2 부분만 |
+| **C13 대체 주가설 H1b** | V2 | E0 | U0 | D0 | P1 | V2 부분만 |
 
 P는 두 값뿐이다. P0은 캡 없음, `pct_max=0.10`(기존)이다. P1은 `max_open_risk_pct=0.20`, `pct_max=0.05`이다(설계 5). 이 값은 C11과 C12에 모두 동결된다.
 
 - **H1(C12)이 단일 사전등록 주가설**이다. 근거는 라이브에서 관찰된 기제에 대응한다는 점이다. 조기 SL에는 V2가, 얇은 크레딧에는 E2가, 동시 26포지션 노출에는 P1이 대응한다.
 - **가설 선택 단계의 누수(명시)**: H1과 후보 목록 전체는 사후분석에서 나왔다. 그 사후분석은 clean 96개 **전체**(validation 39개 포함)의 조기 SL 23/65, 크레딧/폭 버킷, 동시 포지션 수를 봤다. 그래서 replay validation은 H1과 후보들에 대해 **독립 검증 데이터가 아니다**. 이 누수 때문에 판정 근거를 다음처럼 재배치한다.
   - replay validation 결과(조건 2)는 **방향 확인용**이다. 필요조건일 뿐 충분조건이 아니다.
-  - 구속력 있는 판정은 **가설 도출에 쓰이지 않은 데이터**로만 한다. 하나는 generative 평가 창(2023-08-24~2026-08-24, 조건 3)이고, 다른 하나는 Task Contract 이후의 **전향적 페이퍼 보호관찰**(조건 5)이다.
-- **다중비교**: H1은 단일 주가설이라 보정 없이 판정한다. 탐색 조합 C01~C10(10개)은 조건 2의 단측 부트스트랩 p값에 **Holm 보정**(가족 크기 10, α=0.10)을 적용한다. C11은 replay로 평가할 수 없어 가족에서 빠진다.
+  - 구속력 있는 판정은 두 가지로 한다. 하나는 generative 평가 창(2023-08-24~2026-08-24, 조건 3)이고, 다른 하나는 Task Contract 이후의 **전향적 페이퍼 보호관찰**(조건 5)이다.
+  - generative 창은 **수정 레버에 대해서만** 미사용 데이터다. 기준 전략(전략7, 델타 0.20, 2x 손절, 1.5% 폭)은 같은 3년 BS 백테스트에서 골랐으므로 이 창은 기준 전략에 대해 in-sample이다. 그래서 조건 3을 통과해도 "기준 전략 + 레버"의 절대 성과는 낙관 편향을 가질 수 있다. 완전히 누수 없는 판정은 조건 5뿐이다.
+- **H1b(C13) 대체 경로**: H1은 E2를 포함한다. 그래서 설계 4-7 진단이 `credit_width_mismatch=True`이면 H1은 조건 3에서 자동 제외된다. 이 경우에 한해 E2를 뺀 **H1b(V2 + P1)**를 주가설로 판정한다.
+  - H1b는 H1이 mismatch로 제외됐을 때만 검정한다(고정 순서 게이트키핑). 그래서 한 실행에서 주가설 검정은 항상 **1회**이고, 보정 없이 판정해도 1종 오류가 부풀지 않는다.
+- **다중비교**: 주가설(H1 또는 H1b 중 하나)은 보정 없이 판정한다. 탐색 조합 C01~C10(10개)은 조건 2의 단측 부트스트랩 p값에 **Holm 보정**(가족 크기 **10**, α=0.10)을 적용한다.
+  - C11은 replay로 평가할 수 없어 가족에서 빠진다.
+  - C13은 게이트키핑된 주가설 경로라 가족에 넣지 않는다. 그래서 C13을 추가한 뒤에도 가족 크기는 10으로 유지된다.
 - **쌍대 차이 정의**: validation 에피소드 i마다 `d_i = pnl_F,i − pnl_C00,i`로 둔다. 필터로 탈락한 에피소드는 `pnl_F,i = 0`(미거래)으로 둔다. 평균은 **validation 전체 N**으로 나눈다. 손익은 모델 realized(라이브 qty×100 기준)이고 미보정 출력이다.
 
 **수정안 묶음 F를 라이브 Task Contract(페이퍼)로 올리는 조건.** 아래를 모두 만족해야 한다.
 1. 설계 4-6 보정 등급이 `PASS` 또는 `PASS_CONDITIONAL`이다. `FAIL`이면 여기서 끝나고 `OPTIONS_CLOSE_ONLY`를 유지한다.
-2. replay validation에서 d_i 평균이 0보다 크다. H1은 90% 부트스트랩 CI 하한이 0보다 커야 한다. 탐색 조합은 Holm 보정(가족 10) 후 유의해야 한다. C11은 이 조건을 적용하지 않는다.
+2. replay validation에서 d_i 평균이 0보다 크다. 주가설(H1 또는 게이트키핑된 H1b)은 90% 부트스트랩 CI 하한이 0보다 커야 한다. 탐색 조합은 Holm 보정(가족 10) 후 유의해야 한다. C11은 이 조건을 적용하지 않는다.
 3. generative 평가 창(2023-08-24~2026-08-24), 마찰 적용 기준으로 총손익 > 0, PF ≥ 1.2, MDD ≤ 20%(`PORTFOLIO_DD_KILL_PCT`, `src/portfolio.py:44`), 거래 수 ≥ 30을 만족한다. 이 조건은 **중앙 호가표(β는 train 적합값)와 비관 호가표(h×1.5, β는 train에서 재적합) 두 경우 모두**에서 성립해야 한다. 단, E1~E4를 포함한 조합은 설계 4-7 진단이 `credit_width_mismatch=True`이면 조건 3을 **평가 불가**로 보고, 그 조합은 Task Contract 대상에서 **제외**한다(replay만으로 올리지 않는다).
 4. V1을 포함한 조합은 s=`s_orats(레그 수)`(2레그 0.66, 4레그 0.56)에서도 조건 2와 3을 유지해야 한다.
 5. **전향적 페이퍼 보호관찰**을 Task Contract에 사전등록 조건으로 넣는다. 이 조건만이 누수 없는 최종 판정이다.
@@ -297,7 +325,7 @@ P는 두 값뿐이다. P0은 캡 없음, `pct_max=0.10`(기존)이다. P1은 `ma
    - 성공 기준(모두 충족해야 함): 누적 페이퍼 손익 ≥ 0, 60분 내 SL 비율 ≤ 20%, SL 트리거 `profit_pct` 중앙값 ≥ −1.2.
    - 성공하지 못하면 `OPTIONS_CLOSE_ONLY`로 돌아간다. 평가는 이 하네스의 T3 파서 규칙을 그대로 적용해 계산한다.
 
-통과하는 F가 여럿이면 H1을 우선하고, 그다음은 변경 레버 수가 적은 조합을 고른다. **조건 1~4를 하나도 통과하지 못하면** 옵션 사이드는 `OPTIONS_CLOSE_ONLY`로 유지하고, 결론은 "라이브 가능한 수정안 없음"으로 기록한다. 이것도 유효한 결정이다.
+통과하는 F가 여럿이면 우선순위는 H1, H1b(H1이 mismatch로 제외된 경우만), 변경 레버 수가 적은 조합 순이다. **조건 1~4를 하나도 통과하지 못하면** 옵션 사이드는 `OPTIONS_CLOSE_ONLY`로 유지하고, 결론은 "라이브 가능한 수정안 없음"으로 기록한다. 이것도 유효한 결정이다.
 
 ### 범위 밖 (이 레이어에서 안 함)
 
@@ -314,11 +342,10 @@ P는 두 값뿐이다. P0은 캡 없음, `pct_max=0.10`(기존)이다. P1은 `ma
 | # | 테스트 | 검증 | 회귀 주입(실패해야 함) |
 |---|---|---|---|
 | 1 | `test_legacy_mode_parity_with_reprice_exits_intraday` | 합성 일봉과 15분봉(일봉 종가 = 그날 마지막 15분봉 종가)으로 `run_portfolio_simulation`(PT 0.5, SL 2.0)을 돌린 뒤 `reprice_exits_intraday`를 적용한다. 사유가 `*_intraday`인 거래는 레거시 모드 `run_exit_path`의 exit_ts와 close_debit이 같고, 사유는 접미사를 뺀 값과 같다. 일봉 판정이 유지된 거래는 레거시 모드가 `None`을 반환한다. | 폴링 시작을 진입 당일로 변경, 또는 IV 폴백 제거 |
-| 1b | `test_friction_path_shifts_realized_not_trigger_when_beta0` | β=0, h>0이면 트리거 시각과 사유는 레거시 모드와 같고, realized는 교차 비용 Σh×100×qty만큼 작다. β=1이면 SL 경로 거래의 트리거가 같거나 더 이르다. | 마크에 h를 잘못 가산(β 무시) |
 | 2 | `test_leg_mid_sum_matches_price_spread_to_close` | 레그별 BS mid 합이 vendor 함수 값과 1e-9 이내로 같다(2레그와 4레그 모두) | 롱 레그 부호 반전 |
 | 3 | `test_fill_direction_buy_at_ask_sell_at_bid` | s=1이면 buy-to-close 레그는 ask, sell-to-close 레그는 bid에 체결된다. s=0.66이면 각각 `bid+0.66Δ`, `ask−0.66Δ`이다. | sell 레그에도 `bid+sΔ` 적용 |
 | 4 | `test_fit_rejects_validation_rows` | 적합 함수에 경계 이후 행이 섞이면 `ValueError` | 날짜 경계 검사 제거 |
-| 5 | `test_controls_on_analytic_paths` | 해석해를 아는 경로로 대조군을 검증한다. 하네스 자체 출력과 비교하는 테스트가 아니다. (a) 기초자산 가격과 IV를 고정하면 무마찰에서는 세타로 손익이 단조 증가하므로 SL이 0건이다. 하드코딩한 라이브 통계(조기 SL 35%, CI [0.2, 0.5])에 대해 대조군 A는 판정 **실패**다. (b) 크레딧/폭 2%인 거래를 β=1로 돌리면 첫 폴링 손익률이 −Σh/credit(해석값)이 되고 SL이 즉시 난다. (c) 대칭 노이즈 k=1, 고정 가격 경로를 시드 고정으로 돌리면 조기 PT가 1건 이상 나고, Δ가 라이브 CI [0.3, 0.6] 아래로 떨어져 대조군 C는 **실패**한다. | 판정에서 T-c(ii) 누락 |
+| 5 | `test_controls_on_analytic_paths` | 해석해를 아는 경로로 대조군을 검증한다. 하네스 자체 출력과 비교하는 테스트가 아니다. (a) 기초자산 가격과 IV를 고정하면 무마찰에서는 세타로 손익이 단조 증가하므로 SL이 0건이다. 이때 T-c(i)는 분모 0 규칙(4-4)에 따라 0에 `undefined` 플래그가 붙고, T-b는 정의되지 않으므로 실패다. 하드코딩한 라이브 통계(조기 SL 35%, CI [0.2, 0.5])에 대해 대조군 A는 판정 **실패**다. (b) 크레딧/폭 2%인 거래를 β=1로 돌리면 첫 폴링 손익률이 −Σh/credit(해석값)이 되고 SL이 즉시 난다. (c) 대칭 노이즈 k=1, 고정 가격 경로를 시드 고정으로 돌리면 조기 PT가 1건 이상 나고, Δ가 라이브 CI [0.3, 0.6] 아래로 떨어져 대조군 C는 **실패**한다. | 판정에서 T-c(ii) 누락 |
 | 6 | `test_parser_episode_rules` | fixture로 검증한다: 403 오류 진입은 제외, crypto `max_hold_days`는 제외, 레그 불일치 청산은 `leg_mismatch`, 레그 없는 limit은 `legs_unverified`, 청산 1회 limit은 `single_limit`, 20회 재시도(사유 교대)는 `retry`+`reason_flip`, 첫 레코드가 이벤트이며 `trigger_profit_pct`는 그 레코드에 있을 때만 채워진다 | 크립토 필터 제거, 또는 마지막 레코드를 이벤트로 사용 |
 | 7 | `test_simulate_trade_monkeypatch_restored` | 컨텍스트 종료 후(예외가 나도) `vendor.credit_spread_simulator.simulate_trade is original`. D1 임시 전략과 P1 패치도 복원된다. | `finally` 복원 제거 |
 | 8 | `test_generative_skips_preserved` | 워밍업 이전, 만기 거래일 없음, `max_concurrent_positions` 도달 세 가지 사유가 원본과 같은 `skipped_candidates`로 나온다 | 래퍼 안에서 워밍업 로직 재구현(메모리 사례 재현) |
@@ -329,7 +356,7 @@ P는 두 값뿐이다. P0은 캡 없음, `pct_max=0.10`(기존)이다. P1은 `ma
 | 13 | `test_iv_anchor_unanchorable_skipped` | 크레딧 ≥ 폭인 거래는 `unanchorable`로 스킵되고 개수가 보고된다. 정상 거래는 앵커 후 BS 크레딧×0.95가 목표와 1e-6 이내로 같다. | 스킵 대신 iv_scale=1 폴백 |
 | 14 | `test_bootstrap_ci_known_values` | 상수 입력이면 CI가 [x, x]이다. 0/1 배열(30개 1, 70개 0)의 비율 CI는 정규근사 [0.225, 0.375]와 ±0.03 이내이다. 같은 시드면 같은 결과이다. | 리샘플을 비복원 추출로 변경 |
 | 15 | `test_v1_limit_fill_rule` | s=0.5면 t0에서 L에 즉시 체결된다. s=0.66(2레그)이고 mid가 불변이면 t0+2에서 market(s=1)으로 체결된다. s=0.66이고 t0+1에 mid가 충분히 하락하면 L에 체결된다. 4레그 포지션에는 `s_orats`가 0.56을 반환한다. | 폴백 대기를 W=0으로 변경, 또는 4레그에 0.66 사용 |
-| 16 | `test_v2_min_hold` | 30분 시점의 SL급 마크는 무시되고 75분 시점에 SL이 난다. 15분 시점 PT는 허용된다. | 60분 게이트를 PT에도 적용 |
+| 16 | `test_v2_min_hold` | 30분 시점의 SL급 마크는 무시되고 75분 시점에 SL이 난다. 15분 시점 PT는 허용된다. generative 모드(진입일 첫 봉이 `start_after`)에서도 같은 날 두 번째 봉부터 60분 게이트가 적용된다. | 60분 게이트를 PT에도 적용 |
 | 17 | `test_v3_no_stop_and_expiry_settlement` | −300% 마크에서도 청산하지 않는다. 만기 정산은 `price_spread_to_close`(T=0) 내재가치이고 교차 비용은 0이다. | 만기에 교차 비용 가산 |
 | 18 | `test_v4_underlying_breach` | 마크가 −50%여도 기초자산이 숏 행사가를 돌파하면 SL이 난다. 콘도르는 콜과 풋 어느 쪽이든 동일하다. | 콘도르 콜 쪽 검사 누락 |
 | 19 | `test_v0_limit_fallback_retry` | `live_close_path=limit_fallback`이면 L=mid+5%·|mid|이다. 미체결이면 다음 폴링에 재평가하고 재제출한다. `n_limit_retries`가 집계된다. | 재평가 없이 첫 L 고정 |
@@ -339,10 +366,12 @@ P는 두 값뿐이다. P0은 캡 없음, `pct_max=0.10`(기존)이다. P1은 `ma
 | 23 | `test_paired_diff_counts_filtered_as_zero` | 10개 중 4개가 탈락하면 평균 분모가 10이고 탈락분은 0으로 계산된다 | 분모를 남은 6개로 변경 |
 | 24 | `test_sizing_max_loss_is_width` | 후처리 후 `max_loss == width`이다. 크레딧/폭 0.33 거래의 계약수가 라이브 공식 `floor(B/(w*100))`과 같다. | 덮어쓰기 제거 |
 | 25 | `test_p1_pct_max_path` | P1 컨텍스트 안에서 `backtest.risk_pct_for_atr_pct(atr, low_q, high_q)`의 **보간값**을 확인한다. scaled=0이면 0.05, scaled=0.5면 0.035, scaled=1이면 0.02이다. 사후 clip이었다면 scaled=0.5에서 min(0.06, 0.05)=0.05가 나와 걸린다. 컨텍스트 밖에서는 scaled=0.5가 0.06으로 복원된다. | partial 대신 사후 clip |
+| 26 | `test_holm_known_pvalues` | p=[0.01, 0.04, 0.03], α=0.10 → 기각 집합이 해석값과 일치한다. 조합 설정으로 가족을 만들면 크기가 10이다(C11, C12, C13 제외). | 보정 없이 α 비교, 또는 가족에 C11 포함 |
+| 27 | `test_decision_rule_boundaries` | PF=1.2, MDD=0.20, n=30은 통과한다. PF=1.1999, MDD=0.2001, n=29는 실패한다. E 조합 + mismatch는 제외된다. H1이 mismatch로 제외된 경우에만 H1b가 판정되고, H1이 평가 가능하면 H1b는 판정하지 않는다. | mismatch 제외 분기 삭제 |
 | 28 | `test_beta_grid_edge_and_pessimistic_refit` | 합성 train에서 최적값이 격자 상한 1.5에 걸리면 {2,3,4}로 한 번 확장한다. 그래도 상한이면 `FAIL`이다. h×1.5 시나리오에서는 β를 재적합하고, 합성 데이터에서 β·h 곱이 보존된다(±1 격자 간격). | 비관 시나리오에서 중앙 β 재사용 |
 | 29 | `test_calibration_grade` | 4-4와 4-5 통과 + 112 민감도 CI 밖이면 `PASS_CONDITIONAL`이고 보호관찰 중단 임계가 −5%이다. 모두 통과면 `PASS`에 −10%이다. 대조군 C 실패면 `FAIL`이다. | 조건부를 FAIL로 처리 |
-| 26 | `test_holm_known_pvalues` | p=[0.01, 0.04, 0.03], α=0.10 → 기각 집합이 해석값과 일치한다. 조합 설정으로 가족을 만들면 크기가 10이다(C11과 C12 제외). | 보정 없이 α 비교, 또는 가족에 C11 포함 |
-| 27 | `test_decision_rule_boundaries` | PF=1.2, MDD=0.20, n=30은 통과한다. PF=1.1999, MDD=0.2001, n=29는 실패한다. E 조합 + mismatch는 제외된다. | mismatch 제외 분기 삭제 |
+| 30 | `test_friction_path_beta0_same_trigger_beta1_earlier` | β=0, h>0이면 트리거 시각과 사유는 레거시 모드와 같고, realized는 교차 비용 Σh×100×qty만큼 작다. β=1이면 SL 경로 거래의 트리거가 같거나 더 이르다. **엄격 부등식 케이스**도 포함한다: 크레딧/폭 3%, Σh/credit=1.5인 합성 거래는 β=1에서 첫 폴링에 SL이 나고, 레거시 모드는 그보다 뒤에 SL이 나도록 경로를 만든다. 이 거래는 `exit_ts(β=1) < exit_ts(legacy)`를 만족해야 한다. | 마크에 h를 잘못 가산(β 무시), 또는 β 오프셋 부호 반전 |
+| 31 | `test_symmetric_noise_mark` | k=0이면 rng를 호출하지 않고 결과가 결정적이다. k=1, seed 고정, 레그 2개 × 10,000 폴링 표본에서 ε 평균의 절대값 < 0.03·h, 표준편차가 k·h의 ±5% 이내, 레그 간 상관의 절대값 < 0.05이다. 같은 seed면 같은 결과이다. 체결가(`fill_debit`)에는 노이즈가 들어가지 않는다. | ε를 체결가에도 가산, 또는 레그 간 같은 ε 공유 |
 
 테스트 실행 명령: `.venv/bin/python -m pytest tests/test_friction.py tests/test_friction_backtest.py tests/test_portfolio.py -q`. 기존 스위트 전체(`pytest -q`)도 계속 통과해야 한다.
 
@@ -361,21 +390,24 @@ Codex는 `-m gpt-reserve`를 쓴다. 태스크 1개가 디스패치 1개다. 모
 | **T1 호가 패널 수집기** | low | `signals.fetch_chain`, `OPTION_SYMBOLS`, `.env.competition` 키(읽기 전용 시장데이터) | `scripts/collect_option_quotes.py`: 1회 실행 시 `ts, underlying, occ, bid, ask, mid, delta, dte, feed`를 `data/quote_panel/YYYY-MM-DD.parquet`에 추가한다. 열린 포지션의 `current_price`도 함께 기록한다. 종목별 try/except와 로깅을 넣는다. 스케줄링은 하지 않는다. | 가짜 chain으로 스키마, 0·음수 호가 제외, 한 종목 예외 시 나머지 계속 진행을 검증 |
 | **T2 반폭 테이블** | low | T1 스키마 | `src/friction.py`: `SYMBOL_CLASS`, `build_half_spread_table`, `half_spread` → `data/friction/half_spread_table.csv` | #12 |
 | **T3 라이브 에피소드 파서** | medium | `decisions.jsonl` 경로 인자(읽기 전용) | `src/friction_backtest.py::load_live_episodes(path) -> (episodes, exclusion_counts)`, 설계 1의 규칙 1~7, 종목별 limit 폴백 비율 | #6 |
-| **T4a 가격·앵커·마크** | low | T2, vendor 함수 | `src/friction.py`: `leg_mids`, `implied_iv_scale`, `mark_pnl_pct(position, β, table)`, `fill_debit(legs, s)` | #2, #3, #13 |
-| **T4b 정책 V0/V1(2레그)** | medium | T4a | `run_exit_path` 골격(2레그 폴링 루프), 레거시 패리티 모드, V0 market과 limit 폴백 재시도, V1 limit 규칙, `s_orats` | #1, #1b, #15, #19 |
-| **T4c 정책 V2/V3/V4(2레그)** | low | T4b | SL 게이트형 정책 3개(최소 보유, 손절 없음, 기초자산 돌파). 폴링 루프는 T4b 것을 재사용한다. | #16, #17(청산 없음 부분), #18(2레그) |
+| **T4a 가격·앵커·마크** | low | T2, vendor 함수 | `src/friction.py`: `leg_mids`, `implied_iv_scale`, `mark_pnl_pct(position, beta, table, k=0.0, rng=None)`(2-2의 β 오프셋과 대칭 노이즈 정의 그대로), `fill_debit(legs, s)` | #2, #3, #13, #31 |
+| **T4b1 폴링 골격·V0 market** | medium | T4a | `run_exit_path` 골격(2레그 폴링 루프, 설계 3의 모드별 `start_after`/`end_at`), 레거시 패리티 모드, V0 market 청산 | #1, #30 |
+| **T4b2 limit 경로: V0 폴백·V1** | medium | T4b1 | V0 limit 폴백 재시도(L=mid+5%, 매 폴링 재평가), V1 limit→market(W=2), `s_orats`, 2-4 체결 규칙 | #15, #19 |
+| **T4c 정책 V2/V3/V4(2레그)** | low | T4b2 | SL 게이트형 정책 3개(최소 보유, 손절 없음, 기초자산 돌파). 폴링 루프는 T4b1 것을 재사용한다. | #16, #17(청산 없음 부분), #18(2레그) |
 | **T4d 만기·콘도르 4레그** | medium | T4c | `run_exit_path`의 4레그 합산 경로, 만기 내재가치 정산 | #17(만기), #18(콘도르), #20 |
-| **T5a replay와 β 적합** | medium | T3, T4d | `replay(episodes, policy, friction)`, `fit_beta(train)`(격자 확장, 비관 재적합), 대조군 A·C 실행, 보정 등급 산출 | #4, #5, #28, #29 |
+| **T5a1 replay·β 적합** | medium | T3, T4d, T5b | `replay(episodes, policy, friction)`, 4-2 손실 `L(β)`(부트스트랩 SE 정규화, 하한, 동점 규칙), `fit_beta(train)`(격자 확장, 비관 h×1.5 재적합) | #4, #28 |
+| **T5a2 대조군·판정·등급** | medium | T5a1 | 4-4 validation 판정(분모 0 규칙 포함), 대조군 A와 C(k를 train에서 T-c(i)에 적합), 4-6 등급 산출 | #5, #29 |
 | **T5b 통계 유틸** | low | 없음 | `bootstrap_ci`, `paired_diff`, `holm` | #14, #23, #26 |
-| **T5c 보정 CLI/보고서** | low | T5a, T5b | `python src/friction_backtest.py calibrate --decisions <path>` → `reports/friction/calibration-<date>.md`(경계, β(중앙과 비관), 목표별 CI/시뮬, 대조군 A·C, 보정 등급, regime별 잔차, 크레딧 ≤ $0.02를 뺀 T-b, 민감도 k=0.5, 112개 민감도, n/스킵/unanchorable) | fixture로 보고서 필수 항목 존재를 확인 |
+| **T5c 보정 CLI/보고서** | low | T5a2, T5b | `python src/friction_backtest.py calibrate --decisions <path>` → `reports/friction/calibration-<date>.md`(경계, β(중앙과 비관), 목표별 CI/시뮬, 대조군 A·C, 보정 등급, regime별 잔차, 크레딧 ≤ $0.02를 뺀 T-b, 민감도 k=0.5, 112개 민감도, n/스킵/unanchorable) | fixture로 보고서 필수 항목 존재를 확인 |
 | **T6a 몽키패치 래퍼** | medium | T4d, vendor | `patched_simulate_trade` 컨텍스트(복원 보장), `max_loss=width` 덮어쓰기 | #7(simulate_trade 부분), #8, #24 |
 | **T6d 콘도르 후처리** | low | T6a | `pair_condors(trades, signals)`: 짝짓기, 합산 재판정, 겹침 시 `ValueError`, 영향 거래 수 보고 | #21 |
 | **T6b 필터** | low | T2 | `filter_e(threshold)`, `filter_e4`, `filter_u1`, `d1_strategy` 컨텍스트 | #11, #22 |
 | **T6c 포트폴리오 수정** | medium | `src/portfolio.py` | `scale_trades_to_dollars(max_open_risk_pct=None)`, `p1_risk_pct` 컨텍스트 | #9, #10, #25 |
 | **T7a 실행 입력 준비** | low | T2 테이블, T3 폴백 비율, `backtest.fetch_daily_bars/fetch_intraday_bars`(캐시 재사용) | `load_run_inputs(symbols)`: 호가표 로드, 23종목 4년치 봉을 받아 평가 창 2023-08-24~2026-08-24로 자르고, IV 계열과 폴백 비율을 준비한다 | 가짜 client로 창 절단(2026-08-25 이후 행 없음), 누락 종목 스킵 집계를 검증 |
-| **T7b 조합 실행·판정** | medium | T5b, T5c, T6a~d, T7a, 설계 6 표 | `config/friction_variants.json`(표 그대로 13행, P1 값 포함), `compare` → `reports/friction/compare-<date>.md`(조건 1~4 판정, 조건 5 보호관찰 규칙 문안) | #27, 표에 없는 ID는 거부 |
+| **T7b1 조합 실행** | medium | T5b, T5c, T6a~d, T7a, 설계 6 표 | `config/friction_variants.json`(표 그대로 14행, P0/P1 값 포함), `compare` 러너: 조합별 replay d_i(중앙), generative 지표(중앙 β와 비관 재적합 β), V1 조합의 `s_orats` 재실행 결과를 JSON으로 출력 | 표에 없는 ID는 거부, 조합 수 14 확인 |
+| **T7b2 판정·보고서** | medium | T7b1 JSON, T5b | 조건 1~4 판정(Holm 가족 10, H1→H1b 게이트키핑, E 조합 mismatch 제외), `reports/friction/compare-<date>.md`, 조건 5 보호관찰 규칙 문안 | #26, #27 |
 
-순서는 다음과 같다. T1, T3, T5b는 병렬로 진행한다. T1 데이터는 장중 5거래일 수동 실행으로 모은다. 그다음 T2 → T4a → T4b → T4c → T4d → (T5a → T5c), (T6a → T6d, T6b, T6c) → T7a → T7b이다. T5c 보정이 음성 대조군이나 validation에서 실패하면 T7b는 돌리지 않고, 그 실패 보고서가 곧 결론이다.
+순서는 다음과 같다. T1, T3, T5b는 병렬로 진행한다. T1 데이터는 장중 5거래일 수동 실행으로 모은다. 그다음 T2 → T4a → T4b1 → T4b2 → T4c → T4d → (T5a1 → T5a2 → T5c), (T6a → T6d, T6b, T6c) → T7a → T7b1 → T7b2이다. T5c 보정이 대조군이나 validation에서 실패하면(등급 FAIL) T7b1과 T7b2는 돌리지 않고, 그 실패 보고서가 곧 결론이다.
 
 ## 데이터 한계 (결과 해석 시 반드시 함께 인용)
 
