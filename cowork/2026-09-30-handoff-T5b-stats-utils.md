@@ -86,9 +86,9 @@ def holm(pvalues, alpha=0.10) -> list[bool]
 
 ## 8. Executor response (Codex writes here)
 1. 변경 파일: `src/friction_stats.py`, `tests/test_friction_stats.py`
-2. 새 테스트 수: 5개
-3. 전체 테스트 결과: `/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python -m pytest tests/ -q` → `164 passed, 1 warning`
-4. 판단한 점/막힌 점: 공통 private helper로 동일 seed의 bootstrap resampling을 재현한다. scipy·추가 의존성은 사용하지 않았다. 막힌 점 없음.
+2. 새 테스트 수: 8개 (라운드 2에서 3개 추가)
+3. 전체 테스트 결과: `/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python -m pytest tests/ -q` → `166 passed, 1 warning`
+4. 판단한 점/막힌 점: reviewer 요청대로 정확히 0인 입력의 `<=` 경계, 동일 리샘플 기반 `ddof=1`, 전역 RNG 상태 불변을 검증했다. 구현 변경 없음. scipy·추가 의존성은 사용하지 않았다. 막힌 점 없음.
 5. 루브릭 자기채점(감점 사유 먼저): 감점 사유 없음. 정확성 5/5, 재현성 5/5, 범위 준수 5/5.
 
 ## 9. Reviewer log (reviewer writes here)
@@ -101,3 +101,7 @@ def holm(pvalues, alpha=0.10) -> list[bool]
 3. 전역 난수 상태 사용(`np.random.seed`)을 못 잡음 → 테스트 추가: `np.random.seed(123); before = np.random.get_state()[1].copy()`; `bootstrap_ci`/`bootstrap_se`/`bootstrap_p_one_sided`를 호출; 호출 후 `np.random.get_state()[1]`이 `before`와 **같음**(전역 상태 불변)을 단언한다.
 **잘한 점:** 공통 private 헬퍼로 CI/SE가 같은 분포를 공유, 빈 입력 예외, 새 의존성 없음.
 **요청:** 위 3개 테스트를 `tests/test_friction_stats.py`에 추가(기존 테스트는 유지). 구현 변경 불필요(구현 변경이 필요해 보이면 §8에 이유를 적고 멈춰라). 전체 스위트 실행 결과를 §8에 갱신. 커밋 금지.
+
+### 라운드 2
+**Verdict:** approved
+검증: 전체 166 passed 직접 재실행, 구현 파일 무변경(diff 없음), 추가 테스트 3개 확인(정확히 0인 평균 p=1.0, ddof=1을 동일 리샘플 재현으로 `rel=1e-12` 대조, 전역 난수 상태 불변). **회귀 주입 9종을 같은 방식으로 재실행 → 전부 해당 테스트가 실패로 포착**(이전 escape 3종 포함). failure_log: round-1 기록됨(TEST_FAILING).
