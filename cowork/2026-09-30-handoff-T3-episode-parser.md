@@ -1,9 +1,9 @@
 # Codex Handoff — T3 live episode parser — 2026-09-30
 
-> **상태(Status):** `대기중 / pending`
+> **상태(Status):** `검토대기 / review-pending`
 > _(Executor: `진행중` on start, `검토대기` when done. Only the reviewer sets `완료`.)_
 >
-> **시작 기록(Started by):** _(비워둠 — 착수 주체가 `session=<id> machine=<tag> started=<ISO8601>` 기록)_
+> **시작 기록(Started by):** `session=codex machine=friction-backtest started=2026-09-30T12:12:28-07:00`
 >
 > **작성자:** Claude Sonnet 5.5 (reviewer) → **수행자:** Codex gpt-reserve (effort medium)
 > **작업명:** 라이브 `decisions.jsonl` → 옵션 포지션 에피소드 파서 (설계문서 태스크 T3)
@@ -104,7 +104,41 @@ def load_live_episodes(path: str | Path) -> tuple[list[dict], dict[str, int]]:
 1. 변경 파일+한 줄 요약 2. 새 테스트 파일·개수 3. 전체 테스트 결과 4. 실제 로그 1회 실행 결과 5. 판단한 점(시각 표현 선택 등)/막힌 점 6. 루브릭 자기채점(감점 사유 먼저)
 
 ## 8. Executor response (Codex writes here)
-_(write here)_
+1. 변경 파일+한 줄 요약
+   - `src/friction_backtest.py`: live `decisions.jsonl`을 시각순으로 option position episode로 묶고, close 분류·제외 카운트·limit fallback 비율을 제공.
+   - `tests/test_friction_backtest_parser.py`: 명세의 독립 parser fixture 테스트 11개 추가.
+
+2. 새 테스트 파일·개수
+   - `tests/test_friction_backtest_parser.py`, 11 tests.
+
+3. 전체 테스트 결과
+   - `/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python -m pytest tests/ -q`
+   - `159 passed, 1 warning` (기준 148 passed 이상).
+
+4. 실제 로그 1회 실행 결과
+   - 대상: `/Users/Mung/dev/atlas-options-hackathon/registry/decisions.jsonl` (read-only)
+   - episodes: `112`
+   - kind별: `clean=96`, `single_limit=5`, `retry=11`
+   - `reason_flip`: `5`
+   - 4-leg clean: `29`
+   - exclusion_counts: `{"entry_with_error": 1, "open_no_close": 394, "crypto": 9022, "leg_mismatch": 1}`
+
+5. 판단한 점(시각 표현 선택 등)/막힌 점
+   - `entry_ts`/`exit_ts`는 timezone-aware `datetime`으로 일관되게 반환한다.
+   - 입력 전체를 parsed timestamp 기준 정렬하고, 심볼별 다음 진입을 episode 경계로 사용한다. 첫 유효 close를 exit event로 사용한다.
+   - 막힌 점 없음. 기존 `src/` 파일과 `registry/`는 수정하지 않았고 커밋하지 않았다.
+
+6. 루브릭 자기채점(감점 사유 먼저)
+   - 감점 사유: 없음.
+   - 규칙 정확성: `5/5` — 규칙 1~7과 회귀 방지 테스트를 구현했고 11개 parser test 및 전체 suite 통과.
+   - 실제 로그 정합: `5/5` — 기대치 `112 / 96 / 5 / 11 / 5 / 29`와 정확히 일치.
+   - 범위 준수: `5/5` — 지정된 새 `src`/`tests` 파일만 추가, registry read-only 실행, 기존 `src` 미수정, no commit.
 
 ## 9. Reviewer log (reviewer writes here)
-_(reviewer writes here)_
+
+### 라운드 1
+**Verdict:** approved
+검증: 전체 스위트 159 passed 직접 재실행 · 코드 전문 읽음(규칙 1~7 일치) · scratch 사본에 회귀 주입 9종(크립토 필터 제거, 마지막 레코드를 이벤트로, error 체크 제거, 레그 비교 제거, 정렬 제거, single_limit→clean, reason_flip 끔, open_no_close 제거, 비율 분모 조건 제거) → **전부 해당 테스트가 실패로 포착**. 실제 로그를 독립 스크립트로 재실행: 에피소드 112 = clean 96 / single_limit 5 / retry 11, reason_flip 5, clean 4레그 29, exclusion {entry_with_error 1, open_no_close 394, crypto 9022, leg_mismatch 1}; clean 중 SL 65·PT 31, 조기(<60분) SL 23·PT 0 — 설계 배경 수치와 정확히 일치. 종목별 limit 폴백 비율 TLT 0.80, DIA 0.67, SLV 0.25, IWM 0.22, XLE 0.22; 풀링 0.143(설계 4-7 폴백 기본값 16/112=0.143과 일치).
+**경미한 지적(수용):** 레그 목록이 깨진 진입은 카운트 없이 조용히 스킵됨(`_legs is None`) — 현재 로그엔 해당 없음. `open_no_close` 394는 미체결·취소된 진입 지정가가 다수 포함된 것으로 보이며(미검증) 에피소드 표본에는 영향 없음.
+**잘한 점:** 입력 순서와 무관한 정렬, 미체결/거부 진입이 앞 에피소드를 끊지 않게 처리, 잘못된 JSON 줄 격리.
+
