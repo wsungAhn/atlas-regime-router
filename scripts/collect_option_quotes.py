@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,6 +24,25 @@ from signals import OPTION_SYMBOLS, _occ_expiration, fetch_chain  # noqa: E402
 QUOTE_COLUMNS = ["ts", "underlying", "occ", "bid", "ask", "mid", "delta", "dte", "feed"]
 POSITION_COLUMNS = ["ts", "occ", "current_price", "qty"]
 LOG = logging.getLogger(__name__)
+SYMBOL_PAUSE_SEC = 0.5
+RETRY_BACKOFF_SEC = (5, 15, 45)  # after a 429; one pause per retry attempt
+
+
+def _fetch_full_chain(option_client: Any, symbol: str) -> dict:
+    from alpaca.trading.enums import ContractType
+
+    for attempt in range(len(RETRY_BACKOFF_SEC) + 1):
+        try:
+            chain: dict = {}
+            for contract_type in (ContractType.PUT, ContractType.CALL):
+                chain.update(fetch_chain(option_client, symbol, contract_type))
+            return chain
+        except Exception as exc:
+            if getattr(exc, "status_code", None) != 429 or attempt == len(RETRY_BACKOFF_SEC):
+                raise
+            LOG.warning("%s: 429, retry %d/%d in %ds", symbol, attempt + 1, len(RETRY_BACKOFF_SEC), RETRY_BACKOFF_SEC[attempt])
+            time.sleep(RETRY_BACKOFF_SEC[attempt])
+    raise AssertionError("unreachable")
 
 
 def _load_env_file(path: Path) -> None:
@@ -64,11 +84,7 @@ def collect_once(option_client: Any, symbols: Iterable[str], now: datetime, pane
     for symbol in symbols:
         excluded = 0
         try:
-            from alpaca.trading.enums import ContractType
-
-            chain = {}
-            for contract_type in (ContractType.PUT, ContractType.CALL):
-                chain.update(fetch_chain(option_client, symbol, contract_type))
+            chain = _fetch_full_chain(option_client, symbol)
             for occ, snapshot in chain.items():
                 quote = _value(snapshot, "latest_quote")
                 bid = _value(quote, "bid_price")
@@ -86,6 +102,7 @@ def collect_once(option_client: Any, symbols: Iterable[str], now: datetime, pane
         except Exception:
             failed += 1
             LOG.exception("quote collection failed for %s", symbol)
+        time.sleep(SYMBOL_PAUSE_SEC)
     quote_path = panel_dir / f"{today.isoformat()}.parquet"
     _atomic_append(rows, quote_path, QUOTE_COLUMNS)
     if not rows:
@@ -109,7 +126,7 @@ def main() -> None:
     parser.add_argument("--panel-dir", type=Path, default=REPO_DIR / "data" / "quote_panel")
     parser.add_argument("--symbols", help="Comma-separated underlying symbols")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     _load_env_file(args.env_file)
     from alpaca.data.historical.option import OptionHistoricalDataClient
     client = OptionHistoricalDataClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"])

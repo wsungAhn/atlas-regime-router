@@ -2,11 +2,23 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from scripts import collect_option_quotes as collector
 
 
 OCC = "AAPL260101C00100000"
+
+
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch):
+    calls = []
+    monkeypatch.setattr(collector.time, "sleep", calls.append)
+    return calls
+
+
+class Rate429(Exception):
+    status_code = 429
 
 
 def snap(bid=1, ask=2, delta=0.4):
@@ -84,3 +96,35 @@ def test_empty_chain_creates_no_file(tmp_path, monkeypatch):
     monkeypatch.setattr(collector, "fetch_chain", lambda *args: {})
     collector.collect_once(object(), ("A",), datetime(2026, 9, 30, tzinfo=timezone.utc), tmp_path)
     assert not (tmp_path / "2026-09-30.parquet").exists()
+
+
+def test_429_retried_with_backoff_then_succeeds(tmp_path, monkeypatch, sleeps):
+    attempts = []
+
+    def fetch(*args):
+        attempts.append(1)
+        if len(attempts) <= 2:
+            raise Rate429("too many requests")
+        return {OCC: snap()}
+
+    monkeypatch.setattr(collector, "fetch_chain", fetch)
+    collector.collect_once(object(), ("A",), datetime(2026, 9, 30, tzinfo=timezone.utc), tmp_path)
+    assert len(pd.read_parquet(tmp_path / "2026-09-30.parquet")) == 1
+    assert sleeps[:2] == [5, 15]
+
+
+def test_429_gives_up_after_retries_and_other_errors_not_retried(tmp_path, monkeypatch, sleeps):
+    calls = []
+
+    def always_429(*args):
+        calls.append(1)
+        raise Rate429("too many requests")
+
+    monkeypatch.setattr(collector, "fetch_chain", always_429)
+    collector.collect_once(object(), ("A",), datetime(2026, 9, 30, tzinfo=timezone.utc), tmp_path)
+    assert len(calls) == 4 and sleeps.count(45) == 1
+
+    calls.clear()
+    monkeypatch.setattr(collector, "fetch_chain", lambda *a: calls.append(1) or (_ for _ in ()).throw(RuntimeError("boom")))
+    collector.collect_once(object(), ("A",), datetime(2026, 9, 30, tzinfo=timezone.utc), tmp_path)
+    assert len(calls) == 1
