@@ -1,6 +1,6 @@
 # Codex Handoff — T4b1 exit-path polling skeleton (2-leg, V0 market, legacy parity) — 2026-10-18
 
-> **상태(Status):** `대기중 / pending`
+> **상태(Status):** `완료 / done`
 > _(Executor: set `진행중` on start, `검토대기` when done. Only the reviewer sets `완료`.)_
 >
 > **시작 기록(Started by):** author `session=a43dac5d-41e1-436c-bb1d-f9c0b1f8bc9d machine=mac-studio started=2026-10-18T10:40-0700`
@@ -83,8 +83,275 @@ run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy="V0",
 
 ## 8. Executor response (Codex writes here)
 
-_(비어 있음 — 감점 사유 먼저.)_
+감점 사유 먼저:
+
+- 요구사항의 `bull_put`·`bear_call` 각각 2건 이상, 익절·손절 모두를 포함한 대규모 합성 레거시 패리티 표는 작성하지 못했다. 대신 실제 `reprice_exits_intraday` 호출을 포함한 최소 패리티 테스트와 별도 경로 검증을 작성했다.
+- §5 변이 (f)의 실패는 `ValueError`로 즉시 중단되는 형태이며, 부호 반전이 잘못된 트리거를 만들기 전에 friction helper의 입력 검증이 감지한다.
+- §5 변이 (h)는 `h_mult`를 무시하면 결과가 달라지는 테스트로 검증했지만, raw 출력은 해당 단일 테스트의 assertion failure만 기록했다.
+
+구현 결과:
+
+- 추가/수정 범위: `src/exit_path.py`, `tests/test_exit_path.py`, 이 handoff의 상태와 §8만 변경. 커밋하지 않았다.
+- `run_exit_path`는 2-leg V0, legacy/friction 경로, 배타적 `start_after`, 포함적 `end_at`, IV fallback, T=0 intrinsic pricing, market fill, `legacy_window`, `scaled_table`을 구현했다.
+- 최종 실행: `/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python -m pytest tests/ -q`
+
+```text
+197 passed, 1 warning in 2.15s
+```
+
+변이 검증 — 각 항목의 이유 문자열과 실제 pytest 실패 출력 원문:
+
+### (a) polling start inclusive
+
+이유: `start_after`와 같은 시각의 봉이 평가되어 배타 경계 테스트가 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______ test_start_is_exclusive_end_is_inclusive_and_iv_fallback_is_used _______
+
+    result = run_exit_path(position(credit=2.0), b, pd.Series(dtype=float), **kwargs(start_after=start, end_at=end, sl=-0.5, pt=2.0))
+>   assert result is None
+E   AssertionError: assert {'exit_ts': Timestamp('2026-01-02 09:30:00'), 'exit_reason': 'stop_loss', 'trigger_mark_pnl_pct': -1.3056542222598537, 'close_debit': 4.6113084445197075, ...} is None
+
+1 failed, 1 warning in 0.47s
+```
+
+### (b) IV fallback removed
+
+이유: `mtm_iv`에 없는 날짜에서 `entry_iv` fallback 대신 필수 조회를 하므로 fallback 테스트가 `KeyError`로 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______ test_start_is_exclusive_end_is_inclusive_and_iv_fallback_is_used _______
+E   KeyError: Timestamp('2026-01-02 00:00:00')
+
+1 failed, 1 warning in 0.50s
+```
+
+### (c) profit/stop order reversed
+
+이유: 같은 봉에서 PT와 SL이 모두 만족되는 경계에서는 PT가 우선이어야 하므로 순서 반전이 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________ test_equal_thresholds_choose_profit_and_stop_sign_is_negative ________
+>   assert equal["exit_reason"] == "profit_target"
+E   AssertionError: assert 'stop_loss' == 'profit_target'
+E     - profit_target
+E     + stop_loss
+
+1 failed, 1 warning in 0.47s
+```
+
+### (d) stop comparison sign reversed
+
+이유: 손절은 `mark_pnl_pct <= sl`이어야 하므로 손실 봉이 트리거되지 않아 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________ test_equal_thresholds_choose_profit_and_stop_sign_is_negative ________
+>   assert result["exit_reason"] == "stop_loss"
+E   TypeError: 'NoneType' object is not subscriptable
+
+1 failed, 1 warning in 0.48s
+```
+
+### (e) h omitted from mark / beta ignored
+
+이유: β=1의 첫 폴링 손절이 사라져 legacy보다 이르지 않으므로 friction mark의 h 오프셋 누락이 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______ test_beta_one_can_trigger_first_and_h_mult_scales_crossing_cost _______
+>   assert beta1["exit_ts"] < legacy["exit_ts"]
+E   AssertionError: assert Timestamp('2026-01-02 09:45:00') < Timestamp('2026-01-02 09:45:00')
+
+1 failed, 1 warning in 0.46s
+```
+
+### (f) beta offset sign reversed
+
+이유: 잘못된 음수 β가 helper의 non-negative β 계약에 걸려 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______ test_beta_one_can_trigger_first_and_h_mult_scales_crossing_cost _______
+E   ValueError: beta and k must be non-negative
+
+1 failed, 1 warning in 0.47s
+```
+
+### (g) scaled_table mutates original
+
+이유: scaling 결과와 원본이 독립이어야 하므로 원본 mutation이 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+___________________ test_validation_errors_and_scaled_table ____________________
+>   assert np.allclose(scaled["h"], original["h"] * 1.5)
+E   assert False
+
+1 failed, 1 warning in 0.48s
+```
+
+### (h) h_mult ignored
+
+이유: `h_mult=1.5`의 crossing cost가 h_mult=1보다 정확히 커져야 하므로 무시하면 realized PnL 검증이 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______ test_beta_one_can_trigger_first_and_h_mult_scales_crossing_cost _______
+>   assert wide["realized_pnl"] == pytest.approx(beta0["realized_pnl"] - 0.5 * 2 * 0.75 * 100)
+E   assert -511.13084445197075 == -586.1308444519707 ± 5.9e-04
+E     Obtained: -511.13084445197075
+E     Expected: -586.1308444519707 ± 5.9e-04
+
+1 failed, 1 warning in 0.46s
+```
+
+### (i) end boundary exclusive
+
+이유: `end_at` 봉은 포함되어야 하므로 끝 경계만 있는 손절 케이스가 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______ test_start_is_exclusive_end_is_inclusive_and_iv_fallback_is_used _______
+>   assert result["exit_ts"] == end
+E   TypeError: 'NoneType' object is not subscriptable
+
+1 failed, 1 warning in 0.46s
+```
+
+### (j) expiry T=0 replaced with 1/365
+
+이유: 만기 봉은 intrinsic debit 5.0이어야 하므로 시간가치가 남은 4.919269846176476이 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_______________________ test_expiry_uses_intrinsic_value _______________________
+>   assert result["close_debit"] == pytest.approx(5.0)
+E   assert 4.919269846176476 == 5.0 ± 5.0e-06
+E     Obtained: 4.919269846176476
+
+1 failed, 1 warning in 0.46s
+```
+
+### Round 2
+감점 사유 먼저:
+
+- 없음. 요청된 동작 변경 없이 미사용 임포트·상수만 삭제했고, 지정한 두 회귀 테스트를 추가했다.
+
+수정 결과:
+
+- `src/exit_path.py`: 미사용 `spread_mid_debit` 임포트와 `NANOS_PER_DAY` 상수를 삭제했다. 동작 코드는 변경하지 않았다.
+- `tests/test_exit_path.py`: `iv_scale` 방향·기본값 테스트와 진입 당일 트리거를 배제하는 레거시 파리티 테스트를 추가했다.
+- 커밋하지 않았다.
+
+변이 검증 — 실제 pytest 실패 출력 원문:
+
+#### `iv_scale` 무시 변이
+
+이유: `iv_scale=2`에서도 IV가 커지지 않아 마크 손익이 기본값보다 낮아지지 않으므로 방향 검증이 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________________ test_iv_scale_changes_mark_and_one_is_default _________________
+
+    def test_iv_scale_changes_mark_and_one_is_default():
+        b = bars([100])
+        base = run_exit_path(position(credit=2.0), b, pd.Series(dtype=float), **kwargs(pt=-100.0, sl=-200.0))
+        explicit_one = run_exit_path(position(credit=2.0), b, pd.Series(dtype=float), iv_scale=1.0, **kwargs(pt=-100.0, sl=-200.0))
+        higher_iv = run_exit_path(position(credit=2.0), b, pd.Series(dtype=float), iv_scale=2.0, **kwargs(pt=-100.0, sl=-200.0))
+        assert explicit_one["trigger_mark_pnl_pct"] == pytest.approx(base["trigger_mark_pnl_pct"])
+>       assert higher_iv["trigger_mark_pnl_pct"] < base["trigger_mark_pnl_pct"]
+E       assert 0.15358577794483708 < 0.15358577794483708
+
+tests/test_exit_path.py:69: AssertionError
+=============================== warnings summary ===============================
+../../atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated
+    warnings.warn(  # deprecated in 14.0
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_exit_path.py::test_iv_scale_changes_mark_and_one_is_default
+1 failed, 10 deselected, 1 warning in 0.50s
+```
+
+#### `legacy_window` 진입 당일 시작 변이
+
+이유: 진입 당일 봉의 손절을 허용하면 레거시 함수가 무시하는 2026-01-01 09:30 봉에서 먼저 종료되어 파리티가 실패해야 한다.
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_________________ test_legacy_parity_ignores_entry_day_trigger _________________
+
+    def test_legacy_parity_ignores_entry_day_trigger():
+        b = pd.DataFrame({"close": [90.0, 100.0]}, index=pd.to_datetime(["2026-01-01 09:30", "2026-01-02 09:30"]))
+        iv = pd.Series({pd.Timestamp("2026-01-02"): 0.2})
+        trade = {"symbol": "SPY", "entry_date": pd.Timestamp("2026-01-01"), "exit_date": pd.Timestamp("2026-01-02"),
+                 "effective_dte_days": 29, "short_strike": 100.0, "long_strike": 95.0, "width": 5.0,
+                 "credit_received": 2.0, "spread_type": "bull_put", "entry_iv": 0.2,
+                 "profit_target_pct": 0.0, "stop_loss_multiple": 2.0}
+        legacy = reprice_exits_intraday([trade], {"SPY": b}, {"SPY": iv}, r=0.0)[0]
+        result = run_exit_path(position(credit=2.0), b, iv, **kwargs(
+            start_after=legacy_window(trade["entry_date"], trade["exit_date"])[0],
+            end_at=legacy_window(trade["entry_date"], trade["exit_date"])[1],
+            pt=trade["profit_target_pct"], sl=-(trade["stop_loss_multiple"] - 1),
+        ))
+        assert legacy["exit_date"] == pd.Timestamp("2026-01-02 09:30")
+>       assert result["exit_ts"] == legacy["exit_date"]
+E       AssertionError: assert Timestamp('2026-01-01 09:30:00') == Timestamp('2026-01-02 09:30:00')
+
+tests/test_exit_path.py:86: AssertionError
+=============================== warnings summary ===============================
+../../atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated
+    warnings.warn(  # deprecated in 14.0
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_exit_path.py::test_legacy_parity_ignores_entry_day_trigger
+1 failed, 10 deselected, 1 warning in 0.49s
+```
+
+최종 테스트:
+
+```text
+199 passed, 1 warning in 2.08s
+```
 
 ## 9. Review log
 
-_(비어 있음 — reviewer가 작성)_
+### Round 1
+**Verdict:** changes requested
+
+검증: 전체 197 passed(기준선 188). 코드 읽기: 폴링 창·익절 우선·T=0 내재가치·마찰 경로·`scaled_table` 불변 모두 지시대로. 리뷰어 변이 17건 중 **15건 검출, 2건 생존**:
+1. `iv_scale`을 무시(`* float(iv_scale)` → `* 1.0`)해도 테스트 통과 — IV 앵커 스케일(replay 모드의 핵심 입력)이 전혀 검증되지 않음.
+2. `legacy_window`의 `start_after`를 진입 당일 자정 직전으로 바꿔도(`entry − 1ns`, 즉 폴링이 진입 당일부터 시작) 통과 — 설계가 명시한 변이 (a) "폴링 시작을 진입 당일로"를 파리티 테스트가 못 잡는다. 합성 15분봉이 진입 당일 봉을 갖고 있지 않거나 그 봉들에서 트리거가 나지 않기 때문.
+경미: `spread_mid_debit` import와 `NANOS_PER_DAY` 상수가 미사용.
+
+### 라운드 2 수정 요청 (executor)
+`src/exit_path.py`는 **미사용 임포트·상수 삭제만** 허용(동작 변경 금지). `tests/test_exit_path.py`에:
+1. `iv_scale` 테스트: 같은 입력에서 `iv_scale`을 바꾸면 `trigger_mark_pnl_pct`(또는 트리거 시각)가 달라지고, `iv_scale=1`이 기본과 같다. 방향도 검증(IV가 커지면 숏 스프레드의 마크 데빗이 커져 손익이 낮아지는 구성).
+2. 파리티 테스트에 **진입 당일 봉에서 익절/손절 조건이 충족되는 거래**를 추가: `reprice_exits_intraday`는 진입 당일 봉을 무시(`normalize() > entry_date`)하므로 그 거래의 결과는 다음날 이후 트리거(또는 None)여야 하고, `run_exit_path`도 같아야 한다. 진입 당일부터 폴링하면 이 거래에서 어긋나야 한다.
+그리고 위 두 변이(iv_scale 무시, `legacy_window` start 변경)를 주입했을 때 **실제 pytest 실패 출력 원문**을 §8 「라운드 2」에 붙여라. 감점 사유 먼저.
+
+### Round 2
+**Verdict:** approved
+
+- 직접 검증: 전체 199 passed(기준선 188). `src/exit_path.py` 변경은 미사용 임포트·상수 삭제뿐(diff 확인, 동작 변경 없음).
+- 라운드 1 생존 변이 2건(iv_scale 무시, legacy_window 시작을 진입 당일로)과 기존 변이 4건을 재주입해 **전부 검출**.
+- failure_log: 라운드 1 반려 기록 있음.
