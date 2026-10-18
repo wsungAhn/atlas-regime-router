@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -12,7 +15,18 @@ from src.friction import (
     build_half_spread_table,
     half_spread,
     write_half_spread_table,
+    anchor_scales,
+    episode_rng,
+    fill_debit,
+    implied_iv_scale,
+    leg_halves,
+    leg_mids,
+    leg_noise,
+    mark_pnl_pct,
+    parse_occ,
+    spread_mid_debit,
 )
+from src.vendor.credit_spread_simulator import price_spread_to_close
 
 
 def _write_panel(path, rows, name="2026-10-01.parquet"):
@@ -91,6 +105,19 @@ def test_write_csv_has_twelve_rows_and_five_columns(tmp_path):
     assert list(saved.columns) == ["class", "bucket", "n", "h", "fallback"]
 
 
+def test_cli_script_writes_twelve_row_csv(tmp_path):
+    _write_panel(tmp_path, [_row(mid=1.0, h=0.01) for _ in range(30)])
+    out = tmp_path / "t.csv"
+    result = subprocess.run(
+        [sys.executable, "src/friction.py", "--panel-dir", str(tmp_path), "--out", str(out)],
+        cwd=__import__("pathlib").Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert pd.read_csv(out).shape[0] == 12
+
+
 def test_fallback_uses_pooled_representative_mid_and_floor(tmp_path):
     _write_panel(tmp_path, [_row(mid=1.0, h=0.02) for _ in range(2)] + [_row(mid=0.2, h=0.02) for _ in range(2)])
     table = build_half_spread_table(tmp_path)
@@ -151,3 +178,88 @@ def test_symbol_class_covers_all_etf_members():
         assert SYMBOL_CLASS(symbol) == "index_etf"
     for symbol in ("GLD", "TLT", "SLV", "XLE", "XLF"):
         assert SYMBOL_CLASS(symbol) == "other_etf"
+
+
+def _occ(ticker, yymmdd, option_type, strike):
+    return f"{ticker}{yymmdd}{option_type}{int(strike * 1000):08d}"
+
+
+def _position(legs, credit=0.5):
+    return {"legs": [leg if isinstance(leg, dict) else {"occ": leg[0], "side": leg[1]} for leg in legs], "credit": credit}
+
+
+def test_leg_mid_sum_matches_price_spread_to_close():
+    S, T, r, iv = 100.0, 7 / 365, 0.045, 0.25
+    bull = _position([(_occ("SPY", "261017", "P", 95), "short"), (_occ("SPY", "261017", "P", 90), "long")])
+    bear = _position([(_occ("SPY", "261017", "C", 105), "short"), (_occ("SPY", "261017", "C", 110), "long")])
+    condor = _position(bull["legs"] + bear["legs"])
+    for position, spread_type, short, long in ((bull, "bull_put", 95, 90), (bear, "bear_call", 105, 110)):
+        assert spread_mid_debit(position, leg_mids(position, S, T, r, iv)) == pytest.approx(price_spread_to_close(S, short, long, T, r, iv, spread_type), abs=1e-9)
+    assert spread_mid_debit(condor, leg_mids(condor, S, T, r, iv)) == pytest.approx(
+        price_spread_to_close(S, 95, 90, T, r, iv, "bull_put") + price_spread_to_close(S, 105, 110, T, r, iv, "bear_call"), abs=1e-9
+    )
+    assert spread_mid_debit(bull, leg_mids(bull, S, 0.0, r, iv)) == pytest.approx(price_spread_to_close(S, 95, 90, 0.0, r, iv, "bull_put"), abs=1e-9)
+
+
+def test_fill_direction_buy_at_ask_sell_at_bid():
+    legs = [{"side": "short", "bid": 1.0, "ask": 1.2}, {"side": "long", "bid": 0.3, "ask": 0.5}]
+    assert fill_debit(legs, 1) == pytest.approx(1.2 - 0.3)
+    assert fill_debit(legs, 0.66) == pytest.approx((1 + 0.66 * 0.2) - (0.5 - 0.66 * 0.2))
+    assert fill_debit(legs, 0) == pytest.approx(1.0 - 0.5)
+    assert fill_debit(legs, 0.66) == fill_debit(legs, 0.66)
+    for s in (-0.01, 1.01):
+        with pytest.raises(ValueError):
+            fill_debit(legs, s)
+
+
+def test_iv_anchor_unanchorable_skipped():
+    S, T, r, iv = 100.0, 30 / 365, 0.045, 0.25
+    normal = _position([(_occ("SPY", "261017", "P", 95), "short"), (_occ("SPY", "261017", "P", 90), "long")], credit=0.5)
+    unanchorable = _position([(_occ("SPY", "261017", "P", 95), "short"), (_occ("SPY", "261017", "P", 90), "long")], credit=5.0)
+    condor = _position(normal["legs"] + [{"occ": _occ("SPY", "261017", "C", 105), "side": "short"}, {"occ": _occ("SPY", "261017", "C", 110), "side": "long"}], credit=0.5)
+    assert implied_iv_scale(unanchorable, S, T, r, iv) is None
+    scales, count = anchor_scales([(unanchorable, S, T, r, iv), (normal, S, T, r, iv), (condor, S, T, r, iv)])
+    assert count == 1 and scales[0] is None
+    assert spread_mid_debit(normal, leg_mids(normal, S, T, r, iv * scales[1])) * 0.95 == pytest.approx(normal["credit"], abs=1e-6)
+    assert scales[2] is not None
+
+
+def test_symmetric_noise_mark():
+    halves = [0.1, 0.2]
+    class Spy:
+        def normal(self, *args):
+            raise AssertionError("rng was called")
+    assert leg_noise(Spy(), halves, 0) == [0.0, 0.0]
+    rng = np.random.default_rng(11)
+    a = np.array([leg_noise(rng, halves, 1.0) for _ in range(10000)])
+    assert np.all(np.abs(a.mean(axis=0)) < 0.03 * np.array(halves))
+    assert np.all(np.abs(a.std(axis=0) / halves - 1) < 0.05)
+    assert abs(np.corrcoef(a.T)[0, 1]) < 0.05
+    with pytest.raises(ValueError):
+        leg_noise(None, halves, 1)
+    assert episode_rng(3).normal() == episode_rng(3).normal()
+
+
+def test_mark_pnl_beta_offset():
+    table = pd.DataFrame([{"class": "index_etf", "bucket": bucket, "h": 0.1} for bucket in MID_BUCKETS])
+    p = _position([(_occ("SPY", "261017", "P", 95), "short"), (_occ("SPY", "261017", "P", 90), "long")], credit=0.5)
+    mids = leg_mids(p, 100, 30 / 365, 0.045, 0.25)
+    expected = (p["credit"] - spread_mid_debit(p, mids)) / p["credit"]
+    assert mark_pnl_pct(p, 100, 30 / 365, 0.045, 0.25, 0, table) == pytest.approx(expected)
+    assert mark_pnl_pct(p, 100, 30 / 365, 0.045, 0.25, 0.2, table) == pytest.approx(expected - 0.2 * 0.2 / 0.5)
+
+
+def test_mark_clamp_nonnegative():
+    table = pd.DataFrame([{"class": "index_etf", "bucket": bucket, "h": 1.0} for bucket in MID_BUCKETS])
+    p = _position([(_occ("SPY", "261017", "P", 100), "short"), (_occ("SPY", "261017", "P", 95), "long")], credit=0.5)
+    assert mark_pnl_pct(p, 94.0, 0.0, 0.045, 0.25, 2, table) == pytest.approx((0.5 - 8.0 + 0.0) / 0.5)
+
+
+def test_parse_occ_and_zero_mid_half():
+    assert parse_occ("GLD260831P00414000") == ("GLD", __import__("datetime").date(2026, 8, 31), "put", 414.0)
+    assert parse_occ("LONGER260831C00100000")[0] == "LONGER"
+    with pytest.raises(ValueError):
+        parse_occ("SPY2608")
+    table = pd.DataFrame([{"class": "index_etf", "bucket": bucket, "h": 0.05} for bucket in MID_BUCKETS])
+    p = _position([(_occ("SPY", "261017", "P", 100), "short"), (_occ("SPY", "261017", "P", 95), "long")])
+    assert leg_halves(p, [0.0, 1.0], table) == [0.05, 0.05]

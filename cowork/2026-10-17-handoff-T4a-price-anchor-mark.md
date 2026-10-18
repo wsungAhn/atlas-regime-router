@@ -1,6 +1,6 @@
 # Codex Handoff — T4a leg prices, IV anchor, mark P&L, fill debit — 2026-10-17
 
-> **상태(Status):** `대기중 / pending`
+> **상태(Status):** `완료 / done`
 > _(Executor: set `진행중` on start, `검토대기` when done. Only the reviewer sets `완료`.)_
 >
 > **시작 기록(Started by):** author `session=a43dac5d-41e1-436c-bb1d-f9c0b1f8bc9d machine=mac-studio started=2026-10-17T19:30-0700`
@@ -79,8 +79,194 @@
 
 ## 8. Executor response (Codex writes here)
 
-_(비어 있음 — 감점 사유 먼저.)_
+감점 사유 / deductions first:
+
+- 테스트 수는 기존 기준선 180개가 아니라 이 워크트리의 현재 기존 테스트 180개에 T4a 테스트 7개를 추가하여 187개가 되었다. 최종 실행은 `187 passed`이다.
+- `src/signals.py`의 절대 import 의존성 때문에 `pytest tests/test_friction.py -q -k ...` 단독 실행은 수집 단계에서 `ModuleNotFoundError: No module named 'indicators'`가 났다. 요구된 전체 명령 `pytest tests/ -q`는 통과했다.
+- 명세의 “가격은 음수일 수 없음”을 적용해 각 마크를 `max(0.0, mark)`으로 클램프했다.
+- 기존 T2 코드는 수정하지 않았고, 커밋하지 않았다.
+
+최종 테스트:
+
+```text
+........................................................................ [ 38%]
+........................................................................ [ 77%]
+...........................................                              [100%]
+187 passed, 1 warning in 1.33s
+```
+
+변이 검증 — 아래는 각 변이에서 실제 실행한 pytest 실패 출력 원문이다.
+
+(a) `spread_mid_debit`의 롱 부호 반전 — 롱 mid를 빼지 않고 더하면 vendor debit과 불일치한다.
+
+```text
+___________________ test_leg_mid_sum_matches_price_spread_to_close ________________
+E           assert 0.09837367914821868 == 0.09640563201698385 ± 1.0e-09
+E             Obtained: 0.09837367914821868
+E             Expected: 0.09640563201698385 ± 1.0e-09
+1 failed, 23 passed, 1 warning in 1.05s
+```
+
+(b) `fill_debit` 롱에도 `bid+sΔ` 적용 — sell-to-close 방향은 ask에서 bid 쪽으로 내려가야 한다.
+
+```text
+__________________ test_fill_direction_buy_at_ask_sell_at_bid __________________
+E       assert 0.7 == 0.8999999999999999 ± 9.0e-07
+E         Obtained: 0.7
+E         Expected: 0.8999999999999999 ± 9.0e-07
+1 failed, 24 passed, 1 warning in 1.00s
+```
+
+(c) 앵커 실패 시 `scale=1.0` 폴백 — unanchorable position은 `None`이어야 한다.
+
+```text
+_____________________ test_iv_anchor_unanchorable_skipped _____________________
+E       AssertionError: assert 1.0 is None
+E        +  where 1.0 = implied_iv_scale(...)
+1 failed, 25 passed, 1 warning in 1.01s
+```
+
+(d) ε를 롱 레그에도 공유 — 레그별 독립 noise라야 하며 상관이 0.05 미만이어야 한다.
+
+```text
+__________________________ test_symmetric_noise_mark ___________________________
+E       assert np.False_
+E        +  where np.False_ = <function all at ...>
+E       AssertionError: assert np.False_
+E       ...
+E       array([0.00161086, 0.49919457])
+E       ...
+1 failed, 26 passed, 1 warning in 1.07s
+```
+
+(e) noise를 `fill_debit`에 주입 — 호가 체결 함수는 noise/β를 받지 않아야 한다.
+
+```text
+__________________ test_fill_direction_buy_at_ask_sell_at_bid __________________
+E       assert 0.9099999999999999 == 0.8999999999999999 ± 9.0e-07
+E         Obtained: 0.9099999999999999
+E         Expected: 0.8999999999999999 ± 9.0e-07
+1 failed, 24 passed, 1 warning in 1.06s
+```
+
+(f) 롱 마크에 `+β·h` 적용 — 롱도 불리한 방향은 `−β·h`다.
+
+```text
+__________________________ test_mark_pnl_beta_offset __________________________
+E       assert -0.3961982298819784 == -0.4761982298819784 ± 4.8e-07
+E         Obtained: -0.3961982298819784
+E         Expected: -0.4761982298819784 ± 4.8e-07
+1 failed, 27 passed, 1 warning in 1.10s
+```
+
+(g) 클램프 제거 — 음수 option mark를 허용하면 clamp 테스트가 실패한다.
+
+```text
+_________________________ test_mark_clamp_nonnegative __________________________
+E       assert -17.0 == -15.0 ± 1.5e-05
+E         Obtained: -17.0
+E         Expected: -15.0 ± 1.5e-05
+1 failed, 28 passed, 1 warning in 1.03s
+```
+
+(h) `k=0`에서 rng 호출 — spy가 호출을 감지한다.
+
+```text
+__________________________ test_symmetric_noise_mark __________________________
+E       AssertionError: rng was called
+E       assert leg_noise(Spy(), halves, 0) == [0.0, 0.0]
+1 failed, 26 passed, 1 warning in 1.01s
+```
+
+(i) 앵커 haircut `0.05` 제거 — 앵커 가격은 목표 credit의 `1/(1−0.05)`가 되어야 한다.
+
+```text
+_____________________ test_iv_anchor_unanchorable_skipped _____________________
+E       assert 0.4750000002945747 == 0.5 ± 1.0e-06
+E         Obtained: 0.4750000002945747
+E         Expected: 0.5 ± 1.0e-06
+1 failed, 25 passed, 1 warning in 1.02s
+```
+
+### Round 2
+감점 사유 / deductions first:
+
+- 기존 기준선 180개에 T4a 테스트 7개와 CLI 회귀 테스트 1개를 추가해 최종 테스트 수가 188개가 되었다.
+- 없음: 요청된 임포트 수정과 `__main__` 블록 이동만 `src/friction.py`에 적용했고, 회귀 테스트만 `tests/test_friction.py`에 추가했다. 커밋하지 않았다.
+
+최종 테스트:
+
+```text
+........................................................................ [ 38%]
+........................................................................ [ 76%]
+............................................                             [100%]
+=============================== warnings summary ===============================
+../../atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+188 passed, 1 warning in 1.89s
+```
+
+임포트 변이 검증 — `src.` 접두사를 되돌렸을 때 회귀 테스트에서 실제로 실패한 pytest 출력 원문:
+
+```text
+=================================== FAILURES ===================================
+____________________ test_cli_script_writes_twelve_row_csv _____________________
+
+    def test_cli_script_writes_twelve_row_csv(tmp_path):
+        _write_panel(tmp_path, [_row(mid=1.0, h=0.01) for _ in range(30)])
+        out = tmp_path / "t.csv"
+        result = subprocess.run(
+            [sys.executable, "src/friction.py", "--panel-dir", str(tmp_path), "--out", str(out)],
+            cwd=__import__("pathlib").Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+        )
+>       assert result.returncode == 0, result.stdout + result.stderr
+E       AssertionError: Traceback (most recent call last):
+E           File "/Users/Mung/dev/atlas-options-hackathon-worktrees/friction-backtest/src/friction.py", line 14, in <module>
+E             from src.signals import _occ_expiration, _occ_strike
+E         ModuleNotFoundError: No module named 'src'
+E
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['/Users/Mung/dev/atlas-options-hackathon/.venv/bin/python', 'src/friction.py', '--panel-dir', str(tmp_path), '--out', str(out)], returncode=1, stdout='', stderr='Traceback (most recent call last):\\n  File "/Users/Mung/dev/atlas-options-hackathon-worktrees/friction-backtest/src/friction.py", line 14, in <module>\\n    from src.signals import _occ_expiration, _occ_strike\\nModuleNotFoundError: No module named \'src\'\\n').returncode
+
+tests/test_friction.py:117: AssertionError
+=============================== warnings summary ===============================
+../../atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_friction.py::test_cli_script_writes_twelve_row_csv - Assert...
+1 failed, 19 deselected, 1 warning in 0.85s
+```
+
+Reason: when executed as `python src/friction.py` from the repository root, Python does not provide the repository root as an importable `src` package for this module. Inserting the script directory and importing `signals`/`vendor` fixes the CLI while preserving `src.friction` test imports.
 
 ## 9. Review log
 
-_(비어 있음 — reviewer가 작성)_
+### Round 1
+**Verdict:** changes requested
+
+검증: 전체 187 passed(기준선 180). 코드 읽기: 함수 계약·부호·앵커 식(`credit/(1−haircut)`)·클램프 모두 지시대로. 리뷰어 변이 17건(부호, 체결 방향, 앵커 폴백, 헤어컷, 폭 경계, 클램프, 노이즈 공유/표준편차/k=0 rng, 시드, 대표 mid, 만기 내재가치, OCC 타입 등) **전부 검출** — 테스트 품질은 통과.
+반려 사유 (코드 결함 2건):
+1. **T2 CLI 회귀.** `from src.signals import ...` / `from src.vendor...` 때문에 `python src/friction.py --panel-dir data/quote_panel --out ...`가 `ModuleNotFoundError: No module named 'src'`로 죽는다(T2에서 승인된 CLI가 깨짐). 테스트는 `src.friction`으로 임포트해서 통과했을 뿐이다.
+2. 새 함수들이 `if __name__ == "__main__":` 블록 **뒤**에 정의돼 있다. 스크립트 실행 시 정의 전에 종료되고 구조상 잘못됨.
+
+### 라운드 2 수정 요청 (executor)
+- `src/backtest.py:24-31`의 패턴을 따라 임포트하라: `sys.path.insert(0, str(Path(__file__).resolve().parent))` 후 `from signals import _occ_expiration, _occ_strike`, `from vendor.options_pricing import black_scholes_price` (`src.` 접두사 제거). 이때 `tests/`가 `src.friction`으로 임포트해도 통과해야 한다.
+- `if __name__ == "__main__":` 블록을 파일 맨 끝으로 옮겨라.
+- 회귀 테스트 추가: `subprocess`로 `python src/friction.py --panel-dir <합성 패널 tmp> --out <tmp>/t.csv`를 실행해 종료코드 0과 CSV 12행을 확인한다(작업 디렉터리는 워크트리 루트).
+- 그 테스트가 현재 임포트(`src.` 접두사)로 되돌리면 실패함을 보여라(§8 「라운드 2」에 실제 pytest 실패 원문). 감점 사유 먼저.
+
+### Round 2
+**Verdict:** approved
+
+- 직접 검증: 전체 188 passed(기준선 180). `python src/friction.py --panel-dir data/quote_panel --out ...` 정상(13행=헤더+12), `__main__` 블록이 파일 끝.
+- 임포트를 `src.` 접두사로 되돌리는 변이(signals, vendor 각각)와 부호·체결·헤어컷·클램프 변이를 다시 주입해 **전부 검출**.
+- 설계 외 결정: 마크 0 클램프(핸드오프에 명시, §8 보고 확인).
+- failure_log: 라운드 1 반려 기록 있음.
