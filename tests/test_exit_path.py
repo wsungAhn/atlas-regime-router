@@ -25,6 +25,15 @@ def position(spread_type="bull_put", credit=1.0):
     return {"legs": legs, "credit": credit}
 
 
+def condor(credit=2.0):
+    return {"legs": [
+        {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "short"},
+        {"occ": occ("SPY", "2026-01-30", "P", 95), "side": "long"},
+        {"occ": occ("SPY", "2026-01-30", "C", 110), "side": "short"},
+        {"occ": occ("SPY", "2026-01-30", "C", 115), "side": "long"},
+    ], "credit": credit}
+
+
 def bars(values):
     return pd.DataFrame({"close": values}, index=pd.date_range("2026-01-02 09:30", periods=len(values), freq="15min"))
 
@@ -472,3 +481,150 @@ def test_new_policies_use_legacy_mark_for_profit_target(monkeypatch, policy, ext
                            **extra, **kwargs(pt=0.25, sl=-1.0))
     assert result["exit_reason"] == "profit_target"
     assert result["trigger_mark_pnl_pct"] == pytest.approx(0.5)
+
+
+def test_v3_no_stop_and_expiry_settlement(monkeypatch):
+    expiry_bars = pd.DataFrame({"close": [100]}, index=pd.to_datetime(["2026-01-30 09:30"]))
+    for friction in (None, friction_for(1.0)):
+        if friction is not None:
+            friction.update(beta=0.0, h_mult=99.0)
+        result = run_exit_path(position(credit=2.0), expiry_bars, pd.Series(dtype=float), policy="V3",
+                                friction=friction, **kwargs(expiry=date(2026, 1, 30), pt=None, sl=None,
+                                                            end_at=pd.Timestamp("2026-01-30 10:00")))
+        assert result["exit_reason"] == "expiry"
+        assert result["close_debit"] == pytest.approx(0.0)
+        assert result["realized_pnl"] == pytest.approx(200.0)
+        assert result["trigger_mark_pnl_pct"] == pytest.approx(1.0)
+    for policy, extra in [("V0", {}), ("V4", {}), ("V5", {"account_equity": 100, "stop_account_pct": 1}),
+                          ("V6", {"entry_underlying": 100, "stop_underlying_pct": 1})]:
+        result = run_exit_path(position(), expiry_bars, pd.Series(dtype=float), policy=policy,
+                               friction=friction_for(1.0), **extra,
+                               **kwargs(expiry=date(2026, 1, 30), pt=None, sl=-1,
+                                        end_at=pd.Timestamp("2026-01-30 10:00")))
+        assert result["exit_reason"] == "expiry"
+
+
+def test_expiry_window_and_pending_limit_rules(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    before = pd.DataFrame({"close": [100]}, index=pd.to_datetime(["2026-01-29 09:30"]))
+    assert run_exit_path(position(), before, pd.Series(dtype=float), friction=friction_for(0.66),
+                         **kwargs(expiry=date(2026, 1, 30), pt=2, sl=-1,
+                                  end_at=pd.Timestamp("2026-01-29 10:00"))) is None
+    expiry = pd.DataFrame({"close": [100]}, index=pd.to_datetime(["2026-01-30 09:30"]))
+    result = run_exit_path(position(), expiry, pd.Series(dtype=float), policy="V1",
+                           friction=friction_for(0.66), **kwargs(expiry=date(2026, 1, 30), pt=.5, sl=-1,
+                                                                end_at=pd.Timestamp("2026-01-30 10:00")))
+    assert result["exit_reason"] == "expiry"
+    assert result["n_limit_retries"] == 1
+
+
+def test_pending_limit_continues_past_first_expiry_bar_and_settles_at_window_end(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    b = pd.DataFrame({"close": [100, 100, 100, 100]}, index=pd.to_datetime([
+        "2026-01-29 09:30", "2026-01-30 09:30", "2026-01-30 09:45", "2026-01-30 10:00",
+    ]))
+    result = run_exit_path(position(), b, pd.Series(dtype=float), policy="V1",
+                           friction=friction_for(0.66), **kwargs(expiry=date(2026, 1, 30), pt=.5,
+                                                                sl=-1, end_at=pd.Timestamp("2026-01-30 10:00")))
+    assert result["exit_reason"] == "profit_target"
+    assert result["exit_ts"] == b.index[2]
+    assert result["n_limit_retries"] == 3
+
+    unfilled = run_exit_path(position(), b.iloc[:2], pd.Series(dtype=float), policy="V1",
+                             friction=friction_for(0.66), **kwargs(expiry=date(2026, 1, 30), pt=.5,
+                                                                  sl=-1, end_at=pd.Timestamp("2026-01-30 09:30")))
+    assert unfilled["exit_reason"] == "expiry"
+    assert unfilled["exit_ts"] == b.index[1]
+    assert unfilled["n_limit_retries"] == 2
+
+
+@pytest.mark.parametrize("close", [94, 116])
+def test_v4_underlying_breach_condor_is_strict(monkeypatch, close):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: -0.5)
+    result = run_exit_path(condor(), pd.DataFrame({"close": [100, close]}, index=pd.to_datetime([
+        "2026-01-02 09:30", "2026-01-02 09:45"])), pd.Series(dtype=float), policy="V4",
+                           friction=friction_for(1), **kwargs(pt=2, sl=-1))
+    assert result["exit_reason"] == "stop_loss"
+    equal = run_exit_path(condor(), pd.DataFrame({"close": [100, 100, 110]}, index=pd.to_datetime([
+        "2026-01-02 09:30", "2026-01-02 09:45", "2026-01-02 10:00"])), pd.Series(dtype=float),
+                          policy="V4", friction=friction_for(1), **kwargs(pt=2, sl=-1))
+    assert equal is None
+
+
+def test_condor_combined_trigger_and_legacy_debit(monkeypatch):
+    marks = {"bull_put": 2.5, "bear_call": 0.2}
+    monkeypatch.setattr(exit_path, "price_spread_to_close", lambda **args: marks[args["spread_type"]])
+    bars_one = bars([100])
+    assert run_exit_path(condor(), bars_one, pd.Series(dtype=float), **kwargs(pt=2, sl=-.5)) is None
+    marks.update(bull_put=3.0)
+    result = run_exit_path(condor(), bars_one, pd.Series(dtype=float), **kwargs(pt=2, sl=-.5))
+    assert result["exit_reason"] == "stop_loss"
+    calls = []
+    monkeypatch.setattr(exit_path, "price_spread_to_close", lambda **args: calls.append(args["spread_type"]) or .5)
+    run_exit_path(condor(), pd.DataFrame({"close": [100]}, index=pd.to_datetime(["2026-01-30 09:30"])),
+                  pd.Series(dtype=float), **kwargs(expiry=date(2026, 1, 30), pt=2, sl=-1,
+                                                   end_at=pd.Timestamp("2026-01-30 10:00")))
+    assert calls == ["bull_put", "bear_call", "bull_put", "bear_call"]
+
+
+@pytest.mark.parametrize("close", [94, 106])
+def test_v6_condor_moves_both_directions_at_boundary(monkeypatch, close):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 0.0)
+    result = run_exit_path(condor(), bars([100, close]), pd.Series(dtype=float), policy="V6",
+                           friction=friction_for(1), entry_underlying=100, stop_underlying_pct=.06,
+                           **kwargs(pt=2, sl=-1))
+    assert result["exit_reason"] == "stop_loss"
+    result = run_exit_path(condor(), bars([100, close]), pd.Series(dtype=float), policy="V6",
+                           friction=friction_for(1), entry_underlying=100, stop_underlying_pct=.05,
+                           **kwargs(pt=2, sl=-1))
+    assert result["exit_reason"] == "stop_loss"
+
+
+def test_condor_validation_errors():
+    invalids = [
+        condor()["legs"][:3],
+        [*condor()["legs"][:2], {"occ": occ("SPY", "2026-01-30", "P", 90), "side": "short"},
+         {"occ": occ("SPY", "2026-01-30", "C", 115), "side": "long"}],
+        [{"occ": occ("SPY", "2026-01-30", "P", 95), "side": "short"},
+         {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "long"},
+         {"occ": occ("SPY", "2026-01-30", "C", 90), "side": "short"},
+         {"occ": occ("SPY", "2026-01-30", "C", 115), "side": "long"}],
+    ]
+    for legs in invalids:
+        with pytest.raises(ValueError):
+            run_exit_path({"legs": legs, "credit": 1}, bars([100]), pd.Series(dtype=float), **kwargs())
+
+
+def test_condor_validation_rejects_put_short_at_call_short():
+    legs = [
+        {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "short"},
+        {"occ": occ("SPY", "2026-01-30", "P", 95), "side": "long"},
+        {"occ": occ("SPY", "2026-01-30", "C", 100), "side": "short"},
+        {"occ": occ("SPY", "2026-01-30", "C", 105), "side": "long"},
+    ]
+    with pytest.raises(ValueError):
+        exit_path._validate_position({"legs": legs, "credit": 1})
+
+
+def test_condor_validation_rejects_put_short_at_put_long():
+    legs = [
+        {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "short"},
+        {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "long"},
+        {"occ": occ("SPY", "2026-01-30", "C", 110), "side": "short"},
+        {"occ": occ("SPY", "2026-01-30", "C", 115), "side": "long"},
+    ]
+    with pytest.raises(ValueError):
+        exit_path._validate_position({"legs": legs, "credit": 1})
+
+
+def test_condor_validation_rejects_call_short_at_call_long():
+    legs = [
+        {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "short"},
+        {"occ": occ("SPY", "2026-01-30", "P", 95), "side": "long"},
+        {"occ": occ("SPY", "2026-01-30", "C", 110), "side": "short"},
+        {"occ": occ("SPY", "2026-01-30", "C", 110), "side": "long"},
+    ]
+    with pytest.raises(ValueError):
+        exit_path._validate_position({"legs": legs, "credit": 1})

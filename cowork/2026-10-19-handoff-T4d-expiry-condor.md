@@ -1,6 +1,6 @@
 # Codex Handoff — T4d expiry settlement + iron condor (4-leg) — 2026-10-19
 
-> **상태(Status):** `대기중 / pending`
+> **상태(Status):** `완료 / done`
 > _(Executor: set `진행중` on start, `검토대기` when done. Only the reviewer sets `완료`.)_
 >
 > **시작 기록(Started by):** author `session=a43dac5d-41e1-436c-bb1d-f9c0b1f8bc9d machine=mac-studio started=2026-10-19T09:30-0700`
@@ -83,8 +83,184 @@
 
 ## 8. Executor response (Codex writes here)
 
-_(비어 있음 — 감점 사유 먼저.)_
+### 감점 사유 / deductions first
+
+- The requested 15-source-mutation matrix was not fully executed; two representative temporary mutations were run with original pytest failure output below. The implementation and regression tests are complete, but this is a review gate gap.
+- No existing test was changed; all additions are new tests in `tests/test_exit_path.py`.
+- No commit was created.
+
+### 구현
+
+- Added 4-leg iron-condor validation and generalized vertical specifications.
+- Added combined legacy marks/debits, existing friction-path reuse, two-sided V4/V6 condor rules, expiry intrinsic settlement, expiry metadata, and pending-limit cancellation/settlement.
+- Added 8 new regression tests covering expiry, condor triggers/debits, both directions, strict boundaries, pending limits, and validation.
+
+### 검증
+
+Baseline: `241 passed, 1 warning`.
+
+Final: `249 passed, 1 warning`.
+
+Temporary mutation (expiry settlement suppressed; `if n_polls and window.index[-1].normalize() >= expiry_day` changed to `if n_polls and False`):
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+____________________ test_v3_no_stop_and_expiry_settlement _____________________
+E           TypeError: 'NoneType' object is not subscriptable
+tests/test_exit_path.py:494: TypeError
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 1 warning in 0.59s
+```
+
+Temporary mutation (option multiplier `100.0` changed to `1.0`):
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+____________________ test_v3_no_stop_and_expiry_settlement _____________________
+E           assert 2.0 == 200.0 ± 2.0e-04
+E             Obtained: 2.0
+E             Expected: 200.0 ± 2.0e-04
+tests/test_exit_path.py:496: AssertionError
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 1 warning in 0.56s
+```
+
+### Round 2
+#### 감점 사유 / deductions first
+
+- None for the requested Round 2 correction and mutation checks.
+- No existing test was changed; four new focused tests were added to `tests/test_exit_path.py`.
+- No commit was created.
+
+#### 구현
+
+- Deleted the early `pending_limit` expiry-settlement block from `src/exit_path.py`; the existing final-window-bar settlement block is unchanged.
+- Added coverage that a pending V1 order continues beyond the first expiry-day bar, that an unfilled order settles on the final bar with `n_limit_retries == limit_misses`, and that `put_short >= call_short`, put `short <= long`, and call `short >= long` each independently raise `ValueError`.
+
+#### 변이 검증 — 실제 pytest 실패 출력
+
+Mutation 1: restored the deleted early expiry-settlement block.
+
+```text
+F
+=================================== FAILURES ===================================
+_ test_pending_limit_continues_past_first_expiry_bar_and_settles_at_window_end _
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10f461940>
+
+    def test_pending_limit_continues_past_first_expiry_bar_and_settles_at_window_end(monkeypatch):
+        monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+        monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+        b = pd.DataFrame({"close": [100, 100, 100, 100]}, index=pd.to_datetime([
+            "2026-01-29 09:30", "2026-01-30 09:30", "2026-01-30 09:45", "2026-01-30 10:00",
+        ]))
+        result = run_exit_path(position(), b, pd.Series(dtype=float), policy="V1",
+                               friction=friction_for(0.66), **kwargs(expiry=date(2026, 1, 30), pt=.5,
+                                                                    sl=-1, end_at=pd.Timestamp("2026-01-30 10:00")))
+>       assert result["exit_reason"] == "profit_target"
+E       AssertionError: assert 'expiry' == 'profit_target'
+E
+E         - profit_target
+E         + expiry
+
+tests/test_exit_path.py:531: AssertionError
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 62 deselected, 1 warning in 0.56s
+```
+
+Mutation 2: changed `put_short >= call_short` to `put_short > call_short`.
+
+```text
+F
+=================================== FAILURES ===================================
+_____________ test_condor_validation_rejects_put_short_at_call_short _____________
+
+    def test_condor_validation_rejects_put_short_at_call_short():
+        legs = [
+            {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "short"},
+            {"occ": occ("SPY", "2026-01-30", "P", 95), "side": "long"},
+            {"occ": occ("SPY", "2026-01-30", "C", 100), "side": "short"},
+            {"occ": occ("SPY", "2026-01-30", "C", 105), "side": "long"},
+        ]
+>       with pytest.raises(ValueError):
+E       Failed: DID NOT RAISE ValueError
+
+tests/test_exit_path.py:607: Failed
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 64 deselected, 1 warning in 0.55s
+```
+
+Mutation 3: changed put `short <= long` to `short < long`.
+
+```text
+F
+=================================== FAILURES ===================================
+_____________ test_condor_validation_rejects_put_short_at_put_long _____________
+
+    def test_condor_validation_rejects_put_short_at_put_long():
+        legs = [
+            {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "short"},
+            {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "long"},
+            {"occ": occ("SPY", "2026-01-30", "C", 110), "side": "short"},
+            {"occ": occ("SPY", "2026-01-30", "C", 115), "side": "long"},
+        ]
+>       with pytest.raises(ValueError):
+E       Failed: DID NOT RAISE ValueError
+
+tests/test_exit_path.py:618: Failed
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 64 deselected, 1 warning in 0.54s
+```
+
+Mutation 4: changed call `short >= long` to `short > long`.
+
+```text
+F
+=================================== FAILURES ===================================
+_____________ test_condor_validation_rejects_call_short_at_call_long _____________
+
+    def test_condor_validation_rejects_call_short_at_call_long():
+        legs = [
+            {"occ": occ("SPY", "2026-01-30", "P", 100), "side": "short"},
+            {"occ": occ("SPY", "2026-01-30", "P", 95), "side": "long"},
+            {"occ": occ("SPY", "2026-01-30", "C", 110), "side": "short"},
+            {"occ": occ("SPY", "2026-01-30", "C", 110), "side": "long"},
+        ]
+>       with pytest.raises(ValueError):
+E       Failed: DID NOT RAISE ValueError
+
+tests/test_exit_path.py:629: Failed
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 64 deselected, 1 warning in 0.57s
+```
+
+#### 検証
+
+Round 2 targeted suite: 65 passed, 1 warning. Full-suite verification follows below.
 
 ## 9. Review log
 
-_(비어 있음 — reviewer가 작성)_
+### Round 1
+**Verdict:** changes requested
+
+검증: 전체 249 passed(기준선 241). 코드 읽기: 4레그 합산 판정, V4/V6 콘도르 양쪽, 레거시 합산 데빗, 만기 정산(교차비용 0)은 지시대로. 변이 재주입 중 **3종류가 생존**:
+
+**코드 결함 1건**
+1. `run_exit_path` 루프 안에 **`if pending_limit and bar_day >= expiry_day:` 조기 정산 블록**이 있다. 핸드오프 §3-2는 정산을 **창의 마지막 봉**에서 하고 대기 중 limit은 "정산 시 무시"라고 했다. 이 블록은 만기일 첫 봉에서 곧바로 내재가치로 정산해 버려, 대기 주문이 만기일 나머지 봉에서 체결·시장가 전환될 기회를 없앤다(V1 대기 중이면 그 봉의 체결 확인도 건너뜀). **이 블록을 삭제하라.** 루프 끝의 정산 블록(`if n_polls and window.index[-1].normalize() >= expiry_day:`)만 남는다. 이 변이(블록 제거)가 **현재 테스트에 안 걸린다**(생존) — 즉 `test_expiry_window_and_pending_limit_rules`가 이 동작을 구분하지 못한다.
+
+**테스트 공백**
+2. 콘도르 검증 분기 3개가 개별로 검증되지 않는다(해당 검사를 무력화해도 통과): (a) `put_short >= call_short` 위반, (b) 풋 수직 방향 위반(숏 행사가 ≤ 롱 행사가), (c) 콜 수직 방향 위반(숏 행사가 ≥ 롱 행사가). 각각 별도 입력으로 `ValueError`를 단언하라(다른 검사에 걸려서 통과하지 않도록 나머지 조건은 정상으로 구성).
+
+### 라운드 2 수정 요청 (executor)
+1. `src/exit_path.py`에서 위 조기 정산 블록을 삭제한다(다른 동작 변경 금지).
+2. 테스트 추가: ① 만기일에 대기 중인 limit(V0 폴백 또는 V1)이 **만기일 첫 봉이 아닌 그 뒤 봉**에서 체결되거나 V1 시장가로 전환되는 경우(조기 정산 블록이 있으면 실패해야 함), ② 끝까지 미체결이면 창의 마지막 봉에서 정산되고 `n_limit_retries == limit_misses`, ③ 위 콘도르 검증 3개를 개별 입력으로.
+3. 블록을 되살렸을 때와 검증 3개 무력화 변이 각각의 **실제 pytest 실패 출력 원문**을 §8 「라운드 2」에 붙여라. 감점 사유 먼저.
+
+### Round 2
+**Verdict:** approved
+
+- 직접 검증: 전체 253 passed(기준선 241). `src/exit_path.py` 변경은 조기 정산 블록 삭제뿐(diff 확인).
+- 블록 복원 변이와 콘도르 검증 3개 무력화 변이(경계 `>=`→`>` 포함) 및 정산 생략·`limit_misses` 누락 변이를 재주입해 **전부 검출**.
+- failure_log: 라운드 1 반려 기록 있음.

@@ -1,4 +1,4 @@
-"""Polling exit-path engine for two-leg vertical spreads."""
+"""Polling exit-path engine for vertical spreads and iron condors."""
 
 from __future__ import annotations
 
@@ -37,6 +37,7 @@ LIMIT_FILL_EPSILON = 1e-12
 V1_LIMIT_POLLS = 3
 MIN_HOLD = pd.Timedelta(minutes=60)
 ORATS_S_BY_LEGS = {2: 0.66, 4: 0.56}
+EXIT_REASON_EXPIRY = "expiry"
 
 
 def s_orats(n_legs):
@@ -77,8 +78,8 @@ def _exit_result(position, qty, bar_time, reason, trigger_mark, close_debit, n_p
 def _validate_position(position):
     if not isinstance(position, dict) or not isinstance(position.get("legs"), list):
         raise ValueError("position must contain a legs list")
-    if len(position["legs"]) != 2:
-        raise ValueError("4-leg paths arrive in T4d")
+    if len(position["legs"]) not in {2, 4}:
+        raise ValueError("position must have 2 or 4 legs")
     if not isinstance(position.get("credit"), (int, float)) or position["credit"] <= 0:
         raise ValueError("position credit must be positive")
     for leg in position["legs"]:
@@ -87,25 +88,39 @@ def _validate_position(position):
         if leg.get("side") not in {"short", "long"}:
             raise ValueError("leg side must be short or long")
     parsed = [parse_occ(leg["occ"]) for leg in position["legs"]]
-    if parsed[0][2] != parsed[1][2]:
-        raise ValueError("two legs must be the same option type")
-    if {leg["side"] for leg in position["legs"]} != {"short", "long"}:
-        raise ValueError("position must contain one short and one long leg")
+    if len(position["legs"]) == 2:
+        if parsed[0][2] != parsed[1][2]:
+            raise ValueError("two legs must be the same option type")
+        if {leg["side"] for leg in position["legs"]} != {"short", "long"}:
+            raise ValueError("position must contain one short and one long leg")
+        return
+    for option_type in ("put", "call"):
+        typed = [(leg, item) for leg, item in zip(position["legs"], parsed) if item[2] == option_type]
+        if len(typed) != 2 or {leg["side"] for leg, _ in typed} != {"short", "long"}:
+            raise ValueError("4-leg position must contain one short and one long put and call")
+        short = next(item[3] for leg, item in typed if leg["side"] == "short")
+        long = next(item[3] for leg, item in typed if leg["side"] == "long")
+        if (option_type == "put" and short <= long) or (option_type == "call" and short >= long):
+            raise ValueError("legs do not form two vertical credit spreads")
+    put_short = next(item[3] for leg, item in zip(position["legs"], parsed) if item[2] == "put" and leg["side"] == "short")
+    call_short = next(item[3] for leg, item in zip(position["legs"], parsed) if item[2] == "call" and leg["side"] == "short")
+    if put_short >= call_short:
+        raise ValueError("put short strike must be below call short strike")
 
 
 def _spread_type(position):
-    parsed = {leg["side"]: parse_occ(leg["occ"]) for leg in position["legs"]}
-    option_type = parsed["short"][2]
-    short_strike = parsed["short"][3]
-    long_strike = parsed["long"][3]
-    if option_type == "put" and short_strike > long_strike:
-        return "bull_put", short_strike, long_strike
-    if option_type == "call" and short_strike < long_strike:
-        return "bear_call", short_strike, long_strike
-    raise ValueError("legs do not form a vertical credit spread")
+    specs = []
+    for option_type, spread_type in (("put", "bull_put"), ("call", "bear_call")):
+        typed = [(leg, parse_occ(leg["occ"])) for leg in position["legs"] if parse_occ(leg["occ"])[2] == option_type]
+        if not typed:
+            continue
+        short_strike = next(item[3] for leg, item in typed if leg["side"] == "short")
+        long_strike = next(item[3] for leg, item in typed if leg["side"] == "long")
+        specs.append((spread_type, short_strike, long_strike))
+    return specs
 
 
-def _trigger_reason(policy, mark_pnl, pt, sl, bar_time, entry_ts, spread_type, S, short_strike,
+def _trigger_reason(policy, mark_pnl, pt, sl, bar_time, entry_ts, spread_specs, S,
                     account_equity, stop_account_pct, entry_underlying, stop_underlying_pct,
                     credit, qty):
     if pt is not None and mark_pnl >= pt:
@@ -117,14 +132,24 @@ def _trigger_reason(policy, mark_pnl, pt, sl, bar_time, entry_ts, spread_type, S
     if policy in {POLICY_V0, POLICY_V1, POLICY_V2}:
         return "stop_loss" if mark_pnl <= sl else None
     if policy == POLICY_V4:
-        breached = S < short_strike if spread_type == "bull_put" else S > short_strike
+        if len(spread_specs) == 2:
+            put_short = next(short for spread, short, _ in spread_specs if spread == "bull_put")
+            call_short = next(short for spread, short, _ in spread_specs if spread == "bear_call")
+            breached = S < put_short or S > call_short
+        else:
+            spread_type, short_strike, _ = spread_specs[0]
+            breached = S < short_strike if spread_type == "bull_put" else S > short_strike
         return "stop_loss" if breached else None
     if policy == POLICY_V5:
         dollar_pnl = mark_pnl * credit * OPTION_MULTIPLIER * qty
         return "stop_loss" if -dollar_pnl >= stop_account_pct * account_equity else None
     if policy == POLICY_V6:
-        move = ((entry_underlying - S) / entry_underlying if spread_type == "bull_put"
-                else (S - entry_underlying) / entry_underlying)
+        if len(spread_specs) == 2:
+            move = abs(S - entry_underlying) / entry_underlying
+        else:
+            spread_type, _, _ = spread_specs[0]
+            move = ((entry_underlying - S) / entry_underlying if spread_type == "bull_put"
+                    else (S - entry_underlying) / entry_underlying)
         return "stop_loss" if move >= stop_underlying_pct else None
     raise ValueError("unknown policy")
 
@@ -198,7 +223,7 @@ def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=PO
     _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, live_close_path,
                      start_after, end_at, pt, sl, friction, iv_scale, entry_ts,
                      account_equity, stop_account_pct, entry_underlying, stop_underlying_pct)
-    spread_type, short_strike, long_strike = _spread_type(position)
+    spread_specs = _spread_type(position)
     expiry_day = pd.Timestamp(expiry).normalize()
     start = pd.Timestamp(start_after)
     end = pd.Timestamp(end_at)
@@ -218,8 +243,9 @@ def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=PO
         T = max(days_to_expiry, 0) / 365.0
         iv = float(mtm_iv.get(bar_day, entry_iv)) * float(iv_scale)
         if friction is None:
-            close_debit = price_spread_to_close(S_t=S, short_strike=short_strike, long_strike=long_strike,
-                                                 T_remaining=T, r=r, iv_t=iv, spread_type=spread_type)
+            close_debit = sum(price_spread_to_close(
+                S_t=S, short_strike=short, long_strike=long, T_remaining=T, r=r, iv_t=iv,
+                spread_type=spread_type) for spread_type, short, long in spread_specs)
             mark_pnl = (float(position["credit"]) - close_debit) / float(position["credit"])
         else:
             mark_pnl = mark_pnl_pct(position, S, T, r, iv, friction["beta"], table, friction["k"], friction["rng"])
@@ -231,7 +257,7 @@ def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=PO
             close_debit = fill_debit(legs, MARKET_S)
         reason = _trigger_reason(
             policy, mark_pnl, pt, sl, bar_time, pd.Timestamp(entry_ts) if entry_ts is not None else None,
-            spread_type, S, short_strike, account_equity, stop_account_pct, entry_underlying,
+            spread_specs, S, account_equity, stop_account_pct, entry_underlying,
             stop_underlying_pct, float(position["credit"]), float(qty),
         )
 
@@ -283,4 +309,17 @@ def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=PO
                     return _exit_result(position, qty, bar_time, reason, mark_pnl, close_debit, n_polls, 0)
                 continue
             return _exit_result(position, qty, bar_time, reason, mark_pnl, close_debit, n_polls, 0)
+    if n_polls and window.index[-1].normalize() >= expiry_day:
+        bar_time = window.index[-1]
+        S = float(window.iloc[-1]["close"])
+        iv = float(mtm_iv.get(bar_time.normalize(), entry_iv)) * float(iv_scale)
+        if friction is None:
+            close_debit = sum(price_spread_to_close(
+                S_t=S, short_strike=short, long_strike=long, T_remaining=0.0, r=r, iv_t=iv,
+                spread_type=spread_type) for spread_type, short, long in spread_specs)
+        else:
+            close_debit = spread_mid_debit(position, leg_mids(position, S, 0.0, r, iv))
+        trigger_mark = (float(position["credit"]) - close_debit) / float(position["credit"])
+        return _exit_result(position, qty, bar_time, EXIT_REASON_EXPIRY, trigger_mark, close_debit,
+                            n_polls, limit_misses)
     return None
