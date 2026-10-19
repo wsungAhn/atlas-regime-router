@@ -22,6 +22,12 @@ from vendor.credit_spread_simulator import price_spread_to_close  # noqa: E402
 
 POLICY_V0 = "V0"
 POLICY_V1 = "V1"
+POLICY_V2 = "V2"
+POLICY_V3 = "V3"
+POLICY_V4 = "V4"
+POLICY_V5 = "V5"
+POLICY_V6 = "V6"
+POLICIES = {POLICY_V0, POLICY_V1, POLICY_V2, POLICY_V3, POLICY_V4, POLICY_V5, POLICY_V6}
 LIVE_CLOSE_PATH_LIMIT_FALLBACK = "limit_fallback"
 LIVE_CLOSE_PATH_MARKET = "market"
 MARKET_S = 1.0
@@ -29,6 +35,7 @@ OPTION_MULTIPLIER = 100.0
 LIMIT_FALLBACK_MARKUP = 0.05
 LIMIT_FILL_EPSILON = 1e-12
 V1_LIMIT_POLLS = 3
+MIN_HOLD = pd.Timedelta(minutes=60)
 ORATS_S_BY_LEGS = {2: 0.66, 4: 0.56}
 
 
@@ -98,8 +105,33 @@ def _spread_type(position):
     raise ValueError("legs do not form a vertical credit spread")
 
 
+def _trigger_reason(policy, mark_pnl, pt, sl, bar_time, entry_ts, spread_type, S, short_strike,
+                    account_equity, stop_account_pct, entry_underlying, stop_underlying_pct,
+                    credit, qty):
+    if pt is not None and mark_pnl >= pt:
+        return "profit_target"
+    if policy == POLICY_V3:
+        return None
+    if policy == POLICY_V2 and bar_time - entry_ts < MIN_HOLD:
+        return None
+    if policy in {POLICY_V0, POLICY_V1, POLICY_V2}:
+        return "stop_loss" if mark_pnl <= sl else None
+    if policy == POLICY_V4:
+        breached = S < short_strike if spread_type == "bull_put" else S > short_strike
+        return "stop_loss" if breached else None
+    if policy == POLICY_V5:
+        dollar_pnl = mark_pnl * credit * OPTION_MULTIPLIER * qty
+        return "stop_loss" if -dollar_pnl >= stop_account_pct * account_equity else None
+    if policy == POLICY_V6:
+        move = ((entry_underlying - S) / entry_underlying if spread_type == "bull_put"
+                else (S - entry_underlying) / entry_underlying)
+        return "stop_loss" if move >= stop_underlying_pct else None
+    raise ValueError("unknown policy")
+
+
 def _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, live_close_path,
-                     start_after, end_at, pt, sl, friction, iv_scale):
+                     start_after, end_at, pt, sl, friction, iv_scale, entry_ts,
+                     account_equity, stop_account_pct, entry_underlying, stop_underlying_pct):
     _validate_position(position)
     if not isinstance(bars, pd.DataFrame) or "close" not in bars.columns:
         raise ValueError("bars must be a DataFrame with a close column")
@@ -117,14 +149,32 @@ def _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, l
         raise ValueError("r must be numeric")
     if not isinstance(qty, (int, float)) or qty <= 0:
         raise ValueError("qty must be positive")
-    if policy not in {POLICY_V0, POLICY_V1}:
-        raise ValueError("policy must be V0 or V1")
+    if policy not in POLICIES:
+        raise ValueError("unknown policy")
     if live_close_path not in {None, LIVE_CLOSE_PATH_MARKET, LIVE_CLOSE_PATH_LIMIT_FALLBACK}:
         raise ValueError("live_close_path must be None, market, or limit_fallback")
     if friction is None and (policy == POLICY_V1 or live_close_path == LIVE_CLOSE_PATH_LIMIT_FALLBACK):
         raise ValueError("limit paths require friction")
-    if not isinstance(pt, (int, float)) or not isinstance(sl, (int, float)):
-        raise ValueError("pt and sl must be numeric")
+    if pt is not None and not isinstance(pt, (int, float)):
+        raise ValueError("pt must be numeric or None")
+    if policy in {POLICY_V0, POLICY_V1, POLICY_V2} and not isinstance(sl, (int, float)):
+        raise ValueError("sl must be numeric")
+    if policy == POLICY_V2:
+        if entry_ts is None:
+            raise ValueError("entry_ts is required for V2")
+        entry_ts = pd.Timestamp(entry_ts)
+        if entry_ts.tzinfo is not None:
+            raise ValueError("entry_ts must be timezone-naive")
+    if policy == POLICY_V5:
+        if not isinstance(account_equity, (int, float)) or account_equity <= 0:
+            raise ValueError("account_equity must be positive")
+        if not isinstance(stop_account_pct, (int, float)) or not 0 < stop_account_pct <= 1:
+            raise ValueError("stop_account_pct must be in (0, 1]")
+    if policy == POLICY_V6:
+        if not isinstance(entry_underlying, (int, float)) or entry_underlying <= 0:
+            raise ValueError("entry_underlying must be positive")
+        if not isinstance(stop_underlying_pct, (int, float)) or not 0 < stop_underlying_pct <= 1:
+            raise ValueError("stop_underlying_pct must be in (0, 1]")
     if not isinstance(iv_scale, (int, float)) or iv_scale <= 0:
         raise ValueError("iv_scale must be positive")
     start = pd.Timestamp(start_after)
@@ -143,9 +193,11 @@ def _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, l
 
 def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=POLICY_V0,
                   live_close_path=None, start_after, end_at, pt=0.5, sl=-1.0,
-                  friction=None, iv_scale=1.0):
+                  friction=None, iv_scale=1.0, entry_ts=None, account_equity=None,
+                  stop_account_pct=None, entry_underlying=None, stop_underlying_pct=None):
     _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, live_close_path,
-                     start_after, end_at, pt, sl, friction, iv_scale)
+                     start_after, end_at, pt, sl, friction, iv_scale, entry_ts,
+                     account_equity, stop_account_pct, entry_underlying, stop_underlying_pct)
     spread_type, short_strike, long_strike = _spread_type(position)
     expiry_day = pd.Timestamp(expiry).normalize()
     start = pd.Timestamp(start_after)
@@ -177,7 +229,11 @@ def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=PO
             for leg, mid, half in zip(position["legs"], mids, halves):
                 legs.append({"side": leg["side"], "bid": max(mid - half, 0.0), "ask": mid + half})
             close_debit = fill_debit(legs, MARKET_S)
-        reason = "profit_target" if mark_pnl >= pt else "stop_loss" if mark_pnl <= sl else None
+        reason = _trigger_reason(
+            policy, mark_pnl, pt, sl, bar_time, pd.Timestamp(entry_ts) if entry_ts is not None else None,
+            spread_type, S, short_strike, account_equity, stop_account_pct, entry_underlying,
+            stop_underlying_pct, float(position["credit"]), float(qty),
+        )
 
         if policy == POLICY_V1 and pending_limit:
             if fill_debit(legs, friction["s"]) <= limit_debit + LIMIT_FILL_EPSILON:
@@ -191,7 +247,7 @@ def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=PO
                                     n_polls, limit_misses)
             continue
 
-        if policy == POLICY_V0 and live_close_path == LIVE_CLOSE_PATH_LIMIT_FALLBACK and pending_limit:
+        if policy != POLICY_V1 and live_close_path == LIVE_CLOSE_PATH_LIMIT_FALLBACK and pending_limit:
             if reason is None:
                 pending_limit = False
                 limit_debit = None

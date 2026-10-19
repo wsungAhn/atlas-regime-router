@@ -1,6 +1,6 @@
 # Codex Handoff — T4c trigger policies V2/V3/V4 + account stop (V5) + underlying-move stop (V6) + hold-to-expiry — 2026-10-18
 
-> **상태(Status):** `대기중 / pending`
+> **상태(Status):** `완료 / done`
 > _(Executor: set `진행중` on start, `검토대기` when done. Only the reviewer sets `완료`.)_
 >
 > **시작 기록(Started by):** author `session=a43dac5d-41e1-436c-bb1d-f9c0b1f8bc9d machine=mac-studio started=2026-10-18T12:05-0700`
@@ -82,8 +82,209 @@ T4b1/T4b2의 `run_exit_path`는 트리거가 하나(마크 손익 PT/SL)이고 �
 
 ## 8. Executor response (Codex writes here)
 
-_(비어 있음 — 감점 사유 먼저.)_
+감점 사유 / deductions first:
+
+- §5 mutation (a)의 `<`→`<=` 대안은 실행하지 않았다. The 60-minute constant mutation was run and failed; the alternate operator mutation was not separately run.
+- §5 mutation (i)는 the denominator mutation was run against the directional test and failed for the bear-call case; the added test suite does not separately assert a near-threshold denominator distinction.
+- No mutation or test changes were committed. Final full-suite result: `228 passed, 1 warning`.
+
+Implementation deductions:
+
+- New policy trigger evaluation is centralized in `_trigger_reason`; V0/V1 execution behavior remains in the existing branches, while V2–V6 use the V0 execution path.
+- `pt=None` skips profit-target evaluation. V0/V1/V2 validate numeric `sl`; V3–V6 ignore `sl` as required.
+- V4/V5/V6 legacy mode derives the mark from the legacy close debit, and limit fallback remains friction-gated.
+
+Mutation evidence (real pytest output):
+
+(a) `MIN_HOLD = pd.Timedelta(minutes=0)` — `test_v2_min_hold_boundary_and_pt_still_applies`
+
+```text
+E       AssertionError: assert Timestamp('2026-01-02 09:30:00') == Timestamp('2026-01-02 10:15:00')
+1 failed, 1 warning in 0.50s
+```
+
+(b) V2 skips PT — `test_v2_min_hold_boundary_and_pt_still_applies`
+
+```text
+E       TypeError: 'NoneType' object is not subscriptable
+1 failed, 1 warning in 0.50s
+```
+
+(c) V3 applies SL — `test_v3_no_stop_and_pt_none`
+
+```text
+E       TypeError: '<=' not supported between instances of 'float' and 'NoneType'
+1 failed, 1 warning in 0.52s
+```
+
+(d) V4 strict `<` changed to `<=` — `test_v4_underlying_breach_is_strict_and_directional`
+
+```text
+E       AssertionError: assert Timestamp('2026-01-02 09:30:00') == Timestamp('2026-01-02 10:00:00')
+2 failed, 1 warning in 0.52s
+```
+
+(e) V4 bull-put direction reversed — `test_v4_underlying_breach_is_strict_and_directional`
+
+```text
+E       TypeError: 'NoneType' object is not subscriptable
+1 failed, 1 passed, 1 warning in 0.50s
+```
+
+(f) V5 `>=` changed to `>` — `test_v5_account_stop_boundary_uses_dollars_and_qty`
+
+```text
+E       TypeError: 'NoneType' object is not subscriptable
+1 failed, 1 warning in 0.51s
+```
+
+(g) V5 omitted `qty` — `test_v5_account_stop_boundary_uses_dollars_and_qty`
+
+```text
+E       TypeError: 'NoneType' object is not subscriptable
+1 failed, 1 warning in 0.51s
+```
+
+(h) V6 direction reversed — `test_v6_underlying_move_boundary_and_direction`
+
+```text
+E       TypeError: 'NoneType' object is not subscriptable
+1 failed, 1 passed, 1 warning in 0.49s
+```
+
+(i) V6 denominator changed from `entry_underlying` to `S` — `test_v6_underlying_move_boundary_and_direction`
+
+```text
+E       TypeError: 'NoneType' object is not subscriptable
+1 failed, 1 passed, 1 warning in 0.49s
+```
+
+(j) `pt=None` treated as zero — `test_pt_none_disables_profit_target_but_keeps_stop`
+
+```text
+E       AssertionError: assert 'profit_target' == 'stop_loss'
+E         - stop_loss
+E         + profit_target
+4 failed, 1 warning in 0.54s
+```
+
+(k) New-policy trigger bypassed limit fallback — `test_new_policies_keep_limit_fallback_execution`
+
+```text
+E       assert 0 == 2
+1 failed, 1 warning in 0.51s
+```
+
+(l) Legacy V4/V5/V6 mark replaced — `test_new_policies_use_legacy_mark_for_profit_target`
+
+```text
+E       TypeError: 'NoneType' object is not subscriptable
+3 failed, 1 warning in 0.51s
+```
+
+Final test command:
+
+```text
+228 passed, 1 warning in 2.01s
+```
+
+### Round 2
+**감점 사유 / deductions first:**
+
+- 없음. 두 Round 1 생존 변이를 모두 검출했고, `src/exit_path.py`는 수정하지 않았다.
+
+추가한 테스트:
+
+- V6 `bull_put`에서 `entry_underlying=200`, 종가 `[181.8, 180.0]`, 임계 `0.10`을 사용해 `S` 분모 변이가 첫 봉에서 오검출되도록 단언하고, 정상 구현은 두 번째 봉에서 청산하는지 확인했다.
+- V5/V6의 필수 인자 경계를 각각 검증했다: 0, 음수, 1 초과는 `ValueError`, 정확히 1은 허용.
+
+변이 (i) — V6 `bull_put` 분모를 `entry_underlying`에서 `S`로 변경 — `test_v6_bull_put_uses_entry_underlying_as_denominator`:
+
+```text
+...............................F.....................                    [100%]
+=================================== FAILURES ===================================
+____________ test_v6_bull_put_uses_entry_underlying_as_denominator _____________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x10d60bd50>
+
+    def test_v6_bull_put_uses_entry_underlying_as_denominator(monkeypatch):
+        monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 0.0)
+        b = bars([181.8, 180.0])
+        result = run_exit_path(position("bull_put"), b, pd.Series(dtype=float), policy="V6",
+                               friction=friction_for(1.0), entry_underlying=200.0,
+                               stop_underlying_pct=0.10, **kwargs(pt=2.0, sl=-1.0))
+>       assert result["exit_ts"] == b.index[1]
+E       AssertionError: assert Timestamp('2026-01-02 09:30:00') == Timestamp('2026-01-02 09:45:00')
+
+test_exit_path.py:396: AssertionError
+=============================== warnings summary ===============================
+../../../Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html
+    warnings.warn(  # deprecated in 14.0; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+FAILED test_exit_path.py::test_v6_bull_put_uses_entry_underlying_as_denominator
+1 failed, 52 passed, 1 warning in 0.65s
+```
+
+변이 (j-2) — V5 `stop_account_pct` 검증을 `(0, 1]`에서 `[0, 1]`로 변경 — `test_v5_v6_reject_invalid_parameter_boundaries[V5-extra2]`:
+
+```text
+..................................F..................                    [100%]
+=================================== FAILURES ===================================
+__________ test_v5_v6_reject_invalid_parameter_boundaries[V5-extra2] ___________
+
+policy = 'V5', extra = {'account_equity': 100, 'stop_account_pct': 0}
+
+    @pytest.mark.parametrize("policy, extra", [
+        ("V5", {"account_equity": 0, "stop_account_pct": 0.5}),
+        ("V5", {"account_equity": -1, "stop_account_pct": 0.5}),
+        ("V5", {"account_equity": 100, "stop_account_pct": 0}),
+        ("V5", {"account_equity": 100, "stop_account_pct": -0.1}),
+        ("V5", {"account_equity": 100, "stop_account_pct": 1.1}),
+        ("V6", {"entry_underlying": 0, "stop_underlying_pct": 0.5}),
+        ("V6", {"entry_underlying": -1, "stop_underlying_pct": 0.5}),
+        ("V6", {"entry_underlying": 100, "stop_underlying_pct": 0}),
+        ("V6", {"entry_underlying": 100, "stop_underlying_pct": -0.1}),
+        ("V6", {"entry_underlying": 100, "stop_underlying_pct": 1.1}),
+    ])
+    def test_v5_v6_reject_invalid_parameter_boundaries(policy, extra):
+>       with pytest.raises(ValueError):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+test_exit_path.py:412: Failed
+=============================== warnings summary ===============================
+../../../Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html
+    warnings.warn(  # deprecated in 14.0; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html
+
+-- Docs: https://docs.pytest.org/en/stable/howto/capture-warnings.html
+FAILED test_exit_path.py::test_v5_v6_reject_invalid_parameter_boundaries[V5-extra2]
+1 failed, 52 passed, 1 warning in 0.64s
+```
+
+최종 검증:
+
+```text
+241 passed, 1 warning in 2.04s
+```
 
 ## 9. Review log
 
-_(비어 있음 — reviewer가 작성)_
+### Round 1
+**Verdict:** changes requested (tests only)
+
+검증: 전체 228 passed(기준선 212). 코드 읽기: `_trigger_reason` 분리, V2~V6 규칙·경계·방향, `pt=None`, V0 실행 공유 모두 지시대로. 변이 재주입 19건 중 **17건 검출, 2건 생존**(코드는 맞음, 테스트 공백):
+1. **V6 `bull_put` 분기의 분모**를 `entry_underlying`에서 `S`로 바꿔도 통과(`bear_call` 분기 분모만 단언됨 — 형제 분기 누락이 또 발생).
+2. **`stop_account_pct == 0`을 허용해도 통과**(검증 `0 < pct <= 1`을 `0 <= pct`로 바꿔도 안 걸림). V6의 `stop_underlying_pct == 0`, V5의 `account_equity <= 0`, V6 `entry_underlying <= 0` 경계도 함께 단언하라.
+
+### 라운드 2 수정 요청 (executor)
+`src/exit_path.py`는 **수정하지 마라**. `tests/test_exit_path.py`에: ① V6 `bull_put`에서 분모가 `entry_underlying`임을 잡는 테스트(`S`와 `S0`가 크게 다른 합성 경로, 임계 경계가 분모에 따라 달라지게), ② V5/V6 파라미터 경계 검증 테스트(0, 음수, 1 초과, 정확히 1은 허용)를 추가하고, 위 2개 변이 주입 시 **실제 pytest 실패 출력 원문**을 §8 「라운드 2」에 붙여라. 감점 사유 먼저.
+
+### Round 2
+**Verdict:** approved
+
+- 직접 검증: 전체 241 passed(기준선 212). `src/exit_path.py`는 라운드 1과 동일(diff 없음).
+- 라운드 1 생존 변이 2건(V6 `bull_put` 분모, 파라미터 경계)과 경계 변형 9건(V5/V6 pct 하한·상한, equity/entry_underlying 0) 재주입해 **전부 검출**.
+- failure_log: 라운드 1 반려 기록 있음.

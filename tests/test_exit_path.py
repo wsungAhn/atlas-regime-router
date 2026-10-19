@@ -329,3 +329,146 @@ def test_v0_negative_mid_markup_adds_absolute_five_percent(monkeypatch):
     result = run_exit_path(position(), bars([100]), pd.Series(dtype=float), live_close_path="limit_fallback",
                            friction=friction_for(0.5), **kwargs(pt=0.5))
     assert result["close_debit"] == pytest.approx(-1.90)
+
+
+def test_v2_min_hold_boundary_and_pt_still_applies(monkeypatch):
+    b = bars([100, 100, 100, 100])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: -1.0)
+    common = kwargs(pt=2.0, sl=-0.5, end_at=b.index[-1], friction=friction_for(1.0))
+    v0 = run_exit_path(position(), b, pd.Series(dtype=float), **common)
+    v2 = run_exit_path(position(), b, pd.Series(dtype=float), policy="V2", entry_ts=b.index[0] - pd.Timedelta(minutes=15), **common)
+    assert v0["exit_ts"] == b.index[0]
+    assert v2["exit_ts"] == b.index[3]
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    pt = run_exit_path(position(), b, pd.Series(dtype=float), policy="V2", entry_ts=b.index[0] - pd.Timedelta(minutes=15),
+                       **{**common, "pt": 0.5})
+    assert pt["exit_ts"] == b.index[0]
+
+
+def test_v3_no_stop_and_pt_none(monkeypatch):
+    b = bars([100, 100, 100])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: -2.0)
+    assert run_exit_path(position(), b, pd.Series(dtype=float), policy="V3", friction=friction_for(1.0), **kwargs(pt=2.0, sl=None)) is None
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    result = run_exit_path(position(), b, pd.Series(dtype=float), policy="V3", friction=friction_for(1.0), **kwargs(pt=0.5, sl=None))
+    assert result["exit_reason"] == "profit_target"
+    assert run_exit_path(position(), b, pd.Series(dtype=float), policy="V3", friction=friction_for(1.0), **kwargs(pt=None, sl=None)) is None
+
+
+@pytest.mark.parametrize("spread, values, breach", [("bull_put", [100, 100, 99], 2), ("bear_call", [100, 100, 101], 2)])
+def test_v4_underlying_breach_is_strict_and_directional(monkeypatch, spread, values, breach):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 0.0)
+    result = run_exit_path(position(spread), bars(values), pd.Series(dtype=float), policy="V4", friction=friction_for(1.0), **kwargs(pt=2.0, sl=-1.0))
+    assert result["exit_ts"] == bars(values).index[breach]
+    equal = run_exit_path(position(spread), bars(values[:2]), pd.Series(dtype=float), policy="V4", friction=friction_for(1.0), **kwargs(pt=2.0, sl=-1.0))
+    assert equal is None
+
+
+def test_v5_account_stop_boundary_uses_dollars_and_qty(monkeypatch):
+    marks = iter([-0.009, -0.01])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    result = run_exit_path(position(), bars([100, 100]), pd.Series(dtype=float), policy="V5", friction=friction_for(1.0),
+                           account_equity=100, stop_account_pct=0.02, **kwargs(qty=2, pt=2.0, sl=-1.0))
+    assert result["exit_ts"] == bars([100, 100]).index[1]
+    with pytest.raises(ValueError):
+        run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy="V5", **kwargs(pt=2.0, sl=-1.0))
+
+
+@pytest.mark.parametrize("spread, values", [("bull_put", [100, 95]), ("bear_call", [100, 105])])
+def test_v6_underlying_move_boundary_and_direction(monkeypatch, spread, values):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 0.0)
+    result = run_exit_path(position(spread), bars(values), pd.Series(dtype=float), policy="V6", friction=friction_for(1.0),
+                           entry_underlying=100, stop_underlying_pct=0.05, **kwargs(pt=2.0, sl=-1.0))
+    assert result["exit_ts"] == bars(values).index[1]
+    favorable = [100, 105] if spread == "bull_put" else [100, 95]
+    assert run_exit_path(position(spread), bars(favorable), pd.Series(dtype=float), policy="V6", friction=friction_for(1.0),
+                         entry_underlying=100, stop_underlying_pct=0.05, **kwargs(pt=2.0, sl=-1.0)) is None
+    with pytest.raises(ValueError):
+        run_exit_path(position(spread), bars([100]), pd.Series(dtype=float), policy="V6", **kwargs(pt=2.0, sl=-1.0))
+
+
+def test_v6_bull_put_uses_entry_underlying_as_denominator(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 0.0)
+    b = bars([181.8, 180.0])
+    result = run_exit_path(position("bull_put"), b, pd.Series(dtype=float), policy="V6",
+                           friction=friction_for(1.0), entry_underlying=200.0,
+                           stop_underlying_pct=0.10, **kwargs(pt=2.0, sl=-1.0))
+    assert result["exit_ts"] == b.index[1]
+
+
+@pytest.mark.parametrize("policy, extra", [
+    ("V5", {"account_equity": 0, "stop_account_pct": 0.5}),
+    ("V5", {"account_equity": -1, "stop_account_pct": 0.5}),
+    ("V5", {"account_equity": 100, "stop_account_pct": 0}),
+    ("V5", {"account_equity": 100, "stop_account_pct": -0.1}),
+    ("V5", {"account_equity": 100, "stop_account_pct": 1.1}),
+    ("V6", {"entry_underlying": 0, "stop_underlying_pct": 0.5}),
+    ("V6", {"entry_underlying": -1, "stop_underlying_pct": 0.5}),
+    ("V6", {"entry_underlying": 100, "stop_underlying_pct": 0}),
+    ("V6", {"entry_underlying": 100, "stop_underlying_pct": -0.1}),
+    ("V6", {"entry_underlying": 100, "stop_underlying_pct": 1.1}),
+])
+def test_v5_v6_reject_invalid_parameter_boundaries(policy, extra):
+    with pytest.raises(ValueError):
+        run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy=policy,
+                       friction=friction_for(1.0), **extra, **kwargs(pt=2.0, sl=-1.0))
+
+
+@pytest.mark.parametrize("policy, extra", [
+    ("V5", {"account_equity": 100, "stop_account_pct": 1.0}),
+    ("V6", {"entry_underlying": 100, "stop_underlying_pct": 1.0}),
+])
+def test_v5_v6_accept_one_boundary(monkeypatch, policy, extra):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 0.0)
+    assert run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy=policy,
+                         friction=friction_for(1.0), **extra, **kwargs(pt=2.0, sl=-1.0)) is None
+
+
+@pytest.mark.parametrize("policy, extra", [("V0", {}), ("V4", {}), ("V5", {"account_equity": 100, "stop_account_pct": 0.5}),
+                                             ("V6", {"entry_underlying": 100, "stop_underlying_pct": 0.5})])
+def test_pt_none_disables_profit_target_but_keeps_stop(monkeypatch, policy, extra):
+    marks = iter([1.0, -1.0])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    values = [100, 95] if policy == "V6" else [100, 90]
+    if policy == "V5":
+        extra["stop_account_pct"] = 0.01
+    if policy == "V6":
+        extra["stop_underlying_pct"] = 0.05
+    result = run_exit_path(position(), bars(values), pd.Series(dtype=float), policy=policy, friction=friction_for(1.0),
+                           **extra, **kwargs(pt=None, sl=-0.5))
+    assert result["exit_reason"] == "stop_loss"
+
+
+def test_new_policies_keep_limit_fallback_execution(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    monkeypatch.setattr(exit_path, "fill_debit", lambda legs, s: 10.0 if s == 1.0 else next(fills))
+    for policy, extra in [("V4", {}), ("V5", {"account_equity": 100, "stop_account_pct": 0.01})]:
+        fills = iter([99.0, 99.0, 1.0])
+        result = run_exit_path(position(), bars([99, 99, 99]), pd.Series(dtype=float), policy=policy,
+                               live_close_path="limit_fallback", friction=friction_for(0.66),
+                               **extra, **kwargs(pt=0.5, sl=-1.0, end_at=pd.Timestamp("2026-01-02 10:00")))
+        assert result["n_limit_retries"] == 2
+
+
+def test_policy_registry_and_required_validation():
+    for policy in ["V2", "V3", "V4", "V5", "V6"]:
+        extra = {"entry_ts": pd.Timestamp("2026-01-02 09:30")} if policy == "V2" else {}
+        if policy == "V5":
+            extra.update(account_equity=100, stop_account_pct=1.0)
+        if policy == "V6":
+            extra.update(entry_underlying=100, stop_underlying_pct=0.1)
+        assert run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy=policy,
+                             friction=friction_for(1.0), **extra, **kwargs(pt=2.0, sl=-1.0)) is None
+    with pytest.raises(ValueError):
+        run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy="bad", **kwargs())
+
+
+@pytest.mark.parametrize("policy, extra", [("V4", {}), ("V5", {"account_equity": 100, "stop_account_pct": 1.0}),
+                                             ("V6", {"entry_underlying": 100, "stop_underlying_pct": 1.0})])
+def test_new_policies_use_legacy_mark_for_profit_target(monkeypatch, policy, extra):
+    monkeypatch.setattr(exit_path, "price_spread_to_close", lambda **args: 0.5)
+    result = run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy=policy,
+                           **extra, **kwargs(pt=0.25, sl=-1.0))
+    assert result["exit_reason"] == "profit_target"
+    assert result["trigger_mark_pnl_pct"] == pytest.approx(0.5)
