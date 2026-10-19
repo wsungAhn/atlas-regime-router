@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import src.exit_path as exit_path
 from src.exit_path import legacy_window, run_exit_path, scaled_table
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -142,10 +143,22 @@ def test_validation_errors_and_scaled_table():
     with pytest.raises(ValueError, match="4-leg"):
         run_exit_path({"legs": position()["legs"] * 2, "credit": 1}, bars([100]), pd.Series(dtype=float), **kwargs())
     with pytest.raises(ValueError):
+        run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy="V2", **kwargs())
+    with pytest.raises(ValueError):
         run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy="V1", **kwargs())
     bad = {"table": table(), "beta": 0, "h_mult": 1, "s": 0.5, "k": 0, "rng": None}
+    assert run_exit_path(position(), bars([100]), pd.Series(dtype=float), friction=bad, **kwargs()) is None
+    for invalid in (-0.01, 1.01):
+        with pytest.raises(ValueError):
+            run_exit_path(position(), bars([100]), pd.Series(dtype=float), friction={**bad, "s": invalid}, **kwargs())
     with pytest.raises(ValueError):
-        run_exit_path(position(), bars([100]), pd.Series(dtype=float), friction=bad, **kwargs())
+        run_exit_path(position(), bars([100]), pd.Series(dtype=float), live_close_path="bad", **kwargs())
+    with pytest.raises(ValueError):
+        run_exit_path(position(), bars([100]), pd.Series(dtype=float), live_close_path="limit_fallback", **kwargs())
+    assert exit_path.s_orats(2) == pytest.approx(0.66)
+    assert exit_path.s_orats(4) == pytest.approx(0.56)
+    with pytest.raises(ValueError):
+        exit_path.s_orats(3)
     original = table()
     scaled = scaled_table(original, 1.5)
     assert np.allclose(scaled["h"], original["h"] * 1.5)
@@ -156,3 +169,163 @@ def test_expiry_uses_intrinsic_value():
     b = pd.DataFrame({"close": [94]}, index=pd.to_datetime(["2026-01-30 09:30"]))
     result = run_exit_path(position(), b, pd.Series(dtype=float), **kwargs(expiry=date(2026, 1, 30), pt=2.0, sl=-1.0, end_at=pd.Timestamp("2026-01-30 10:00")))
     assert result["close_debit"] == pytest.approx(5.0)
+
+
+def friction_for(s):
+    return {"table": table(0.1), "beta": 0.0, "h_mult": 1.0, "s": s, "k": 0.0, "rng": None}
+
+
+def test_v1_limit_fill_rule(monkeypatch):
+    b = bars([100, 100, 100])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    immediate = run_exit_path(position(), b, pd.Series(dtype=float), policy="V1", friction=friction_for(0.5), **kwargs(pt=0.5))
+    assert immediate["close_debit"] == pytest.approx(1.0)
+    assert immediate["n_limit_retries"] == 0
+
+    market = run_exit_path(position(), b, pd.Series(dtype=float), policy="V1", friction=friction_for(0.66), **kwargs(pt=0.5))
+    assert market["n_limit_retries"] == 3
+    assert market["close_debit"] == pytest.approx(1.2)
+
+    mids = iter([[2.0, 1.0], [1.95, 1.05], [2.0, 1.0]])
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: next(mids))
+    later = run_exit_path(position(), b, pd.Series(dtype=float), policy="V1", friction=friction_for(0.66), **kwargs(pt=0.5))
+    assert later["n_limit_retries"] == 1
+    assert later["close_debit"] == pytest.approx(1.0)
+
+
+def test_v0_limit_fallback_retry_reprices_and_cancels(monkeypatch):
+    b = bars([100, 100, 100])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    mids = iter([[2.0, 1.0], [1.8, 1.0], [2.0, 1.0]])
+    halves = iter([[0.1, 0.1], [0.01, 0.01], [0.1, 0.1]])
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: next(mids))
+    monkeypatch.setattr(exit_path, "leg_halves", lambda *args: next(halves))
+    result = run_exit_path(position(), b, pd.Series(dtype=float), live_close_path="limit_fallback",
+                           friction=friction_for(0.9), **kwargs(pt=0.5))
+    assert result["close_debit"] == pytest.approx(0.84)
+    assert result["n_limit_retries"] == 1
+
+    mids = iter([[2.0, 1.0], [2.0, 1.0], [2.0, 1.0]])
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: next(mids))
+    halves = iter([[0.1, 0.1], [0.1, 0.1], [0.1, 0.1]])
+    monkeypatch.setattr(exit_path, "leg_halves", lambda *args: next(halves))
+    marks = iter([1.0, 0.0, 1.0])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    assert run_exit_path(position(), b, pd.Series(dtype=float), live_close_path="limit_fallback",
+                         friction=friction_for(0.9), **kwargs(pt=0.5)) is None
+
+
+def test_v1_trigger_metadata_and_limit_is_fixed_without_rechecking(monkeypatch):
+    b = bars([100, 100, 100])
+    marks = iter([1.0, -1.0, -1.0])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    result = run_exit_path(position(), b, pd.Series(dtype=float), policy="V1", friction=friction_for(0.66), **kwargs(pt=0.5))
+    assert result["exit_reason"] == "profit_target"
+    assert result["trigger_mark_pnl_pct"] == pytest.approx(1.0)
+    assert result["exit_ts"] == b.index[2]
+
+
+def test_limit_window_end_returns_none(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    assert run_exit_path(position(), bars([100]), pd.Series(dtype=float), policy="V1", friction=friction_for(0.66), **kwargs(pt=0.5)) is None
+    assert run_exit_path(position(), bars([100]), pd.Series(dtype=float), live_close_path="limit_fallback",
+                         friction=friction_for(0.9), **kwargs(pt=0.5)) is None
+
+
+def test_v0_limit_fallback_rounds_limit_price(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [1.83, 1.0])
+    result = run_exit_path(position(), bars([100]), pd.Series(dtype=float), live_close_path="limit_fallback",
+                           friction=friction_for(0.5), **kwargs(pt=0.5))
+    assert result["close_debit"] == pytest.approx(0.87)
+
+
+def test_v1_limit_window_ignores_trigger_rechecks(monkeypatch):
+    marks = iter([1.0, 0.0, 0.0])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    result = run_exit_path(position(), bars([100, 100, 100]), pd.Series(dtype=float), policy="V1",
+                           friction=friction_for(0.66), **kwargs(pt=0.5))
+    assert result["exit_ts"] == bars([100, 100, 100]).index[2]
+    assert result["exit_reason"] == "profit_target"
+    assert result["n_limit_retries"] == 3
+
+
+def test_v0_negative_mid_uses_absolute_markup(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    monkeypatch.setattr(exit_path, "spread_mid_debit", lambda *args: -2.0)
+    monkeypatch.setattr(exit_path, "fill_debit", lambda legs, s: -2.0)
+    result = run_exit_path(position(), bars([100]), pd.Series(dtype=float), live_close_path="limit_fallback",
+                           friction=friction_for(0.5), **kwargs(pt=0.5))
+    assert result["close_debit"] == pytest.approx(-1.9)
+
+
+def test_v0_first_and_retry_limits_are_rounded(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    mid_debits = iter([1.231, 1.234])
+    monkeypatch.setattr(exit_path, "spread_mid_debit", lambda *args: next(mid_debits))
+    fills = iter([99.0, 1.292, 99.0, 1.297])
+    monkeypatch.setattr(exit_path, "fill_debit", lambda legs, s: next(fills))
+    result = run_exit_path(position(), bars([100, 100]), pd.Series(dtype=float), live_close_path="limit_fallback",
+                           friction=friction_for(0.5), **kwargs(pt=0.5))
+    assert result["close_debit"] == pytest.approx(1.30)
+    assert result["n_limit_retries"] == 1
+
+
+def test_v0_trigger_clear_cancels_and_retrigger_resets_retries(monkeypatch):
+    marks = iter([1.0, 0.0, 1.0])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    fills = iter([99.0, 2.0, 99.0, 99.0, 1.0])
+    monkeypatch.setattr(exit_path, "fill_debit", lambda legs, s: next(fills))
+    result = run_exit_path(position(), bars([100, 100, 100]), pd.Series(dtype=float),
+                           live_close_path="limit_fallback", friction=friction_for(0.5), **kwargs(pt=0.5))
+    assert result["n_limit_retries"] == 0
+
+
+def test_v1_metadata_stays_at_t0_when_later_mark_changes(monkeypatch):
+    marks = iter([1.0, 0.0, -1.0])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    result = run_exit_path(position(), bars([100, 100, 100]), pd.Series(dtype=float), policy="V1",
+                           friction=friction_for(0.66), **kwargs(pt=0.5))
+    assert result["exit_reason"] == "profit_target"
+    assert result["trigger_mark_pnl_pct"] == pytest.approx(1.0)
+
+
+def test_v0_cleared_order_resets_retry_count_before_retrigger(monkeypatch):
+    marks = iter([1.0, 1.0, 0.0, 1.0, 1.0])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    fills = iter([99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 99.0, 1.0, 1.0])
+    monkeypatch.setattr(exit_path, "fill_debit", lambda legs, s: next(fills))
+    result = run_exit_path(position(), bars([100, 100, 100, 100, 100]), pd.Series(dtype=float),
+                           live_close_path="limit_fallback", friction=friction_for(0.5),
+                           **kwargs(pt=0.5, end_at=pd.Timestamp("2026-01-02 11:00")))
+    assert result["n_limit_retries"] == 1
+
+
+def test_v1_market_conversion_keeps_original_trigger_metadata(monkeypatch):
+    marks = iter([1.0, 0.0, 0.0, 0.0])
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: next(marks))
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    result = run_exit_path(position(), bars([100, 100, 100, 100]), pd.Series(dtype=float), policy="V1",
+                           friction=friction_for(0.66), **kwargs(pt=0.5))
+    assert result["n_limit_retries"] == 3
+    assert result["exit_reason"] == "profit_target"
+    assert result["trigger_mark_pnl_pct"] == pytest.approx(1.0)
+
+
+def test_v0_negative_mid_markup_adds_absolute_five_percent(monkeypatch):
+    monkeypatch.setattr(exit_path, "mark_pnl_pct", lambda *args: 1.0)
+    monkeypatch.setattr(exit_path, "leg_mids", lambda *args: [2.0, 1.0])
+    monkeypatch.setattr(exit_path, "spread_mid_debit", lambda *args: -2.0)
+    monkeypatch.setattr(exit_path, "fill_debit", lambda legs, s: -2.0)
+    result = run_exit_path(position(), bars([100]), pd.Series(dtype=float), live_close_path="limit_fallback",
+                           friction=friction_for(0.5), **kwargs(pt=0.5))
+    assert result["close_debit"] == pytest.approx(-1.90)

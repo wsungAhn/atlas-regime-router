@@ -15,13 +15,28 @@ from friction import (  # noqa: E402
     leg_mids,
     mark_pnl_pct,
     parse_occ,
+    spread_mid_debit,
 )
 from vendor.credit_spread_simulator import price_spread_to_close  # noqa: E402
 
 
 POLICY_V0 = "V0"
+POLICY_V1 = "V1"
+LIVE_CLOSE_PATH_LIMIT_FALLBACK = "limit_fallback"
+LIVE_CLOSE_PATH_MARKET = "market"
 MARKET_S = 1.0
 OPTION_MULTIPLIER = 100.0
+LIMIT_FALLBACK_MARKUP = 0.05
+LIMIT_FILL_EPSILON = 1e-12
+V1_LIMIT_POLLS = 3
+ORATS_S_BY_LEGS = {2: 0.66, 4: 0.56}
+
+
+def s_orats(n_legs):
+    try:
+        return ORATS_S_BY_LEGS[n_legs]
+    except (KeyError, TypeError):
+        raise ValueError("s_orats supports only 2 or 4 legs") from None
 
 
 def scaled_table(table: pd.DataFrame, h_mult: float) -> pd.DataFrame:
@@ -38,6 +53,18 @@ def legacy_window(entry_date, exit_date):
     entry = pd.Timestamp(entry_date).normalize()
     end = pd.Timestamp(exit_date).normalize()
     return entry + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1), end + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+
+
+def _exit_result(position, qty, bar_time, reason, trigger_mark, close_debit, n_polls, n_limit_retries):
+    return {
+        "exit_ts": bar_time,
+        "exit_reason": reason,
+        "trigger_mark_pnl_pct": float(trigger_mark),
+        "close_debit": float(close_debit),
+        "realized_pnl": (float(position["credit"]) - float(close_debit)) * OPTION_MULTIPLIER * float(qty),
+        "n_polls": n_polls,
+        "n_limit_retries": n_limit_retries,
+    }
 
 
 def _validate_position(position):
@@ -71,7 +98,8 @@ def _spread_type(position):
     raise ValueError("legs do not form a vertical credit spread")
 
 
-def _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, start_after, end_at, pt, sl, friction, iv_scale):
+def _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, live_close_path,
+                     start_after, end_at, pt, sl, friction, iv_scale):
     _validate_position(position)
     if not isinstance(bars, pd.DataFrame) or "close" not in bars.columns:
         raise ValueError("bars must be a DataFrame with a close column")
@@ -89,8 +117,12 @@ def _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, s
         raise ValueError("r must be numeric")
     if not isinstance(qty, (int, float)) or qty <= 0:
         raise ValueError("qty must be positive")
-    if policy != POLICY_V0:
-        raise ValueError("only policy V0 is supported")
+    if policy not in {POLICY_V0, POLICY_V1}:
+        raise ValueError("policy must be V0 or V1")
+    if live_close_path not in {None, LIVE_CLOSE_PATH_MARKET, LIVE_CLOSE_PATH_LIMIT_FALLBACK}:
+        raise ValueError("live_close_path must be None, market, or limit_fallback")
+    if friction is None and (policy == POLICY_V1 or live_close_path == LIVE_CLOSE_PATH_LIMIT_FALLBACK):
+        raise ValueError("limit paths require friction")
     if not isinstance(pt, (int, float)) or not isinstance(sl, (int, float)):
         raise ValueError("pt and sl must be numeric")
     if not isinstance(iv_scale, (int, float)) or iv_scale <= 0:
@@ -105,13 +137,15 @@ def _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, s
         required = {"table", "beta", "h_mult", "s", "k", "rng"}
         if set(friction) != required:
             raise ValueError("friction must contain exactly table, beta, h_mult, s, k, rng")
-        if friction["s"] != MARKET_S:
-            raise ValueError("T4b1 supports market s=1 only")
+        if not isinstance(friction["s"], (int, float)) or not 0.0 <= friction["s"] <= 1.0:
+            raise ValueError("friction s must be in [0, 1]")
 
 
 def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=POLICY_V0,
-                  start_after, end_at, pt=0.5, sl=-1.0, friction=None, iv_scale=1.0):
-    _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, start_after, end_at, pt, sl, friction, iv_scale)
+                  live_close_path=None, start_after, end_at, pt=0.5, sl=-1.0,
+                  friction=None, iv_scale=1.0):
+    _validate_inputs(position, bars, mtm_iv, expiry, entry_iv, r, qty, policy, live_close_path,
+                     start_after, end_at, pt, sl, friction, iv_scale)
     spread_type, short_strike, long_strike = _spread_type(position)
     expiry_day = pd.Timestamp(expiry).normalize()
     start = pd.Timestamp(start_after)
@@ -119,6 +153,11 @@ def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=PO
     table = scaled_table(friction["table"], friction["h_mult"]) if friction is not None else None
     window = bars.loc[(bars.index > start) & (bars.index <= end)]
     n_polls = 0
+    pending_limit = False
+    limit_debit = None
+    limit_reason = None
+    limit_trigger_mark = None
+    limit_misses = 0
     for bar_time, row in window.iterrows():
         n_polls += 1
         S = float(row["close"])
@@ -139,14 +178,53 @@ def run_exit_path(position, bars, mtm_iv, *, expiry, entry_iv, r, qty, policy=PO
                 legs.append({"side": leg["side"], "bid": max(mid - half, 0.0), "ask": mid + half})
             close_debit = fill_debit(legs, MARKET_S)
         reason = "profit_target" if mark_pnl >= pt else "stop_loss" if mark_pnl <= sl else None
+
+        if policy == POLICY_V1 and pending_limit:
+            if fill_debit(legs, friction["s"]) <= limit_debit + LIMIT_FILL_EPSILON:
+                close_debit = limit_debit
+                return _exit_result(position, qty, bar_time, limit_reason, limit_trigger_mark, close_debit,
+                                    n_polls, limit_misses)
+            limit_misses += 1
+            if limit_misses == V1_LIMIT_POLLS:
+                close_debit = fill_debit(legs, MARKET_S)
+                return _exit_result(position, qty, bar_time, limit_reason, limit_trigger_mark, close_debit,
+                                    n_polls, limit_misses)
+            continue
+
+        if policy == POLICY_V0 and live_close_path == LIVE_CLOSE_PATH_LIMIT_FALLBACK and pending_limit:
+            if reason is None:
+                pending_limit = False
+                limit_debit = None
+                limit_misses = 0
+            else:
+                limit_misses += 1
+                mid_debit = spread_mid_debit(position, mids)
+                limit_debit = round(mid_debit + LIMIT_FALLBACK_MARKUP * abs(mid_debit), 2)
+                if fill_debit(legs, friction["s"]) <= limit_debit + LIMIT_FILL_EPSILON:
+                    close_debit = limit_debit
+                    return _exit_result(position, qty, bar_time, reason, mark_pnl, close_debit,
+                                        n_polls, limit_misses)
+                continue
+
         if reason is not None:
-            return {
-                "exit_ts": bar_time,
-                "exit_reason": reason,
-                "trigger_mark_pnl_pct": float(mark_pnl),
-                "close_debit": float(close_debit),
-                "realized_pnl": (float(position["credit"]) - float(close_debit)) * OPTION_MULTIPLIER * float(qty),
-                "n_polls": n_polls,
-                "n_limit_retries": 0,
-            }
+            if policy == POLICY_V1:
+                pending_limit = True
+                limit_reason = reason
+                limit_trigger_mark = mark_pnl
+                limit_debit = spread_mid_debit(position, mids)
+                limit_misses = 0
+                if fill_debit(legs, friction["s"]) <= limit_debit + LIMIT_FILL_EPSILON:
+                    close_debit = limit_debit
+                    return _exit_result(position, qty, bar_time, reason, mark_pnl, close_debit, n_polls, 0)
+                limit_misses = 1
+                continue
+            if live_close_path == LIVE_CLOSE_PATH_LIMIT_FALLBACK:
+                pending_limit = True
+                mid_debit = spread_mid_debit(position, mids)
+                limit_debit = round(mid_debit + LIMIT_FALLBACK_MARKUP * abs(mid_debit), 2)
+                if fill_debit(legs, friction["s"]) <= limit_debit + LIMIT_FILL_EPSILON:
+                    close_debit = limit_debit
+                    return _exit_result(position, qty, bar_time, reason, mark_pnl, close_debit, n_polls, 0)
+                continue
+            return _exit_result(position, qty, bar_time, reason, mark_pnl, close_debit, n_polls, 0)
     return None
