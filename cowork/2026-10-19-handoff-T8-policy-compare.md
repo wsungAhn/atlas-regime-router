@@ -1,6 +1,6 @@
 # Codex Handoff — T8 exploratory replay policy comparison (hold-to-expiry, stop A vs C) — 2026-10-19
 
-> **상태(Status):** `진행중 / in-progress (round 3 요청)`
+> **상태(Status):** `완료 / done`
 >
 > **시작 기록(Started by):** author `session=a43dac5d-41e1-436c-bb1d-f9c0b1f8bc9d machine=mac-studio started=2026-10-19T14:30-0700`
 >
@@ -117,6 +117,89 @@ Mutation validation (raw pytest failure output; one mutation per run):
 The mutation output above is the raw pytest failure summary for section 5(a)–(m)
 after each mutation was injected and before the implementation was restored.
 
+Round 2 requested tests added to `tests/test_friction_compare.py`:
+
+- `test_summarize_worst_pnl_is_the_minimum_realized_pnl`
+- `test_binding_condor_uses_the_larger_wing_width`
+- `test_summarize_stop_rate_is_stop_rows_over_common_rows`
+
+Round 2 mutation validation (each mutation was injected into `src/friction_compare.py`,
+run against its targeted test, and restored; raw pytest failure output):
+
+Worst P&L mutation (`min(pnl)` → `max(pnl)`):
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_____________ test_summarize_worst_pnl_is_the_minimum_realized_pnl _____________
+
+    def test_summarize_worst_pnl_is_the_minimum_realized_pnl():
+        rows = [row("SPY", "2026-01-01", 3), row("SPY", "2026-01-02", -2),
+                row("SPY", "2026-01-03", 1)]
+        result = fc.summarize({"X0": {"rows": rows}, "A1": {"rows": rows}}, n_resamples=10)
+>       assert result["variants"]["X0"]["worst_pnl"] == -2
+E       assert 3 == -2
+
+tests/test_friction_compare.py:105: AssertionError
+=============================== warnings summary ===============================
+../../atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 failed, 1 warning in 0.51s
+```
+
+Condor width mutation (`max(...)` → `min(...)` in `_width`):
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________________ test_binding_condor_uses_the_larger_wing_width ________________
+
+    def test_binding_condor_uses_the_larger_wing_width():
+        episodes = [{"symbol": "SPY", "entry_ts": "2026-01-01",
+                     "legs": ["SPY260117P00400000", "SPY260117P00390000",
+                               "SPY260117C00450000", "SPY260117C00470000"],
+                     "limit_credit": 2.0, "qty": 1}]
+        meta = fc._binding_metadata(episodes, 100)
+>       assert meta[("SPY", pd.Timestamp("2026-01-01"))]["max_loss_over_equity"] == 18.0
+E       assert 8.0 == 18.0
+
+tests/test_friction_compare.py:114: AssertionError
+=============================== warnings summary ===============================
+../../atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 failed, 1 warning in 0.53s
+```
+
+Stop-rate mutation (`len(stop_rows)` → `len(rows)`):
+
+```text
+F                                                                        [100%]
+=================================== FAILURES ===================================
+____________ test_summarize_stop_rate_is_stop_rows_over_common_rows ____________
+
+    def test_summarize_stop_rate_is_stop_rows_over_common_rows():
+        rows = [row("SPY", "2026-01-01", -1, reason="stop_loss"),
+                row("SPY", "2026-01-02", 2), row("SPY", "2026-01-03", 4)]
+        result = fc.summarize({"X0": {"rows": rows}, "A1": {"rows": rows}}, n_resamples=10)
+>       assert result["variants"]["A1"]["stop_rate"] == 1 / 3
+E       assert 1.0 == (1 / 3)
+
+tests/test_friction_compare.py:121: AssertionError
+=============================== warnings summary ===============================
+../../atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1 failed, 1 warning in 0.52s
+```
+
 Scope check: only the two requested source/test files and this handoff section were changed by this execution; pre-existing untracked `data/` and `reports/friction/` entries were left untouched.
 
 ## 9. Reviewer log (Claude writes here)
@@ -137,6 +220,7 @@ failure_log: cefb7bc9
 
 ### Round 2
 **Verdict:** changes requested (소규모)
+failure_log: (round-2 기록)
 
 329 passed. 로더 재사용·main 구조는 수정됨; 실데이터로 `main`을 돌려(4분) 보고서 생성 확인. 내가 주입한 변이 10건 중 **3건 생존**:
 1. `worst_pnl`을 `min(pnl)`→`max(pnl)` — 테스트가 worst를 리터럴로 단언하지 않는다.
@@ -144,3 +228,7 @@ failure_log: cefb7bc9
 3. `stop_rate`를 `len(stop_rows)/len(rows)`→`len(rows)/len(rows)` — `stop_rate`를 리터럴(예: 3행 중 1행 stop_loss → 1/3)로 단언.
 세 항목에 테스트를 추가하고 각 변이를 재주입해 §8에 pytest 실패 원문을 붙인다. 다른 파일/구현 변경 금지.
 
+### Round 3
+**Verdict:** approved
+
+332 passed 재실행. 생존 3건(worst_pnl, 콘도르 폭 max, stop_rate) 재주입 모두 사망. 실데이터 실행(4분)으로 보고서·JSON 경로 검증. 한계: 보고서 내용은 합성 테스트가 아닌 실행으로 확인.

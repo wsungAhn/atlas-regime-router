@@ -1,0 +1,684 @@
+{
+  "meta": {
+    "data_period": [
+      "2026-08-20T13:45:00",
+      "2026-10-19T16:15:00"
+    ],
+    "date": "2026-10-19",
+    "equity": 50000.0,
+    "exclusion_counts": {
+      "crypto": 14472,
+      "entry_with_error": 1,
+      "leg_mismatch": 1,
+      "open_no_close": 387
+    },
+    "missing_symbols": [],
+    "n_common": {
+      "central": 119,
+      "pessimistic": 119
+    },
+    "n_dropped": {
+      "central": 0,
+      "pessimistic": 0
+    },
+    "n_episodes_total": 119,
+    "r": 0.045,
+    "resamples": 2000,
+    "s": 0.5,
+    "seed": 20260930
+  },
+  "summary": {
+    "central": {
+      "n_common": 119,
+      "n_dropped": 0,
+      "variants": {
+        "A1": {
+          "binding": {
+            "max": 0.19698,
+            "median": 0.09114,
+            "structurally_untriggerable_rate": 0.09243697478991597
+          },
+          "by_regime": {
+            "range": {
+              "mean_pnl": -421.9267516492807,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -172.83261091440835,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -580.7090471337268,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 54,
+            "stop_loss": 65
+          },
+          "mean_pnl": -438.97991002591425,
+          "median_minutes_held": 8369.777805383334,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -138.28690388453924,
+              178.91972221849946
+            ],
+            "mean": 19.633214646819944
+          },
+          "stop_rate": 0.5462184873949579,
+          "total_pnl": -52238.6092930838,
+          "win_rate": 0.44537815126050423,
+          "worst_pnl": -4809.528274324448
+        },
+        "A2": {
+          "binding": {
+            "max": 0.19698,
+            "median": 0.09114,
+            "structurally_untriggerable_rate": 0.18487394957983194
+          },
+          "by_regime": {
+            "range": {
+              "mean_pnl": -362.43748607889944,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -49.13681064871784,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -757.6819116166886,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 77,
+            "stop_loss": 42
+          },
+          "mean_pnl": -469.3298662655423,
+          "median_minutes_held": 10229.861339833333,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -163.31982252515283,
+              136.0606950502095
+            ],
+            "mean": -10.716741592808116
+          },
+          "stop_rate": 0.35294117647058826,
+          "total_pnl": -55850.25408559953,
+          "win_rate": 0.6218487394957983,
+          "worst_pnl": -5799.4691843966675
+        },
+        "A5": {
+          "binding": {
+            "max": 0.19698,
+            "median": 0.09114,
+            "structurally_untriggerable_rate": 0.31092436974789917
+          },
+          "by_regime": {
+            "range": {
+              "mean_pnl": -440.174942641055,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -113.57927159590413,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -627.1551218111974,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 93,
+            "stop_loss": 26
+          },
+          "mean_pnl": -453.26803121852254,
+          "median_minutes_held": 10424.5271094,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -181.25130904915906,
+              168.73052678426848
+            ],
+            "mean": 5.34509345421172
+          },
+          "stop_rate": 0.2184873949579832,
+          "total_pnl": -53938.89571500418,
+          "win_rate": 0.7142857142857143,
+          "worst_pnl": -5799.4691843966675
+        },
+        "C2": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -201.69138154832575,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -353.233764435137,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -803.8881694815819,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 50,
+            "stop_loss": 69
+          },
+          "mean_pnl": -496.6728315037845,
+          "median_minutes_held": 8579.841204433333,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -192.89920080205044,
+              104.86130342996466
+            ],
+            "mean": -38.05970683105039
+          },
+          "stop_rate": 0.5798319327731093,
+          "total_pnl": -59104.066948950356,
+          "win_rate": 0.48739495798319327,
+          "worst_pnl": -5953.1923762488
+        },
+        "C3": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -189.4834704454528,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -549.899925868192,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -977.0885192727764,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 74,
+            "stop_loss": 45
+          },
+          "mean_pnl": -609.3647639293964,
+          "median_minutes_held": 10139.45275815,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -432.3800309991363,
+              88.4295225604983
+            ],
+            "mean": -150.75163925666226
+          },
+          "stop_rate": 0.37815126050420167,
+          "total_pnl": -72514.40690759817,
+          "win_rate": 0.5882352941176471,
+          "worst_pnl": -11780.651592313165
+        },
+        "C5": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -128.70848223795238,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -704.0878781995768,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -1087.1974744236131,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 97,
+            "stop_loss": 22
+          },
+          "mean_pnl": -668.4220325967336,
+          "median_minutes_held": 10379.856431566666,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -605.169096820521,
+              137.32774723456197
+            ],
+            "mean": -209.80890792399939
+          },
+          "stop_rate": 0.18487394957983194,
+          "total_pnl": -79542.2218790113,
+          "win_rate": 0.6974789915966386,
+          "worst_pnl": -17098.151026886007
+        },
+        "X0": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -262.6826397415939,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -236.51520479106927,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -723.642516290994,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "profit_target": 54,
+            "stop_loss": 65
+          },
+          "mean_pnl": -458.61312467273416,
+          "median_minutes_held": 3058.8922618,
+          "n": 119,
+          "paired": {
+            "ci": [
+              0.0,
+              0.0
+            ],
+            "mean": 0.0
+          },
+          "stop_rate": 0.5462184873949579,
+          "total_pnl": -54574.961836055365,
+          "win_rate": 0.453781512605042,
+          "worst_pnl": -5799.4691843966675
+        },
+        "X1": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -414.0876274359683,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -163.0590831441029,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -738.4825970567401,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 44,
+            "stop_loss": 75
+          },
+          "mean_pnl": -503.1029619988549,
+          "median_minutes_held": 6854.272756266667,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -131.91498643350243,
+              27.682379210763802
+            ],
+            "mean": -44.48983732612075
+          },
+          "stop_rate": 0.6302521008403361,
+          "total_pnl": -59869.25247786373,
+          "win_rate": 0.36134453781512604,
+          "worst_pnl": -5799.4691843966675
+        },
+        "X2": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -116.29761904761907,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": 133.19999999999982,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -389.37499999999903,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 119
+          },
+          "mean_pnl": -183.21008403361304,
+          "median_minutes_held": 10469.8682996,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -37.84266721473886,
+              579.8424745600669
+            ],
+            "mean": 275.40304063912123
+          },
+          "stop_rate": 0.0,
+          "total_pnl": -21801.999999999953,
+          "win_rate": 0.7899159663865546,
+          "worst_pnl": -8811.0
+        }
+      }
+    },
+    "pessimistic": {
+      "n_common": 119,
+      "n_dropped": 0,
+      "variants": {
+        "A1": {
+          "binding": {
+            "max": 0.19698,
+            "median": 0.09114,
+            "structurally_untriggerable_rate": 0.09243697478991597
+          },
+          "by_regime": {
+            "range": {
+              "mean_pnl": -589.5249106881178,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -303.874617730968,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -750.3696047732303,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 55,
+            "stop_loss": 64
+          },
+          "mean_pnl": -599.7994213477574,
+          "median_minutes_held": 8549.74949065,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -136.37076182772523,
+              240.2547012762968
+            ],
+            "mean": 47.673323500619965
+          },
+          "stop_rate": 0.5378151260504201,
+          "total_pnl": -71376.13114038314,
+          "win_rate": 0.453781512605042,
+          "worst_pnl": -6279.611607657781
+        },
+        "A2": {
+          "binding": {
+            "max": 0.19698,
+            "median": 0.09114,
+            "structurally_untriggerable_rate": 0.18487394957983194
+          },
+          "by_regime": {
+            "range": {
+              "mean_pnl": -616.6522956175888,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -222.33894453422778,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -1003.1288040632649,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 77,
+            "stop_loss": 42
+          },
+          "mean_pnl": -702.6938473998672,
+          "median_minutes_held": 10229.861339833333,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -214.3970408983546,
+              97.03217532596867
+            ],
+            "mean": -55.2211025514899
+          },
+          "stop_rate": 0.35294117647058826,
+          "total_pnl": -83620.56784058419,
+          "win_rate": 0.6218487394957983,
+          "worst_pnl": -8385.885851063336
+        },
+        "A5": {
+          "binding": {
+            "max": 0.19698,
+            "median": 0.09114,
+            "structurally_untriggerable_rate": 0.31092436974789917
+          },
+          "by_regime": {
+            "range": {
+              "mean_pnl": -540.6879811898079,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -315.56581129709934,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -925.7689987593312,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 93,
+            "stop_loss": 26
+          },
+          "mean_pnl": -661.6641044360055,
+          "median_minutes_held": 10424.5271094,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -233.98942359201786,
+              188.4991986453508
+            ],
+            "mean": -14.191359587628103
+          },
+          "stop_rate": 0.2184873949579832,
+          "total_pnl": -78738.02842788465,
+          "win_rate": 0.7142857142857143,
+          "worst_pnl": -10138.085005403556
+        },
+        "C2": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -312.7407806412963,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -503.7604311018035,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -1042.0361572189026,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 50,
+            "stop_loss": 69
+          },
+          "mean_pnl": -671.5546532761551,
+          "median_minutes_held": 8579.841204433333,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -187.501255236539,
+              130.3801071577068
+            ],
+            "mean": -24.081908427777886
+          },
+          "stop_rate": 0.5798319327731093,
+          "total_pnl": -79915.00373986246,
+          "win_rate": 0.47058823529411764,
+          "worst_pnl": -8539.609042915468
+        },
+        "C3": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -314.7509024182418,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -804.4065925348586,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -1194.845184554115,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 74,
+            "stop_loss": 45
+          },
+          "mean_pnl": -802.1987589222822,
+          "median_minutes_held": 10139.45275815,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -494.318841932499,
+              134.6154079879898
+            ],
+            "mean": -154.72601407390496
+          },
+          "stop_rate": 0.37815126050420167,
+          "total_pnl": -95461.65231175158,
+          "win_rate": 0.5798319327731093,
+          "worst_pnl": -16762.151592313163
+        },
+        "C5": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -171.73890672552255,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -1045.22121153291,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -1306.1670257056644,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 97,
+            "stop_loss": 22
+          },
+          "mean_pnl": -850.9600815755399,
+          "median_minutes_held": 10379.856431566666,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -687.9610628022482,
+              218.84320334999936
+            ],
+            "mean": -203.48733672716247
+          },
+          "stop_rate": 0.18487394957983194,
+          "total_pnl": -101264.24970748925,
+          "win_rate": 0.6974789915966386,
+          "worst_pnl": -23173.151026886007
+        },
+        "X0": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -374.10530379893646,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -376.5778754180454,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -998.5074421528928,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "profit_target": 55,
+            "stop_loss": 64
+          },
+          "mean_pnl": -647.4727448483774,
+          "median_minutes_held": 3134.7356591,
+          "n": 119,
+          "paired": {
+            "ci": [
+              0.0,
+              0.0
+            ],
+            "mean": 0.0
+          },
+          "stop_rate": 0.5378151260504201,
+          "total_pnl": -77049.25663695691,
+          "win_rate": 0.46218487394957986,
+          "worst_pnl": -8385.885851063336
+        },
+        "X1": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -541.1063654024185,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": -282.260814809436,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -1005.7416149613057,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 45,
+            "stop_loss": 74
+          },
+          "mean_pnl": -689.760938614499,
+          "median_minutes_held": 7019.525577816667,
+          "n": 119,
+          "paired": {
+            "ci": [
+              -139.63059540859885,
+              37.46673504142091
+            ],
+            "mean": -42.288193766121694
+          },
+          "stop_rate": 0.6218487394957983,
+          "total_pnl": -82081.55169512538,
+          "win_rate": 0.3697478991596639,
+          "worst_pnl": -8385.885851063336
+        },
+        "X2": {
+          "by_regime": {
+            "range": {
+              "mean_pnl": -116.29761904761907,
+              "n": 42
+            },
+            "trend_down": {
+              "mean_pnl": 133.19999999999982,
+              "n": 25
+            },
+            "trend_up": {
+              "mean_pnl": -389.37499999999903,
+              "n": 52
+            }
+          },
+          "exit_reason_counts": {
+            "expiry": 119
+          },
+          "mean_pnl": -183.21008403361304,
+          "median_minutes_held": 10469.8682996,
+          "n": 119,
+          "paired": {
+            "ci": [
+              105.53657146326891,
+              819.6383961772013
+            ],
+            "mean": 464.2626608147643
+          },
+          "stop_rate": 0.0,
+          "total_pnl": -21801.999999999953,
+          "win_rate": 0.7899159663865546,
+          "worst_pnl": -8811.0
+        }
+      }
+    }
+  }
+}
