@@ -1,6 +1,6 @@
 # Codex Handoff — T5a2 validation judgement + controls A/C + calibration grade — 2026-10-19
 
-> **상태(Status):** `진행중 / in-progress (round 2 요청)`
+> **상태(Status):** `검토대기 / ready for review (round 2 완료)`
 > _(Executor: set `진행중` on start, `검토대기` when done. Only the reviewer sets `완료`.)_
 >
 > **시작 기록(Started by):** author `session=a43dac5d-41e1-436c-bb1d-f9c0b1f8bc9d machine=mac-studio started=2026-10-19T12:10-0700`
@@ -118,7 +118,94 @@
 
 ## 8. Executor response (Codex writes here)
 
-_(비어 있음 — 수행자가 작성)_
+감점 사유 먼저:
+
+- `src/friction_validation.py`는 변경하지 않았다. 새 회귀 테스트가 실제 구현 버그를 증명하지 않았다.
+- §3-6 해석은 기존 구현과 동일하게 유지했다: `entry_ts >= boundary_ts`인 모든 kind를 sensitivity 집합으로 사용하고, 그 동일 집합의 live rows로 CI를 만든다.
+- Round 2 전 항목을 수행했고, 아래 모든 변이는 실제로 주입한 뒤 pytest 실패를 확인했다. 각 블록은 pytest의 원문 failure fragment다.
+
+변이 검증 원문:
+
+```text
+(a) CI_LEVEL = 0.95
+E       assert 0.95 == 0.9
+(a) CI_LEVEL = 0.80
+E       assert 0.8 == 0.9
+(b) closed interval -> open interval
+E       assert False
+>       assert first["in_ci"](first["t_a"][0], first["t_a"])
+(c) combined SL/PT resampling
+E       assert (0.0, 1.0) == (1.0, 1.0)
+(d) t_b None passes
+E       assert True is False
+>       assert result["targets"]["t_b"]["passed"] is False
+(e-i) remove t_d CI condition
+E       assert True is False
+>       assert result["targets"]["t_d"]["passed"] is False
+(e-ii) remove t_d lowest condition
+E       assert True is False
+>       assert result["targets"]["t_d"]["passed"] is expected
+(f) strict-lowest instead of lowest-or-tied
+E       assert True is False
+>       assert result["targets"]["t_d"]["passed"] is expected
+(g, omit t_a)
+E       assert True is False
+>       assert result["passed"] is False
+(g, omit t_b)
+E       assert True is False
+>       assert result["passed"] is False
+(g, omit t_c_i)
+E       assert True is False
+>       assert result["passed"] is False
+(g, omit t_c_ii)
+E       assert True is False
+>       assert result["passed"] is False
+(g, omit t_d)
+E       assert True is False
+>       assert result["passed"] is expected
+(h-i) A h_mult 0.0 -> 1.0
+E       assert (0.0 == 0.0 and 1.0 == 0.0)
+(h-ii) A beta 0.0 -> 0.1
+E       assert (0.1 == 0.0)
+(i) A outside or -> and
+E       assert (False is True)
+(j) C t_c_ii -> t_c_i
+E       assert (True is True and False is True)
+(k) C outside condition inverted
+E       assert True is False
+(l-i) tie chooses large k
+E       assert 3.0 == 0.0
+(l-ii) pass rng to k=0
+E       AssertionError: assert (0.0 == 0.0 and 'rng' not in {...})
+(l-iii) shared rng
+E       AssertionError: assert 1 == (13 - 1)
+(m-i) ignore model_insufficient
+E       AssertionError: assert 'PASS' == 'FAIL'
+(m-ii) ignore sensitivity t_a
+E       AssertionError: assert 'PASS' == 'PASS_CONDITIONAL'
+(m-iii) ignore sensitivity t_c_i
+E       AssertionError: assert 'PASS' == 'PASS_CONDITIONAL'
+(m-iv) swap probation values
+E       assert -0.05 == -0.1
+(n-i) sensitivity clean only
+E       ValueError: sensitivity episode set must not be empty
+(n-ii) sensitivity boundary > instead of >=
+E       assert 2 == 1
+(o-i) validation replay uses train
+E       AssertionError: assert [...] == [...]
+(o-ii) pessimistic h_mult ignored
+E       assert 1.0 == 1.5
+(o-iii) credit boundary > instead of >=
+E       assert 0 == 1
+```
+
+Round 2 tests added to `tests/test_friction_validation.py` cover: A-only/C-only control outcomes and aggregate `and`, C replay RNG, sensitivity beta/h_mult, t_d CI gating, validation-only calibration replay and judgement rows, exact `0.02` exclusion versus `0.0200001` retention, pessimistic h_mult, and all-kind/boundary behavior. The `if False else` leftover was removed.
+
+Final test command:
+
+```text
+307 passed, 1 warning in 2.56s
+```
 
 ## 9. Reviewer log (Claude writes here)
 
@@ -149,3 +236,9 @@ _(비어 있음 — 수행자가 작성)_
    - `judge_validation` t_d: (ii) 최저이지만 (i) CI 밖 → passed False.
 3. 변이는 §5의 (a)~(o) 전체를 실제로 주입해 원문을 §8에 붙인다(생존 10건 포함, 형제 분기 각각). 못 하는 변이는 사유를 쓴다.
 4. 테스트 파일의 `if False else` 잔재 제거. 미사용 임포트 없음 확인.
+
+### Round 2
+**Verdict:** approved
+
+- 스위트 307 passed 재실행. 1라운드 생존 10건 + 형제 변이 31종을 내가 직접 재주입: 전부 사망(실제 pooled-resample 변이 포함). 구현 파일 무변경, `if False` 잔재 제거 확인.
+- 한계: Codex §8은 pytest 원문 전체가 아니라 실패 조각 위주. §3-6 민감도 해석(진입 ≥ 경계 전 kind, 같은 집합 라이브로 CI)은 실데이터 실행 시 재확인 필요.
