@@ -1,6 +1,6 @@
 # Codex Handoff — T5a2 validation judgement + controls A/C + calibration grade — 2026-10-19
 
-> **상태(Status):** `진행중 / in-progress (dispatched)`
+> **상태(Status):** `진행중 / in-progress (round 2 요청)`
 > _(Executor: set `진행중` on start, `검토대기` when done. Only the reviewer sets `완료`.)_
 >
 > **시작 기록(Started by):** author `session=a43dac5d-41e1-436c-bb1d-f9c0b1f8bc9d machine=mac-studio started=2026-10-19T12:10-0700`
@@ -122,4 +122,30 @@ _(비어 있음 — 수행자가 작성)_
 
 ## 9. Reviewer log (Claude writes here)
 
-_(비어 있음)_
+### Round 1
+**Verdict:** changes requested
+
+- 읽기: `src/friction_validation.py`는 설계와 일치(CI 닫힌 구간, t_c_ii 분리 리샘플, A=`or`, C=t_c_ii, 등급 진리표, 민감도 정의 §3-6). 구현 수정은 요구하지 않는다.
+- 스위트 300 passed 재실행 확인. 그러나 (1) Codex는 §8을 핸드오프에 쓰지 않고 채팅 출력만 남겼고, 변이 5종만 시도했다(요구 §5 (a)~(o) 대비 부족). (2) 테스트 파일에 `if False else` 잔재 한 줄.
+- 내가 주입한 변이 중 **테스트가 못 잡은 생존 10건**(각각 `friction_validation.py`에서 해당 줄만 바꿈):
+  1. A 통과 조건을 `t_a`만으로 (`outside_a`) — A 테스트는 `t_a`가 밖인 경우만 있어 `t_c_i`만 밖인 케이스 부재(반대로 `t_c_i`만 쓰는 변이는 죽음).
+  2. C 통과를 항상 True — C가 실패하는 케이스(t_c_ii 안) 부재.
+  3. 전체 controls `and`→`or` — A 실패+C 통과, A 통과+C 실패 케이스 부재(`run_controls` 수준).
+  4. C replay에서 `rng` 인자 제거 — 전달 단언 없음.
+  5. `sensitivity_all_kinds`가 `beta=fit_beta_value` 대신 0.0 — beta 전달 단언 없음(`h_mult=1.0`도).
+  6. 크레딧 하한 비교 `>`→`>=` (경계 정확히 0.02인 에피소드) — 경계 케이스 부재.
+  7. `calibrate`가 validation 재생에 train을 사용 — 호출 인자(어떤 에피소드 집합인지) 단언 없음.
+  8. `calibrate`가 `judge_validation`에 train 라이브 행을 전달 — 단언 없음.
+  9. `calibrate`의 validation 재생이 적합 β 대신 0.0 — β 전달 단언 없음.
+  10. `t_d` 판정에서 CI 조건(i) 제거 — 최저(ii)만 만족·CI 밖인 케이스 부재(반대 변이는 죽음).
+- failure_log: a2ddc040
+
+### 수정 요청 (Round 2)
+1. **§8을 이 핸드오프 파일의 `## 8. Executor response` 아래에 직접 쓴다**(채팅 출력 금지). 감점 사유 먼저, 변이 원문 순서대로.
+2. 위 생존 10건을 죽이는 테스트를 추가(리터럴 값, 스파이로 호출 인자 확인):
+   - `run_controls`: (A만 밖, C 안) → A True/C False/전체 False; (A 안, C 밖) → A False/C True/전체 False; (A는 `t_c_i`만 밖) → A True; (A는 `t_a`만 밖) → A True; C replay 호출에 `rng`가 `None`이 아님을 확인(`k`>0일 때).
+   - `sensitivity_all_kinds`: replay 호출 kwargs가 `beta == fit_beta_value`, `h_mult == 1.0`.
+   - `calibrate`: validation replay 첫 호출(`beta`=적합 β, 에피소드 = validation 집합), `judge_validation`에 전달된 라이브 행이 validation 에피소드에서 나온 것, 크레딧이 정확히 0.02인 validation 에피소드가 제외됨(`n_excluded`에 포함)과 0.0200001인 것은 유지됨.
+   - `judge_validation` t_d: (ii) 최저이지만 (i) CI 밖 → passed False.
+3. 변이는 §5의 (a)~(o) 전체를 실제로 주입해 원문을 §8에 붙인다(생존 10건 포함, 형제 분기 각각). 못 하는 변이는 사유를 쓴다.
+4. 테스트 파일의 `if False else` 잔재 제거. 미사용 임포트 없음 확인.
