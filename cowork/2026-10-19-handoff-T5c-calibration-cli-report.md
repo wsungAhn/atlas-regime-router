@@ -1,6 +1,6 @@
 # Codex Handoff — T5c calibration CLI + markdown report — 2026-10-19
 
-> **상태(Status):** `검토대기 / review-pending`
+> **상태(Status):** `진행중 / in-progress (round 3 요청)`
 >
 > **시작 기록(Started by):** author `session=a43dac5d-41e1-436c-bb1d-f9c0b1f8bc9d machine=mac-studio started=2026-10-19T13:00-0700`
 >
@@ -54,7 +54,7 @@
 
 ## 8. Executor response (Codex writes here)
 
-구현 완료: `src/friction_calibrate.py`, `tests/test_friction_calibrate.py`만 변경했고 커밋하지 않았다. 전체 테스트 최종 결과:
+구현 완료: `src/friction_calibrate.py`, `tests/test_friction_calibrate.py`와 이 handoff의 §8만 변경했고 커밋하지 않았다. `src/friction_validation.py::calibrate`의 실제 반환 구조(§10)를 기준으로 렌더러와 테스트 fixture를 교체했다. 전체 테스트 최종 결과:
 
 ```text
 ........................................................................ [ 23%]
@@ -62,10 +62,10 @@
 ........................................................................ [ 69%]
 ........................................................................ [ 92%]
 .........................                                                [100%]
-313 passed, 1 warning in 2.88s
+313 passed, 1 warning in 2.51s
 ```
 
-감점/질문 사항 먼저: §1은 `friction_validation.calibrate`를 요구하지만 이 워크트리에는 `src/friction_validation.py`가 없고, 이름이 유사한 `src/friction_calibration.py`에도 `calibrate`가 없다. 따라서 CLI는 `friction_validation.calibrate`를 선택적으로 가져오며, 실제 calibrate 함수가 제공/패치되면 호출한다. 이 불일치 때문에 실데이터 CLI 실행은 리뷰어 확인이 필요하다.
+감점/질문 사항 먼저: 없음. §10의 정본과 `src/friction_validation.py`를 대조해 직접 import하도록 수정했고, validation targets의 T-d, A/C controls, sensitivity 및 low-credit 구조를 모두 렌더링한다. 출력 파일 존재 검사는 calibrate 호출 전에 수행한다.
 
 §5 변이 검증 — 각 변이 후 복구했으며 아래는 변이 실행의 raw pytest failure output이다.
 
@@ -76,7 +76,7 @@ F.....                                                                   [100%]
 ______________ test_load_inputs_prepares_bars_and_tracks_missing ______________
 E       AssertionError: assert [Timestamp('2026-01-01 00:00:00'), ...] == [Timestamp('2026-01-01 00:15:00'), ...]
 E       At index 0 diff: Timestamp('2026-01-01 00:00:00') != Timestamp('2026-01-01 00:15:00')
-1 failed, 5 passed, 1 warning in 0.57s
+1 failed, 5 passed, 1 warning in 0.59s
 ```
 
 ### (b) `missing` 정렬 제거
@@ -129,7 +129,7 @@ E       AssertionError: ... '-0.0500' not found in rendered report
 ```text
 ..F...                                                                   [100%]
 _______________ test_render_report_is_complete_and_deterministic _______________
-E       AssertionError: assert '| t_b | -0.1000 | n/a |' in report
+E       AssertionError: assert '| t_b | n/a | (n/a, n/a) | False |' in report
 1 failed, 5 passed, 1 warning in 0.55s
 ```
 
@@ -270,4 +270,14 @@ failure_log: 649d99fa
  "skip_counts_validation": {...}}
 ```
 CI 값은 `(lo, hi)` 튜플(또는 `(None, None)`).
+
+### Round 2
+**Verdict:** changes requested (소규모, 실데이터 실행에서 발견)
+
+렌더러는 §10 구조에 맞게 고쳐졌고 313 passed. 실데이터로 `main`을 실행해(2분, 성공적으로 `calibrate` 완료) 다음 결함이 나왔다 — 합성 테스트가 못 잡은 것들:
+1. **`python src/friction_calibrate.py ...`가 아무것도 안 한다**: `if __name__ == "__main__": sys.exit(main())` 가드가 없다. 추가하고, 서브프로세스 테스트(`--help`이 SystemExit 0, 사용법 출력)로 단언(기존 `friction.py` CLI 회귀 테스트 방식 참고).
+2. **JSON 직렬화 실패**: `TypeError: Object of type datetime is not JSON serializable`. `calibrate` 결과/`meta`에 stdlib `datetime`/`date`(및 `pd.Timestamp` 외 시간형)가 들어온다. `to_jsonable`이 `datetime.datetime`, `datetime.date`를 ISO 문자열로, `pd.Timedelta`/`np.ndarray`는 각각 문자열/리스트로 처리하게 하고, 테스트에 각 타입을 포함해 `json.dumps` 성공 + 값 단언. 알 수 없는 타입은 조용히 통과시키지 말고 `TypeError`를 던져라(지금은 `return obj`).
+3. **부분 쓰기**: `.md`는 써졌는데 `.json`이 실패하면 재실행이 `FileExistsError`로 막힌다. 두 문자열을 **먼저 모두 만든 뒤** 쓰고, 쓰기 실패 시 이번에 만든 파일을 삭제(원자성). 테스트: 직렬화 실패를 주입하면 두 파일 모두 남지 않음.
+4. **Reasons 버그**: `lines.extend(...) or lines.append("  - n/a")`가 항상 `n/a` 줄을 추가한다(실보고서에 `validation:t_d` 아래 `n/a`가 같이 찍힘). reasons가 있으면 `n/a` 없음, 비면 `n/a` 한 줄. 테스트로 두 경우 단언.
+5. **가독성**: Controls의 `sim stats` 열이 dict repr 덤프다. `t_a/t_b/t_c_i/t_c_ii` 네 값만 `t_a=0.5476; t_b=-1.2699; ...` 형식으로 출력(`t_d`, `undefined` 제외 — T-d는 Validation에). Inputs의 `data_period`는 `start – end` 문자열, 튜플 repr 금지. 테스트 단언.
 
