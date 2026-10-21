@@ -30,6 +30,7 @@ IV_ANCHOR_HAIRCUT = 0.05
 IV_BISECTION_TOL = 1e-9
 ZERO_MID_REPRESENTATIVE = 0.05
 DEFAULT_EPISODE_SEED = 20260930
+HUB_QUOTE_ROOT = Path.home() / "data/universe-hub/options/quotes"
 
 
 def SYMBOL_CLASS(underlying):
@@ -56,23 +57,26 @@ def _pooled_value(rows, bucket):
     return max(float(rows["rel"].median()) * _REPRESENTATIVE_MID[bucket], TICK_FLOOR)
 
 
-def build_half_spread_table(panel_dir):
-    panel_path = Path(panel_dir)
+def build_half_spread_table(panel_dir=None):
+    panel_path = Path(HUB_QUOTE_ROOT if panel_dir is None else panel_dir)
+    paths = sorted(panel_path.glob("date=*/*.parquet"))
+    if not paths:
+        raise ValueError(f"no quote panel files under {panel_path}")
     frames = []
-    for path in sorted(panel_path.glob("20*.parquet")):
+    for path in paths:
         try:
             frames.append(pd.read_parquet(path))
         except Exception:
             logging.exception("Could not read quote panel %s; skipping", path)
-    if frames:
-        panel = pd.concat(frames, ignore_index=True)
-        panel = panel.loc[panel["dte"].between(DTE_MIN, DTE_MAX)].copy()
-        panel["h"] = (panel["ask"] - panel["bid"]) / 2
-        panel["rel"] = panel["h"] / panel["mid"]
-        panel["class"] = panel["underlying"].map(SYMBOL_CLASS)
-        panel["bucket"] = panel["mid"].map(_mid_bucket)
-    else:
-        panel = pd.DataFrame(columns=("h", "rel", "mid", "class", "bucket"))
+    if not frames:
+        raise ValueError(f"no quote panel files under {panel_path}")
+    panel = pd.concat(frames, ignore_index=True)
+    panel = panel.loc[:, ["underlying", "bid", "ask", "mid", "dte"]]
+    panel = panel.loc[panel["dte"].between(DTE_MIN, DTE_MAX)].copy()
+    panel["h"] = (panel["ask"] - panel["bid"]) / 2
+    panel["rel"] = panel["h"] / panel["mid"]
+    panel["class"] = panel["underlying"].map(SYMBOL_CLASS)
+    panel["bucket"] = panel["mid"].map(_mid_bucket)
 
     all_rows = []
     for class_name in ("index_etf", "other_etf", "single_stock"):
@@ -106,7 +110,9 @@ def half_spread(table, underlying, mid):
     return float(match.iloc[0])
 
 
-def write_half_spread_table(panel_dir, out_path):
+def write_half_spread_table(panel_dir=None, out_path=None):
+    if out_path is None:
+        raise ValueError("out_path is required")
     table = build_half_spread_table(panel_dir)
     destination = Path(out_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -303,10 +309,14 @@ def fill_debit(legs, s):
     return float(debit)
 
 
-if __name__ == "__main__":
+def main(argv=None):
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser()
-    parser.add_argument("--panel-dir", required=True)
+    parser.add_argument("--panel-dir", default=None)
     parser.add_argument("--out", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     write_half_spread_table(args.panel_dir, args.out)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,7 +1,10 @@
+import os
 import pandas as pd,numpy as np,glob,re,sys
 sys.path.insert(0,'src')
 from friction import parse_occ
-fs=[f for f in sorted(glob.glob('data/quote_panel/20*.parquet')) if 'positions' not in f and 'r1' not in f]
+fs=sorted(glob.glob(os.path.expanduser('~/data/universe-hub/options/quotes/date=*/*.parquet')))
+if not fs:
+    raise SystemExit("no quote panel files")
 d=pd.concat([pd.read_parquet(f) for f in fs]); d['ts']=pd.to_datetime(d['ts'])
 d['day']=d.ts.dt.date
 syms=sorted(d.underlying.unique()); print(syms, d.day.min(), d.day.max())

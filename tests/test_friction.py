@@ -1,10 +1,12 @@
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
+import src.friction as friction
 from src.friction import (
     DTE_MAX,
     DTE_MIN,
@@ -30,7 +32,9 @@ from src.vendor.credit_spread_simulator import price_spread_to_close
 
 
 def _write_panel(path, rows, name="2026-10-01.parquet"):
-    pd.DataFrame(rows).to_parquet(path / name, index=False)
+    destination = path / "date=2026-10-01"
+    destination.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(destination / name, index=False)
 
 
 def _row(underlying="SPY", mid=1.0, h=0.01, dte=7):
@@ -41,7 +45,8 @@ def test_half_spread_lookup_floor_and_buckets(tmp_path):
     points = ((0.0999, 0.006), (0.10, 0.007), (0.4999, 0.008), (0.50, 0.009), (1.9999, 0.010), (2.00, 0.011))
     rows = [r for mid, h in points for r in [_row(mid=mid, h=h)] * 30]
     rows += [_row(underlying="GLD", mid=0.2, h=0.00001)]
-    table = build_half_spread_table(tmp_path)
+    with pytest.raises(ValueError, match="no quote panel files"):
+        build_half_spread_table(tmp_path)
     _write_panel(tmp_path, rows)
     table = build_half_spread_table(tmp_path)
     assert [_mid_bucket(mid) for mid, _ in points] == ["<0.10", "0.10-0.50", "0.10-0.50", "0.50-2.00", "0.50-2.00", ">2.00"]
@@ -73,11 +78,34 @@ def test_dte_filter_and_sample_fallback(tmp_path):
     assert len(table) == 12
 
 
-def test_positions_files_are_ignored(tmp_path):
+def test_all_unreadable_quote_panels_raise(tmp_path):
+    destination = tmp_path / "date=2026-10-01"
+    destination.mkdir()
+    (destination / "x.parquet").write_bytes(b"not a parquet file")
+    with pytest.raises(ValueError, match="no quote panel files"):
+        build_half_spread_table(tmp_path)
+
+
+def test_default_quote_root_is_hub_store_and_is_used(tmp_path, monkeypatch):
+    assert friction.HUB_QUOTE_ROOT == Path.home() / "data/universe-hub/options/quotes"
     _write_panel(tmp_path, [_row(mid=1.0, h=0.01) for _ in range(30)])
-    _write_panel(tmp_path, [_row(mid=1.0, h=99.0)], "positions-2026-10-01.parquet")
-    table = build_half_spread_table(tmp_path)
-    assert len(table) == 12 and table.loc[(table["class"] == "index_etf") & (table["bucket"] == "0.50-2.00"), "n"].iloc[0] == 30, "positions-* files must be excluded"
+    monkeypatch.setattr(friction, "HUB_QUOTE_ROOT", tmp_path)
+    table = build_half_spread_table()
+    assert (table["n"] > 0).any()
+
+
+def test_cli_default_hub_root_and_old_layout_fail(tmp_path, monkeypatch):
+    _write_panel(tmp_path, [_row(mid=1.0, h=0.01) for _ in range(30)])
+    out = tmp_path / "default.csv"
+    monkeypatch.setattr(friction, "HUB_QUOTE_ROOT", tmp_path)
+    friction.main(["--out", str(out)])
+    assert (pd.read_csv(out)["n"] > 0).any()
+
+    old_layout = tmp_path / "old-layout"
+    old_layout.mkdir()
+    pd.DataFrame([_row(mid=1.0, h=0.01)]).to_parquet(old_layout / "2026-10-01.parquet", index=False)
+    with pytest.raises(ValueError, match="no quote panel files"):
+        friction.main(["--panel-dir", str(old_layout), "--out", str(tmp_path / "old.csv")])
 
 
 def test_symbol_class_and_invalid_mid(tmp_path):
@@ -113,6 +141,7 @@ def test_cli_script_writes_twelve_row_csv(tmp_path):
         cwd=__import__("pathlib").Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
+        timeout=60,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert pd.read_csv(out).shape[0] == 12

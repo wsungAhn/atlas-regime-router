@@ -1,7 +1,7 @@
 # Codex Handoff — 2026-10-20 — atlas reader repoint to the Universe Hub quote store (UH-019 D8.1)
 
-> **상태(Status):** `대기중 / pending`
-> **시작 기록(Started by):** _(비워둠)_
+> **상태(Status):** `검토대기 / review-pending`
+> **시작 기록(Started by):** Codex (`gpt-5.6-luna`, medium) — 2026-10-20
 > **작성자:** Claude (reviewer) → **수행자:** Codex (`gpt-5.6-luna`, medium)
 > **설계 근거:** `/Users/Mung/dev/universe-hub/docs/design-uh019-option-quote-panel.md` section D8.1 (read it) and D2 (hub layout). The hub already holds the migrated data: `~/data/universe-hub/options/quotes/date=YYYY-MM-DD/<YYYYMMDDTHHMMSSffffffZ>.parquet` (58 snapshots, 331,206 rows; one file = one snapshot; columns ts[timestamp us UTC], underlying, occ, bid, ask, mid, delta, dte, feed).
 > **범위:** IN: `src/friction.py`, `tests/test_friction.py`, `research/os1-edge-2026-10/panel_edge.py`. OUT: everything else (do not touch `scripts/collect_option_quotes.py`, plists, `~/data`, the hub repo, `~/Library/LaunchAgents`). Do not commit. Atlas main has unrelated untracked `reports/*` — ignore them.
@@ -26,7 +26,124 @@ Rubric: Reader correctness on hub layout gate 5 · Fail-loud on empty/stale path
 
 ## 8. Executor response
 ### 8-1 Files changed / 8-2 Tests / 8-3 raw pytest tail / 8-4 real-store run / 8-6 judgment calls / 8-7 self-score
-_(write here)_
+#### 8-1 Files changed
+- `src/friction.py`
+- `tests/test_friction.py`
+- `research/os1-edge-2026-10/panel_edge.py`
+- This handoff
+
+No commit created.
+
+#### 8-2 Tests
+Final command:
+`cd /Users/Mung/dev/atlas-options-hackathon && .venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+
+Result: `376 passed, 1 warning in 4.28s`.
+
+#### 8-3 raw pytest tail
+```text
+...................................................................... [ 19%]
+........................................................................ [ 38%]
+........................................................................ [ 57%]
+........................................................................ [ 76%]
+........................................................................ [ 95%]
+................                                                         [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html
+    warnings.warn(  # deprecated in 14.0
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+376 passed, 1 warning in 4.28s
+```
+
+#### 8-4 real-store run
+Command:
+`cd /Users/Mung/dev/atlas-options-hackathon && .venv/bin/python -m src.friction --out /tmp/hs.csv`
+
+Exit code: `0`
+
+First lines of `/tmp/hs.csv`:
+```text
+class,bucket,n,h,fallback
+index_etf,<0.10,27074,0.010000000000000002,False
+index_etf,0.10-0.50,17135,0.009999999999999981,False
+index_etf,0.50-2.00,13126,0.011823529411764715,False
+index_etf,>2.00,98230,0.48499999999999943,False
+```
+
+At least one cell has `n>0` (all 12 cells do).
+
+#### 8-6 judgment calls
+- Added `main(argv=None)` and kept the default as a runtime `None` resolution to `HUB_QUOTE_ROOT`, so the integration test can monkeypatch `friction.HUB_QUOTE_ROOT` and invoke the real CLI entry in-process. No environment-variable override was added.
+- Read each parquet file without a column subset, then selected only `underlying`, `bid`, `ask`, `mid`, and `dte` after concatenation, as required for the hub `date=*` layout.
+- Added `timeout=60` to the subprocess-based CLI test.
+
+#### 8-7 self-score
+Deductions: none.
+
+- Reader correctness on hub layout: `5/5`
+- Fail-loud on empty/stale path: `5/5`
+- Test strength: `5/5`
+- Scope: `5/5`
+
+### Round 2
+**Executed:** 2026-10-20 | **Result:** two reviewer-requested test gaps added; no `src/` change required
+
+#### 8-1 Files changed
+- `tests/test_friction.py`
+- This handoff
+
+No commit created.
+
+#### 8-2 Tests
+Final command:
+`cd /Users/Mung/dev/atlas-options-hackathon && .venv/bin/python -m pytest tests/ -q -p no:cacheprovider`
+
+Result: `378 passed, 1 warning in 8.77s`.
+
+#### 8-3 raw pytest tail
+```text
+........................................................................ [ 19%]
+........................................................................ [ 38%]
+........................................................................ [ 57%]
+........................................................................ [ 76%]
+......
+.................................................................. [ 95%]
+..................                                                       [100%]
+=============================== warnings summary ===============================
+.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6
+  /Users/Mung/dev/atlas-options-hackathon/.venv/lib/python3.13/site-packages/websockets/legacy/__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+378 passed, 1 warning in 8.77s
+```
+
+#### 8-6 judgment calls
+- Added exactly the two reviewer-requested tests: all-unreadable parquet files raise `ValueError`; the real hub default constant and no-argument default reader path are asserted.
+- No `src/` change was needed because both tests pass against the existing implementation.
+
+#### 8-7 self-score
+Deductions: none.
+
+- Reader correctness on hub layout: `5/5`
+- Fail-loud on empty/stale path: `5/5`
+- Test strength: `5/5`
+- Scope: `5/5`
 
 ## 9. Review log
-_(empty)_
+
+### Round 1
+**Reviewed:** 2026-10-20 | **Verdict:** changes requested (two small test gaps)
+
+Verified directly: diff read (friction.py, test_friction.py, panel_edge.py); suite 376 passed; real-store CLI `python -B -m src.friction --out ...` against `~/data/universe-hub/options/quotes` exits 0 with real n values (index_etf 27,074 / 17,135 / 13,126 ...). Mutation sweep on `src/friction.py` (7 mutations, `tests/test_friction.py` only): 4 KILLED, 3 SURVIVED. `empty_paths_no_raise` is equivalent (the second `if not frames` raise covers it) — no action. Real gaps:
+1. `all_unreadable_no_raise`: when files exist but every one is unreadable, `build_half_spread_table` must raise the ValueError — add a test with a corrupt `date=*/x.parquet` (garbage bytes) as the only file.
+2. `default_root_changed`: nothing asserts the real default; add a test `friction.HUB_QUOTE_ROOT == Path.home() / "data/universe-hub/options/quotes"` and that `build_half_spread_table()` with `panel_dir=None` globs `HUB_QUOTE_ROOT` (monkeypatch it to a tmp hub-layout dir and call without arguments).
+Change `src/` only if a test reveals a real defect (say so in §8-6). Paste the raw pytest tail in §8-3. Do not touch other files.
+
+
+### Round 2
+**Reviewed:** 2026-10-20 | **Verdict:** approved
+
+Verified directly: suite 378 passed (376 + 2); my 5 reader mutations all KILLED (glob pattern, all-unreadable raise, default root constant, CLI default, default ignored); real-store CLI run exit 0 (round 1). `src/` unchanged since round 1 review (tests only).
